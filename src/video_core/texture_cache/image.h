@@ -59,6 +59,7 @@ struct UniqueImage {
     }
 
     void Create(const vk::ImageCreateInfo& image_ci);
+    [[nodiscard]] vk::Result TryCreate(const vk::ImageCreateInfo& image_ci);
 
     void Destroy();
 
@@ -102,6 +103,10 @@ struct Image {
         return backing->image.image;
     }
 
+    vk::Format GetImageFormat() const {
+        return backing->image.image_ci.format;
+    }
+
     bool IsTracked() {
         return track_addr != 0 && track_addr_end != 0;
     }
@@ -128,7 +133,8 @@ struct Image {
                          std::optional<SubresourceRange> subres_range);
     void Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                  std::optional<SubresourceRange> range, vk::CommandBuffer cmdbuf = {});
-    void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset);
+    void Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer, u64 offset,
+                u64 buffer_size);
     void Download(std::span<const vk::BufferImageCopy> download_copies, vk::Buffer buffer,
                   u64 offset, u64 download_size);
 
@@ -196,6 +202,8 @@ public:
     } binding{};
 
 private:
+    void ValidateCopyFormat(const Image& source) const;
+
     static Common::IncrementalIdProvider<u64> global_image_uid;
 };
 

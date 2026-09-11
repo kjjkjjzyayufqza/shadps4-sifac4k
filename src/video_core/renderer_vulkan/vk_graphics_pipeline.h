@@ -41,6 +41,7 @@ struct GraphicsPipelineKey {
     AmdGpu::ColorControl::LogicOp logic_op;
     u8 num_samples;
     u8 depth_samples;
+    vk::Format depth_stencil_format;
     std::array<u8, AmdGpu::NUM_COLOR_BUFFERS> color_samples;
     u32 mrt_mask;
     struct {

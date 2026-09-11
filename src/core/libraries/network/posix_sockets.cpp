@@ -4,6 +4,8 @@
 #include <vector>
 #include <common/assert.h>
 #include "common/error.h"
+#include "common/ipv4_interface.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
 #include "net.h"
@@ -174,9 +176,47 @@ int PosixSocket::Close() {
 
 int PosixSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
     std::scoped_lock lock{m_mutex};
-    sockaddr addr2;
+    sockaddr addr2{};
     convertOrbisNetSockaddrToPosix(addr, &addr2);
-    return ConvertReturnErrorCode(::bind(sock, &addr2, sizeof(sockaddr_in)));
+    auto& ipv4 = reinterpret_cast<sockaddr_in&>(addr2);
+    const auto selected = EmulatorSettings.GetNetworkInterfaceAddress();
+    if (socket_family == AF_INET && ipv4.sin_addr.s_addr == INADDR_ANY && !selected.empty()) {
+        const auto address = Common::Network::ParseIpv4(selected);
+        if (!address) {
+            *Libraries::Kernel::__Error() = ORBIS_NET_EADDRNOTAVAIL;
+            return -1;
+        }
+        ipv4.sin_addr.s_addr = htonl(*address);
+    }
+    const auto result = ConvertReturnErrorCode(::bind(sock, &addr2, sizeof(sockaddr_in)));
+    if (result == 0) {
+        is_bound = true;
+    }
+    LOG_DEBUG(Lib_Net, "bind {}:{} result={}",
+              Common::Network::Ipv4ToString(ntohl(ipv4.sin_addr.s_addr)), ntohs(ipv4.sin_port),
+              result);
+    return result;
+}
+
+int PosixSocket::EnsureSelectedAddress() {
+    const auto selected = EmulatorSettings.GetNetworkInterfaceAddress();
+    if (is_bound || socket_family != AF_INET || selected.empty()) {
+        return 0;
+    }
+    const auto address = Common::Network::ParseIpv4(selected);
+    if (!address) {
+        *Libraries::Kernel::__Error() = ORBIS_NET_EADDRNOTAVAIL;
+        return -1;
+    }
+    sockaddr_in native{};
+    native.sin_family = AF_INET;
+    native.sin_addr.s_addr = htonl(*address);
+    const auto result = ConvertReturnErrorCode(
+        ::bind(sock, reinterpret_cast<const sockaddr*>(&native), sizeof(native)));
+    if (result == 0) {
+        is_bound = true;
+    }
+    return result;
 }
 
 int PosixSocket::Listen(int backlog) {
@@ -221,6 +261,9 @@ static int socket_is_ready(int sock, bool is_read = true) {
 
 int PosixSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
     std::scoped_lock lock{m_mutex};
+    if (EnsureSelectedAddress() < 0) {
+        return -1;
+    }
 
 #ifdef _WIN32
     int totalSent = 0;
@@ -289,6 +332,9 @@ int PosixSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
 int PosixSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSockaddr* to,
                             u32 tolen) {
     std::scoped_lock lock{m_mutex};
+    if (EnsureSelectedAddress() < 0) {
+        return -1;
+    }
     int res = 0;
 #ifdef _WIN32
     if (flags & ORBIS_NET_MSG_DONTWAIT) {
@@ -303,6 +349,59 @@ int PosixSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetS
     } else {
         sockaddr addr{};
         convertOrbisNetSockaddrToPosix(to, &addr);
+        auto& ipv4 = reinterpret_cast<sockaddr_in&>(addr);
+        const auto selected =
+            Common::Network::ParseIpv4(EmulatorSettings.GetNetworkInterfaceAddress());
+        const auto configured_peers = EmulatorSettings.GetLoopbackBroadcastPeers();
+        if (socket_family == AF_INET && socket_type == ORBIS_NET_SOCK_DGRAM && selected &&
+            !configured_peers.empty()) {
+            const auto iface =
+                Common::Network::ResolveIpv4Interface(EmulatorSettings.GetNetworkInterfaceAddress());
+            const u32 netmask = iface ? iface->netmask : 0;
+            const u32 destination = ntohl(ipv4.sin_addr.s_addr);
+            if (Common::Network::ShouldFanoutBroadcast(*selected, netmask, destination)) {
+                const auto peers =
+                    Common::Network::IsLoopback(*selected)
+                        ? Common::Network::ParseLoopbackPeerList(*selected, configured_peers)
+                        : Common::Network::ParseInterfaceBroadcastPeerList(*selected, netmask,
+                                                                           configured_peers);
+                if (!peers) {
+                    if (Common::Network::IsLoopback(*selected)) {
+                        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
+                        return -1;
+                    }
+                } else {
+                    int enabled{};
+                    socklen_t enabled_size = sizeof(enabled);
+                    if (getsockopt(sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<char*>(&enabled),
+                                   &enabled_size) != 0) {
+                        return ConvertReturnErrorCode(-1);
+                    }
+                    if (!enabled) {
+                        *Libraries::Kernel::__Error() = ORBIS_NET_EACCES;
+                        return -1;
+                    }
+                    // Loopback has no broadcast domain, so only fan out unicasts.
+                    // TAP overlays such as UU drop 255.255.255.255; unicast copies reach the peer.
+                    // Native broadcast is still sent on non-loopback so Ethernet TAPs keep working.
+                    int sent = -1;
+                    if (!Common::Network::IsLoopback(*selected)) {
+                        sent = sendto(sock, static_cast<const char*>(msg), len, posix_flags, &addr,
+                                      sizeof(sockaddr_in));
+                    }
+                    for (const auto peer : *peers) {
+                        ipv4.sin_addr.s_addr = htonl(peer);
+                        const int result =
+                            sendto(sock, static_cast<const char*>(msg), len, posix_flags, &addr,
+                                   sizeof(sockaddr_in));
+                        if (result >= 0) {
+                            sent = result;
+                        }
+                    }
+                    return ConvertReturnErrorCode(sent);
+                }
+            }
+        }
         res = sendto(sock, (const char*)msg, len, posix_flags, &addr, tolen);
     }
     return ConvertReturnErrorCode(res);
@@ -427,6 +526,9 @@ SocketPtr PosixSocket::Accept(OrbisNetSockaddr* addr, u32* addrlen) {
 
 int PosixSocket::Connect(const OrbisNetSockaddr* addr, u32 namelen) {
     std::scoped_lock lock{m_mutex};
+    if (EnsureSelectedAddress() < 0) {
+        return -1;
+    }
     sockaddr addr2;
     convertOrbisNetSockaddrToPosix(addr, &addr2);
     int result = ::connect(sock, &addr2, sizeof(sockaddr_in));

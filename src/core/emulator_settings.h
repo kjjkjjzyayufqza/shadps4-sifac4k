@@ -207,6 +207,8 @@ struct GeneralSettings {
     Setting<std::string> trophy_notification_side{"right"};
     Setting<bool> show_splash{false};
     Setting<bool> connected_to_network{false};
+    Setting<std::string> network_interface_address{};
+    Setting<std::string> loopback_broadcast_peers{};
     Setting<bool> discord_rpc_enabled{false};
     Setting<bool> show_fps_counter{false};
     Setting<int> console_language{1};
@@ -236,6 +238,10 @@ struct GeneralSettings {
                                            &GeneralSettings::trophy_notification_side),
             make_override<GeneralSettings>("connected_to_network",
                                            &GeneralSettings::connected_to_network),
+            make_override<GeneralSettings>("network_interface_address",
+                                           &GeneralSettings::network_interface_address),
+            make_override<GeneralSettings>("loopback_broadcast_peers",
+                                           &GeneralSettings::loopback_broadcast_peers),
             make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
             make_override<GeneralSettings>("shadnet_server", &GeneralSettings::shadnet_server),
             make_override<GeneralSettings>("shadnet_webapi_server",
@@ -250,6 +256,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    extra_dmem_in_mbytes, extra_fmem_in_mbytes, shad_net_enabled,
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
+                                   network_interface_address, loopback_broadcast_peers,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
                                    signaling_info, enable_upnp)
@@ -681,6 +688,8 @@ public:
     SETTING_FORWARD(m_general, TrophyNotificationSide, trophy_notification_side)
     SETTING_FORWARD_BOOL(m_general, ShowSplash, show_splash)
     SETTING_FORWARD_BOOL(m_general, ConnectedToNetwork, connected_to_network)
+    SETTING_FORWARD(m_general, NetworkInterfaceAddress, network_interface_address)
+    SETTING_FORWARD(m_general, LoopbackBroadcastPeers, loopback_broadcast_peers)
     SETTING_FORWARD_BOOL(m_general, DiscordRPCEnabled, discord_rpc_enabled)
     SETTING_FORWARD_BOOL(m_general, ShowFpsCounter, show_fps_counter)
     SETTING_FORWARD(m_general, ConsoleLanguage, console_language)

@@ -76,7 +76,8 @@ public:
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
     bool LoadPipelineStage(Serialization::Archive& ar, size_t stage);
 
-    const GraphicsPipeline* GetGraphicsPipeline();
+    const GraphicsPipeline* GetGraphicsPipeline(
+        vk::Format depth_stencil_format = vk::Format::eUndefined);
 
     const ComputePipeline* GetComputePipeline();
 
@@ -96,7 +97,7 @@ public:
     }
 
 private:
-    bool RefreshGraphicsKey();
+    bool RefreshGraphicsKey(vk::Format depth_stencil_format);
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
 

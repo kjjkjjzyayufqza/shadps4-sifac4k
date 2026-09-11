@@ -14,7 +14,7 @@ namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
 static constexpr u32 ShaderBinaryVersion = 4u;
 static constexpr u32 ShaderMetaVersion = 3u;
-static constexpr u32 PipelineKeyVersion = 3u;
+static constexpr u32 PipelineKeyVersion = 4u;
 } // namespace Serialization
 
 namespace Vulkan {
@@ -210,6 +210,11 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
     graphics_key.Deserialize(ar);
+    if (graphics_key.depth_stencil_format != vk::Format::eUndefined &&
+        !instance.IsFormatSupported(graphics_key.depth_stencil_format,
+                                    vk::FormatFeatureFlagBits2::eDepthStencilAttachment)) {
+        return false;
+    }
 
     GraphicsPipeline::SerializationSupport sdata{};
     sdata.Deserialize(ar);

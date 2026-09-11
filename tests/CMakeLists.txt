@@ -9,7 +9,20 @@ include(FetchContent)
 )
 FetchContent_MakeAvailable(googletest)
 
+add_executable(shadps4_ipv4_interface_test
+    network/test_ipv4_interface.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/ipv4_interface.cpp
+)
+target_include_directories(shadps4_ipv4_interface_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_ipv4_interface_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_ipv4_interface_test PRIVATE GTest::gtest_main)
+if (WIN32)
+    target_compile_definitions(shadps4_ipv4_interface_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_link_libraries(shadps4_ipv4_interface_test PRIVATE ws2_32 iphlpapi)
+endif()
+
 set(TEST_TARGETS
+    shadps4_ipv4_interface_test
     shadps4_settings_test
     shadps4_ngs2_test
     shadps4_gcn_test
@@ -238,6 +251,21 @@ foreach(t ${TEST_TARGETS})
 endforeach()
 
 include(GoogleTest)
+
+add_executable(shadps4_depth_staging_test video_core/test_depth_staging.cpp)
+target_include_directories(shadps4_depth_staging_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_depth_staging_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_depth_staging_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_depth_staging_test)
+
+add_executable(shadps4_image_format_test video_core/test_image_format.cpp)
+target_include_directories(shadps4_image_format_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}/externals/vulkan-headers/include
+)
+target_compile_features(shadps4_image_format_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_image_format_test PRIVATE GTest::gtest_main)
+gtest_discover_tests(shadps4_image_format_test)
 
 foreach(t ${TEST_TARGETS})
     gtest_discover_tests(${t}

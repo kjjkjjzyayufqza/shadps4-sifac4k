@@ -89,6 +89,8 @@ struct Socket {
 
 struct PosixSocket : public Socket {
     net_socket sock;
+    int socket_family{AF_INET};
+    bool is_bound{};
     int sockopt_so_connecttimeo = 0;
     int sockopt_so_reuseport = 0;
     int sockopt_so_onesbcast = 0;
@@ -100,10 +102,14 @@ struct PosixSocket : public Socket {
     int sockopt_tcp_mss_to_advertise = 0;
     int socket_type;
     explicit PosixSocket(int domain, int type, int protocol)
-        : Socket(domain, type, protocol), sock(socket(domain, type, protocol)) {
+        : Socket(domain, type, protocol), sock(socket(domain, type, protocol)),
+          socket_family(domain) {
         socket_type = type;
     }
-    explicit PosixSocket(net_socket sock) : Socket(0, 0, 0), sock(sock) {}
+    explicit PosixSocket(net_socket sock)
+        : Socket(0, ORBIS_NET_SOCK_STREAM, 0), sock(sock), is_bound(true),
+          socket_type(ORBIS_NET_SOCK_STREAM) {}
+    int EnsureSelectedAddress();
     bool IsValid() const override;
     int Close() override;
     int SetSocketOptions(int level, int optname, const void* optval, u32 optlen) override;

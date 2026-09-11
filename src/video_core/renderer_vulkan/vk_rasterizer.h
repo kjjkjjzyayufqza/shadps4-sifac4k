@@ -84,7 +84,7 @@ public:
     }
 
 private:
-    void PrepareRenderState(const GraphicsPipeline* pipeline);
+    const GraphicsPipeline* PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);

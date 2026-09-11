@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include "common/ipv4_interface.h"
 #include "common/types.h"
 
 namespace Libraries::Net {
@@ -25,6 +26,11 @@ private:
     u32 external_ip{0};
     u32 nat_type{0};
     std::mutex m_mutex;
+    bool selected_interface_checked{};
+    std::string selected_interface_address;
+    std::optional<Common::Network::Ipv4Interface> selected_interface;
+
+    bool RetrieveSelectedInterface();
 
 public:
     const std::array<u8, 6>& GetEthernetAddr() const;

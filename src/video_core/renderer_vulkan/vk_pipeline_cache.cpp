@@ -320,8 +320,8 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
 
 PipelineCache::~PipelineCache() = default;
 
-const GraphicsPipeline* PipelineCache::GetGraphicsPipeline() {
-    if (!RefreshGraphicsKey()) {
+const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(vk::Format depth_stencil_format) {
+    if (!RefreshGraphicsKey(depth_stencil_format)) {
         return nullptr;
     }
     const auto [it, is_new] = graphics_pipelines.try_emplace(graphics_key);
@@ -374,7 +374,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
     return it->second.get();
 }
 
-bool PipelineCache::RefreshGraphicsKey() {
+bool PipelineCache::RefreshGraphicsKey(vk::Format depth_stencil_format) {
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
@@ -386,6 +386,12 @@ bool PipelineCache::RefreshGraphicsKey() {
     key.stencil_format = regs.depth_buffer.StencilValid()
                              ? regs.depth_buffer.stencil_info.format
                              : AmdGpu::DepthBuffer::StencilFormat::Invalid;
+    key.depth_stencil_format =
+        depth_stencil_format != vk::Format::eUndefined
+            ? depth_stencil_format
+            : instance.GetSupportedFormat(
+                  LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
+                  vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
     key.depth_clamp_enable = !regs.depth_render_override.disable_viewport_clamp;
     key.depth_clip_enable = regs.clipper_control.ZclipEnable();
     key.clip_space = regs.clipper_control.clip_space;

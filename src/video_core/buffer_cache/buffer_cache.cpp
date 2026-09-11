@@ -779,9 +779,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
     ASSERT_MSG(device_addr == image.info.guest_address,
                "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
                image.info.guest_address);
-    const u32 buf_offset = buffer.Offset(image.info.guest_address);
+    const u64 buf_offset = buffer.Offset(image.info.guest_address);
     boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
-    u32 copy_size = 0;
+    u64 copy_size = 0;
     for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
         const auto& mip_info = image.info.mips_layout[mip];
         const u32 width = std::max(image.info.size.width >> mip, 1u);
@@ -809,7 +809,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, VAddr device_addr, 
         return false;
     }
     auto& tile_manager = texture_cache.GetTileManager();
-    tile_manager.TileImage(image, buffer_copies, buffer.Handle(), buf_offset, copy_size);
+    tile_manager.TileImage(image, buffer_copies, buffer, buf_offset, copy_size);
     return true;
 }
 

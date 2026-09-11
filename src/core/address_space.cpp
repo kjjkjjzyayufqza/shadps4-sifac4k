@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
 #include <map>
 #include "common/alignment.h"
 #include "common/arch.h"
@@ -544,16 +545,31 @@ struct AddressSpace::Impl {
             return;
         }
 
+        if (size == 0) {
+            return;
+        }
+        if (size > std::numeric_limits<VAddr>::max() - virtual_addr) {
+            LOG_ERROR(Core, "Virtual protection range overflows: address {:#x}, size {:#x}",
+                      virtual_addr, size);
+            return;
+        }
         const VAddr virtual_end = virtual_addr + size;
-        auto it = --regions.upper_bound(virtual_addr);
-        ASSERT_MSG(it != regions.end(), "addr {:#x} out of bounds", virtual_addr);
-        for (; it->first < virtual_end; it++) {
+        auto it = regions.upper_bound(virtual_addr);
+        if (it != regions.begin()) {
+            --it;
+        }
+        // The request can reach the last reserved region or start in a gap between regions.
+        for (; it != regions.end() && it->first < virtual_end; ++it) {
             if (!it->second.is_mapped) {
                 continue;
             }
             const auto& region = it->second;
+            const VAddr region_end = region.base + region.size;
+            if (region_end <= virtual_addr) {
+                continue;
+            }
             const u64 range_addr = std::max(region.base, virtual_addr);
-            const u64 range_size = std::min(region.base + region.size, virtual_end) - range_addr;
+            const u64 range_size = std::min(region_end, virtual_end) - range_addr;
             DWORD old_flags{};
             if (!VirtualProtectEx(process, LPVOID(range_addr), range_size, new_flags, &old_flags)) {
                 UNREACHABLE_MSG(

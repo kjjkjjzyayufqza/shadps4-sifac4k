@@ -771,6 +771,35 @@ vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const
     return it->second.optimalTilingFeatures | it->second.bufferFeatures;
 }
 
+ImageFormatSupport Instance::GetImageFormatSupport(
+    const vk::PhysicalDeviceImageFormatInfo2& info) const {
+    const std::array key{static_cast<u32>(info.format), static_cast<u32>(info.type),
+                         static_cast<u32>(info.tiling), static_cast<u32>(info.usage),
+                         static_cast<u32>(info.flags)};
+    std::scoped_lock lock{image_format_mutex};
+    if (!info.pNext) {
+        if (const auto it = image_format_properties.find(key);
+            it != image_format_properties.end()) {
+            return it->second;
+        }
+    }
+    const auto queried = physical_device.getImageFormatProperties2(info);
+    ImageFormatSupport support{.result = queried.result};
+    if (queried.result == vk::Result::eSuccess) {
+        support.properties = queried.value.imageFormatProperties;
+    }
+    // Only cache stable capability answers, never resource failures or unkeyed extension chains.
+    if (!info.pNext && (support.result == vk::Result::eSuccess ||
+                        support.result == vk::Result::eErrorFormatNotSupported)) {
+        image_format_properties.emplace(key, support);
+        LOG_INFO(Render_Vulkan, "Image capability {} type={} usage={} flags={}: {} samples={}",
+                 vk::to_string(info.format), vk::to_string(info.type), vk::to_string(info.usage),
+                 vk::to_string(info.flags), vk::to_string(support.result),
+                 vk::to_string(support.properties.sampleCounts));
+    }
+    return support;
+}
+
 bool Instance::IsFormatSupported(const vk::Format format,
                                  const vk::FormatFeatureFlags2 flags) const {
     if (format == vk::Format::eUndefined) [[unlikely]] {

@@ -121,7 +121,11 @@ ImageView::ImageView(const Vulkan::Instance& instance, const ImageViewInfo& info
         .pNext = &usage_ci,
         .image = image.GetImage(),
         .viewType = ConvertImageViewType(info.type),
-        .format = instance.GetSupportedFormat(format, image.format_features),
+        .format = format == image.info.pixel_format &&
+                          (image.aspect_mask &
+                           (vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil))
+                      ? image.GetImageFormat()
+                      : instance.GetSupportedFormat(format, image.format_features),
         .components = info.mapping,
         .subresourceRange{
             .aspectMask = aspect,

@@ -3,9 +3,13 @@
 
 #pragma once
 
+#include <array>
+#include <map>
+#include <mutex>
 #include <span>
 #include <unordered_map>
 
+#include "video_core/renderer_vulkan/vk_image_format.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #define TRACY_VK_USE_SYMBOL_TABLE
@@ -32,6 +36,9 @@ public:
     /// Gets a compatibility format if the format is not supported.
     [[nodiscard]] vk::Format GetSupportedFormat(vk::Format format,
                                                 vk::FormatFeatureFlags2 flags) const;
+
+    [[nodiscard]] ImageFormatSupport GetImageFormatSupport(
+        const vk::PhysicalDeviceImageFormatInfo2& info) const;
 
     /// Returns the Vulkan instance
     vk::Instance GetInstance() const {
@@ -315,6 +322,14 @@ public:
         return properties.limits.minUniformBufferOffsetAlignment;
     }
 
+    vk::DeviceSize StorageMaxSize() const {
+        return properties.limits.maxStorageBufferRange;
+    }
+
+    const auto& MaxComputeWorkGroupCount() const {
+        return properties.limits.maxComputeWorkGroupCount;
+    }
+
     /// Returns the minimum required alignment for storage buffers
     vk::DeviceSize StorageMinAlignment() const {
         return properties.limits.minStorageBufferOffsetAlignment;
@@ -491,6 +506,8 @@ private:
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
+    mutable std::mutex image_format_mutex;
+    mutable std::map<std::array<u32, 5>, ImageFormatSupport> image_format_properties;
     TracyVkCtx profiler_context{};
     u32 queue_family_index{0};
     bool custom_border_color{};

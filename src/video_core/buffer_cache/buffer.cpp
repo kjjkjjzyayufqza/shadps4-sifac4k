@@ -243,6 +243,20 @@ void StreamBuffer::Commit() {
     watch.tick = scheduler->CurrentTick();
 }
 
+void StreamBuffer::Invalidate(const u64 invalidate_offset, const u64 size) {
+    ASSERT_MSG(usage == MemoryUsage::Download, "Only download stream buffers can be invalidated");
+    ASSERT_MSG(invalidate_offset <= size_bytes && size <= size_bytes - invalidate_offset,
+               "Invalid download range [{:#x}, {:#x}) for buffer size {:#x}", invalidate_offset,
+               invalidate_offset + size, size_bytes);
+    if (is_coherent) {
+        return;
+    }
+    const VkResult result = vmaInvalidateAllocation(instance->GetAllocator(), buffer.allocation,
+                                                    invalidate_offset, size);
+    ASSERT_MSG(result == VK_SUCCESS, "Failed to invalidate download buffer: {}",
+               vk::to_string(vk::Result{result}));
+}
+
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
     watches.resize(watches.size() + grow_size);
 }

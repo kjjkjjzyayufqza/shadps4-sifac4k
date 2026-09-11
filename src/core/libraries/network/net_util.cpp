@@ -38,6 +38,7 @@ typedef int net_socket;
 #include <string.h>
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "net.h"
 #include "net_error.h"
@@ -45,12 +46,40 @@ typedef int net_socket;
 
 namespace NetUtil {
 
+bool NetUtilInternal::RetrieveSelectedInterface() {
+    const auto address = EmulatorSettings.GetNetworkInterfaceAddress();
+    if (!selected_interface_checked || selected_interface_address != address) {
+        selected_interface_checked = true;
+        selected_interface_address = address;
+        selected_interface = Common::Network::ResolveIpv4Interface(address);
+        if (!selected_interface) {
+            LOG_ERROR(Lib_NetCtl, "Selected IPv4 interface '{}' is unavailable", address);
+        } else {
+            LOG_INFO(Lib_NetCtl, "Selected IPv4 interface: address={} netmask={} gateway={}",
+                     Common::Network::Ipv4ToString(selected_interface->address),
+                     Common::Network::Ipv4ToString(selected_interface->netmask),
+                     Common::Network::Ipv4ToString(selected_interface->gateway));
+        }
+    }
+    if (!selected_interface) {
+        return false;
+    }
+    ip = Common::Network::Ipv4ToString(selected_interface->address);
+    netmask = Common::Network::Ipv4ToString(selected_interface->netmask);
+    default_gateway = Common::Network::Ipv4ToString(selected_interface->gateway);
+    ether_address = selected_interface->mac;
+    return true;
+}
+
 const std::array<u8, 6>& NetUtilInternal::GetEthernetAddr() const {
     return ether_address;
 }
 
 bool NetUtilInternal::RetrieveEthernetAddr() {
     std::scoped_lock lock{m_mutex};
+    if (!EmulatorSettings.GetNetworkInterfaceAddress().empty()) {
+        return RetrieveSelectedInterface();
+    }
 #ifdef _WIN32
     std::vector<u8> adapter_infos(sizeof(IP_ADAPTER_INFO));
     ULONG size_infos = sizeof(IP_ADAPTER_INFO);
@@ -129,6 +158,9 @@ const std::string& NetUtilInternal::GetDefaultGateway() const {
 
 bool NetUtilInternal::RetrieveDefaultGateway() {
     std::scoped_lock lock{m_mutex};
+    if (!EmulatorSettings.GetNetworkInterfaceAddress().empty()) {
+        return RetrieveSelectedInterface();
+    }
 
 #ifdef _WIN32
     ULONG flags = GAA_FLAG_INCLUDE_GATEWAYS;
@@ -266,6 +298,9 @@ const std::string& NetUtilInternal::GetNetmask() const {
 
 bool NetUtilInternal::RetrieveNetmask() {
     std::scoped_lock lock{m_mutex};
+    if (!EmulatorSettings.GetNetworkInterfaceAddress().empty()) {
+        return RetrieveSelectedInterface();
+    }
     char netmaskStr[INET_ADDRSTRLEN];
     auto success = false;
 
@@ -348,6 +383,9 @@ u32 NetUtilInternal::GetNatType() const {
 
 bool NetUtilInternal::RetrieveIp() {
     std::scoped_lock lock{m_mutex};
+    if (!EmulatorSettings.GetNetworkInterfaceAddress().empty()) {
+        return RetrieveSelectedInterface();
+    }
 
     auto sockfd = socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {

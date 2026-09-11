@@ -38,6 +38,29 @@ layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define BLOCK_TYPE u32vec4
 #endif
 
+#ifndef LINEAR_BITS_PER_PIXEL
+#define LINEAR_BITS_PER_PIXEL BITS_PER_PIXEL
+#endif
+
+#if LINEAR_BITS_PER_PIXEL == 8
+#define LINEAR_BLOCK_TYPE uint8_t
+#elif LINEAR_BITS_PER_PIXEL == 16
+#define LINEAR_BLOCK_TYPE uint16_t
+#elif LINEAR_BITS_PER_PIXEL == 32
+#define LINEAR_BLOCK_TYPE uint32_t
+#elif LINEAR_BITS_PER_PIXEL == 64
+#define LINEAR_BLOCK_TYPE u32vec2
+#elif LINEAR_BITS_PER_PIXEL == 96
+#define LINEAR_BLOCK_TYPE u32vec3
+#else
+#define LINEAR_BLOCK_TYPE u32vec4
+#endif
+
+#ifndef DEPTH_CONVERSION
+#define DEPTH_CONVERSION 0
+#endif
+
+#ifndef IS_LINEAR
 #if PIPE_CONFIG == ADDR_SURF_P2
 #define NUM_PIPES 2
 #define NUM_PIPE_BITS 1
@@ -84,6 +107,7 @@ layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 #define BITS_TO_BYTES(x) (((x) + (BITS_PER_BYTE-1)) / BITS_PER_BYTE)
 
 #define _BIT(v, b) bitfieldExtract((v), (b), 1)
+#endif
 
 struct MipInfo {
     uint size;
@@ -97,16 +121,18 @@ layout (set = 0, binding = 0, scalar) buffer InputBuf {
 };
 
 layout (set = 0, binding = 1, scalar) buffer OutputBuf {
-    BLOCK_TYPE linear_data[];
+    LINEAR_BLOCK_TYPE linear_data[];
 };
 
 layout (set = 0, binding = 2, scalar) uniform TilingInfo {
     uint bank_swizzle;
     uint num_slices;
     uint num_mips;
+    uint num_texels;
     MipInfo mips[16];
 } info;
 
+#ifndef IS_LINEAR
 uint32_t ComputePixelIndexWithinMicroTile(uint32_t x, uint32_t y, uint32_t z) {
     uint32_t p0 = 0;
     uint32_t p1 = 0;
@@ -412,16 +438,31 @@ uint32_t ComputeSurfaceAddrFromCoordMacroTiled(uint32_t x, uint32_t y, uint32_t 
 uint GetMipLevel(inout uint texel) {
     uint mip = 0;
     uint mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
-    while (texel >= mip_size && mip < info.num_mips) {
+    while (mip + 1 < info.num_mips && texel >= mip_size) {
         texel -= mip_size;
         ++mip;
         mip_size = info.mips[mip].size / BYTES_PER_PIXEL;
     }
     return mip;
 }
+#endif
 
 void main() {
-    uint texel = gl_GlobalInvocationID.x;
+    if (info.num_texels == 0) {
+        return;
+    }
+    const uint group = gl_WorkGroupID.x + gl_WorkGroupID.y * gl_NumWorkGroups.x;
+    if (group > (info.num_texels - 1) / gl_WorkGroupSize.x) {
+        return;
+    }
+    const uint linear_texel = group * gl_WorkGroupSize.x + gl_LocalInvocationID.x;
+    uint texel = linear_texel;
+    if (texel >= info.num_texels) {
+        return;
+    }
+#ifdef IS_LINEAR
+    uint tiled_offset = texel * BYTES_PER_PIXEL;
+#else
     uint mip = GetMipLevel(texel);
     uint pitch = info.mips[mip].pitch;
     uint height = info.mips[mip].height;
@@ -435,10 +476,40 @@ void main() {
 #else
     tiled_offset += ComputeSurfaceAddrFromCoordMacroTiled(x, y, slice, pitch, height, 0);
 #endif
+#endif
 
 #ifdef IS_TILER
-    tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[gl_GlobalInvocationID.x];
+#if DEPTH_CONVERSION == 1 || DEPTH_CONVERSION == 2
+    // Combined depth/stencil copies use the selected host depth plane's texel representation.
+    const uint32_t host_value = uint32_t(linear_data[linear_texel]);
+#if DEPTH_CONVERSION == 1
+    const uint32_t d24 = host_value & 0x00ffffffu;
+    const uint32_t a = d24 >> 8;
+    const uint32_t b = d24 & 0xffu;
+    const int32_t remainder = int32_t(b * 65535u) - int32_t(a * 255u);
+    const int32_t adjustment = remainder >= 8388608 ? 1 : (remainder <= -8388608 ? -1 : 0);
+    tiled_data[tiled_offset / BYTES_PER_PIXEL] = BLOCK_TYPE(uint32_t(int32_t(a) + adjustment));
+#elif DEPTH_CONVERSION == 2
+    float host_depth = uintBitsToFloat(host_value);
+    host_depth = isnan(host_depth) ? 0.0 : clamp(host_depth, 0.0, 1.0);
+    tiled_data[tiled_offset / BYTES_PER_PIXEL] =
+        BLOCK_TYPE(uint32_t(floor(host_depth * 65535.0 + 0.5)));
+#endif
 #else
-    linear_data[gl_GlobalInvocationID.x] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+    tiled_data[tiled_offset / BYTES_PER_PIXEL] = linear_data[linear_texel];
+#endif
+#else
+#if DEPTH_CONVERSION == 1 || DEPTH_CONVERSION == 2
+    const uint32_t guest_value = uint32_t(tiled_data[tiled_offset / BYTES_PER_PIXEL]);
+#if DEPTH_CONVERSION == 1
+    linear_data[linear_texel] = LINEAR_BLOCK_TYPE(
+        (guest_value << 8) + (guest_value + 128u) / 257u);
+#elif DEPTH_CONVERSION == 2
+    linear_data[linear_texel] = LINEAR_BLOCK_TYPE(
+        floatBitsToUint(float(guest_value) / 65535.0));
+#endif
+#else
+    linear_data[linear_texel] = tiled_data[tiled_offset / BYTES_PER_PIXEL];
+#endif
 #endif
 }

@@ -128,7 +128,7 @@ public:
 
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
-                                                       u32 offset = 0) {
+                                                       u64 offset = 0) {
         if (dst_acess_mask == access_mask && stage == dst_stage) {
             return {};
         }
@@ -180,6 +180,8 @@ public:
 
     /// Ensures that reserved bytes of memory are available to the GPU.
     void Commit();
+
+    void Invalidate(u64 invalidate_offset, u64 size);
 
     /// Maps and commits a memory region with user provided data
     u64 Copy(auto src, size_t size, size_t alignment = 0) {

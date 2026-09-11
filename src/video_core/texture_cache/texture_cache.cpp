@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <memory>
+
 #include <xxhash.h>
 
 #include "common/assert.h"
@@ -21,6 +28,29 @@ namespace VideoCore {
 
 static constexpr u64 PageShift = 12;
 static constexpr u64 NumFramesBeforeRemoval = 32;
+
+static void ConvertDepthDownloadToGuest(u8* data, const u64 num_texels,
+                                        const DepthConversion conversion) {
+    if (conversion == DepthConversion::None) {
+        return;
+    }
+
+    for (u64 texel = 0; texel < num_texels; ++texel) {
+        u32 host_value;
+        std::memcpy(&host_value, data + texel * sizeof(host_value), sizeof(host_value));
+
+        u16 guest_value;
+        if (conversion == DepthConversion::D16ToD24) {
+            guest_value = D24ToD16(host_value);
+        } else {
+            const float depth = std::bit_cast<float>(host_value);
+            const float clamped_depth = std::isnan(depth) ? 0.0f : std::clamp(depth, 0.0f, 1.0f);
+            guest_value = static_cast<u16>(
+                std::lround(clamped_depth * static_cast<float>(std::numeric_limits<u16>::max())));
+        }
+        std::memcpy(data + texel * sizeof(guest_value), &guest_value, sizeof(guest_value));
+    }
+}
 
 TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                            AmdGpu::Liverpool* liverpool_, BufferCache& buffer_cache_,
@@ -74,11 +104,32 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
         return;
     }
     auto& download_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::Download);
-    const u32 download_size = image.info.pitch * image.info.size.height * image.info.size.depth *
-                              image.info.resources.layers * (image.info.num_bits / 8);
-    ASSERT(download_size <= image.info.guest_size);
-    const auto [download, offset] = download_buffer.Map(download_size);
-    download_buffer.Commit();
+    const u32 guest_bytes_per_pixel = image.info.num_bits / 8;
+    const u64 num_texels = u64{image.info.pitch} * image.info.size.height * image.info.size.depth *
+                           image.info.resources.layers;
+    const u64 guest_download_size = num_texels * guest_bytes_per_pixel;
+    ASSERT(guest_download_size <= image.info.guest_size);
+    const auto tiling_format = GetTilingFormat(image.info, image.GetImageFormat());
+    const u64 host_download_size =
+        GuestToHostBytes(guest_download_size, guest_bytes_per_pixel, tiling_format);
+    ASSERT_MSG(image.info.num_samples == 1,
+               "Image readback requires a single-sample source, got {} samples",
+               image.info.num_samples);
+
+    // An asynchronous CPU callback can run after the utility ring becomes reusable. Give it an
+    // owned buffer so its mapped bytes remain stable until the callback completes. Oversized
+    // synchronous readbacks use the same path because they cannot fit the fixed utility ring.
+    std::unique_ptr<StreamBuffer> owned_download_buffer;
+    StreamBuffer* readback_buffer = &download_buffer;
+    if (!sync || host_download_size > download_buffer.SizeBytes()) {
+        owned_download_buffer = std::make_unique<StreamBuffer>(
+            instance, scheduler, MemoryUsage::Download, host_download_size);
+        readback_buffer = owned_download_buffer.get();
+    }
+    const auto [download, offset] = readback_buffer->Map(host_download_size, 4);
+    ASSERT_MSG(download != nullptr, "Failed to reserve {:#x} bytes for image readback",
+               host_download_size);
+    readback_buffer->Commit();
     const vk::BufferImageCopy image_download = {
         .bufferOffset = offset,
         .bufferRowLength = image.info.pitch,
@@ -98,18 +149,37 @@ void TextureCache::DownloadImageMemory(ImageId image_id, bool sync) {
     const auto cmdbuf = scheduler.CommandBuffer();
     image.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {});
     cmdbuf.copyImageToBuffer(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                             download_buffer.Handle(), image_download);
+                             readback_buffer->Handle(), image_download);
+
+    const vk::BufferMemoryBarrier2 host_barrier{
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+        .buffer = readback_buffer->Handle(),
+        .offset = offset,
+        .size = host_download_size,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .bufferMemoryBarrierCount = 1,
+        .pBufferMemoryBarriers = &host_barrier,
+    });
+
+    auto write_back = [device_addr = image.info.guest_address, download, offset,
+                       guest_download_size, host_download_size, num_texels,
+                       depth_conversion = tiling_format.depth_conversion, readback_buffer,
+                       owned_download_buffer = std::move(owned_download_buffer)]() mutable {
+        readback_buffer->Invalidate(offset, host_download_size);
+        ConvertDepthDownloadToGuest(download, num_texels, depth_conversion);
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
+                                                  guest_download_size);
+    };
 
     if (sync) {
         scheduler.Finish();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image.info.guest_address),
-                                                  download, download_size);
+        write_back();
     } else {
-        scheduler.DeferPriorityOperation(
-            [this, device_addr = image.info.guest_address, download, download_size] {
-                Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr), download,
-                                                          download_size);
-            });
+        scheduler.DeferPriorityOperation(std::move(write_back));
     }
 }
 
@@ -254,7 +324,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
                               vk::AccessFlagBits2::eDepthStencilAttachmentWrite, {});
             blit_helper.ReinterpretColorAsMsDepth(
                 new_info.size.width, new_info.size.height, new_info.num_samples,
-                cache_image.info.pixel_format, new_info.pixel_format, cache_image.GetImage(),
+                cache_image.GetImageFormat(), new_image.GetImageFormat(), cache_image.GetImage(),
                 new_image.GetImage());
         } else {
             LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
@@ -730,6 +800,8 @@ void TextureCache::RefreshImage(Image& image) {
     const u32 num_mips = image.info.resources.levels;
     const bool is_gpu_modified = True(image.flags & ImageFlagBits::GpuModified);
     const bool is_gpu_dirty = True(image.flags & ImageFlagBits::GpuDirty);
+    const auto tiling_format = GetTilingFormat(image.info, image.GetImageFormat());
+    const u32 guest_bytes_per_pixel = image.info.num_bits / 8;
 
     boost::container::small_vector<vk::BufferImageCopy, 14> image_copies;
     for (u32 m = 0; m < num_mips; m++) {
@@ -752,7 +824,7 @@ void TextureCache::RefreshImage(Image& image) {
         const u32 extent_width = mip_pitch ? std::min(mip_pitch, width) : width;
         const u32 extent_height = mip_height ? std::min(mip_height, height) : height;
         image_copies.push_back({
-            .bufferOffset = mip_offset,
+            .bufferOffset = GuestToHostBytes(mip_offset, guest_bytes_per_pixel, tiling_format),
             .bufferRowLength = mip_pitch,
             .bufferImageHeight = mip_height,
             .imageSubresource{
@@ -775,8 +847,13 @@ void TextureCache::RefreshImage(Image& image) {
 
     const auto [in_buffer, in_offset] =
         buffer_cache.ObtainBufferForImage(image.info.guest_address, image.info.guest_size);
-    if (auto barrier = in_buffer->GetBarrier(vk::AccessFlagBits2::eTransferRead,
-                                             vk::PipelineStageFlagBits2::eTransfer)) {
+    const bool uses_detiler =
+        NeedsTilingPipeline(image.info.props.is_tiled, tiling_format.depth_conversion);
+    const auto input_access =
+        uses_detiler ? vk::AccessFlagBits2::eShaderRead : vk::AccessFlagBits2::eTransferRead;
+    const auto input_stage = uses_detiler ? vk::PipelineStageFlagBits2::eComputeShader
+                                          : vk::PipelineStageFlagBits2::eTransfer;
+    if (auto barrier = in_buffer->GetBarrier(input_access, input_stage)) {
         scheduler.CommandBuffer().pipelineBarrier2(vk::DependencyInfo{
             .dependencyFlags = vk::DependencyFlagBits::eByRegion,
             .bufferMemoryBarrierCount = 1,
@@ -785,12 +862,13 @@ void TextureCache::RefreshImage(Image& image) {
     }
 
     const auto [buffer, offset] =
-        tile_manager.DetileImage(in_buffer->Handle(), in_offset, image.info);
+        tile_manager.DetileImage(*in_buffer, in_offset, image.info, image.GetImageFormat());
     for (auto& copy : image_copies) {
         copy.bufferOffset += offset;
     }
 
-    image.Upload(image_copies, buffer, offset);
+    image.Upload(image_copies, buffer, offset,
+                 GuestToHostBytes(image.info.guest_size, guest_bytes_per_pixel, tiling_format));
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sampler,
@@ -986,7 +1064,8 @@ void TextureCache::GarbageCollectImages() {
             return false;
         }
         if (download) {
-            DownloadImageMemory(image_id);
+            // Finish writeback before FreeImage releases tracking and permits guest VA reuse.
+            DownloadImageMemory(image_id, true);
         }
         FreeImage(image_id);
         if (total_used_memory < critical_gc_memory) {

@@ -98,7 +98,12 @@ void UniqueImage::Destroy() {
 }
 
 void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
-    this->image_ci = image_ci;
+    const auto result = TryCreate(image_ci);
+    ASSERT_MSG(result == vk::Result::eSuccess, "Failed allocating image with error {}",
+               vk::to_string(result));
+}
+
+vk::Result UniqueImage::TryCreate(const vk::ImageCreateInfo& image_ci) {
     ASSERT(!image);
     const VmaAllocationCreateInfo alloc_info = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
@@ -111,11 +116,15 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
 
     const VkImageCreateInfo image_ci_unsafe = static_cast<VkImageCreateInfo>(image_ci);
     VkImage unsafe_image{};
+    VmaAllocation new_allocation{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_info, &unsafe_image,
-                                     &allocation, nullptr);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
-    image = vk::Image{unsafe_image};
+                                     &new_allocation, nullptr);
+    if (result == VK_SUCCESS) {
+        this->image_ci = image_ci;
+        image = vk::Image{unsafe_image};
+        allocation = new_allocation;
+    }
+    return vk::Result{result};
 }
 
 Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -152,29 +161,10 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     }
 
     constexpr auto tiling = vk::ImageTiling::eOptimal;
-    const auto supported_format = instance->GetSupportedFormat(info.pixel_format, format_features);
-    const vk::PhysicalDeviceImageFormatInfo2 format_info{
-        .format = supported_format,
-        .type = ConvertImageType(info.type),
-        .tiling = tiling,
-        .usage = usage_flags,
-        .flags = flags,
-    };
-    const auto image_format_properties =
-        instance->GetPhysicalDevice().getImageFormatProperties2(format_info);
-    if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
-    }
-    supported_samples = image_format_properties.result == vk::Result::eSuccess
-                            ? image_format_properties.value.imageFormatProperties.sampleCounts
-                            : vk::SampleCountFlagBits::e1;
-
-    const vk::ImageCreateInfo image_ci = {
+    vk::ImageCreateInfo image_ci = {
         .flags = flags,
         .imageType = ConvertImageType(info.type),
-        .format = supported_format,
+        .format = info.pixel_format,
         .extent{
             .width = info.size.width,
             .height = info.size.height,
@@ -182,7 +172,7 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
         .arrayLayers = static_cast<u32>(info.resources.layers),
-        .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
+        .samples = static_cast<vk::SampleCountFlagBits>(info.num_samples),
         .tiling = tiling,
         .usage = usage_flags,
         .initialLayout = vk::ImageLayout::eUndefined,
@@ -191,7 +181,40 @@ Image::Image(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance->GetDevice(), instance->GetAllocator()};
-    backing->image.Create(image_ci);
+    const auto query_support = [this](const vk::ImageCreateInfo& candidate) {
+        return instance->GetImageFormatSupport({.format = candidate.format,
+                                                .type = candidate.imageType,
+                                                .tiling = candidate.tiling,
+                                                .usage = candidate.usage,
+                                                .flags = candidate.flags});
+    };
+    if (info.props.is_depth) {
+        const auto selected = TryCreateDepthImage(image_ci, query_support,
+                                                  [this](const vk::ImageCreateInfo& candidate) {
+                                                      return backing->image.TryCreate(candidate);
+                                                  });
+        ASSERT_MSG(selected.result == vk::Result::eSuccess,
+                   "No usable depth image for {} {}x{}x{} levels={} layers={} samples={}: {}",
+                   vk::to_string(info.pixel_format), info.size.width, info.size.height,
+                   info.size.depth, info.resources.levels, info.resources.layers, info.num_samples,
+                   vk::to_string(selected.result));
+        supported_samples = selected.supported_samples;
+        LOG_DEBUG(Render_Vulkan, "Depth image format {} -> {}", vk::to_string(info.pixel_format),
+                  vk::to_string(selected.format));
+    } else {
+        image_ci.format = instance->GetSupportedFormat(info.pixel_format, format_features);
+        const auto support = query_support(image_ci);
+        if (support.result == vk::Result::eErrorFormatNotSupported) {
+            LOG_ERROR(Render_Vulkan,
+                      "image format {} type {} is not supported (flags {}, usage {})",
+                      vk::to_string(image_ci.format), vk::to_string(image_ci.imageType),
+                      vk::to_string(image_ci.flags), vk::to_string(image_ci.usage));
+        }
+        supported_samples = support.result == vk::Result::eSuccess ? support.properties.sampleCounts
+                                                                   : vk::SampleCountFlagBits::e1;
+        image_ci.samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples);
+        backing->image.Create(image_ci);
+    }
 
     Vulkan::SetObjectName(instance->GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
@@ -353,7 +376,7 @@ void Image::Transit(vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
 }
 
 void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffer buffer,
-                   u64 offset) {
+                   u64 offset, u64 buffer_size) {
     SetBackingSamples(info.num_samples, false);
     scheduler->EndRendering();
 
@@ -364,16 +387,16 @@ void Image::Upload(std::span<const vk::BufferImageCopy> upload_copies, vk::Buffe
         .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
         .buffer = buffer,
         .offset = offset,
-        .size = info.guest_size,
+        .size = buffer_size,
     };
     const vk::BufferMemoryBarrier2 post_barrier{
         .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
-        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferRead,
         .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
         .dstAccessMask = vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite,
         .buffer = buffer,
         .offset = offset,
-        .size = info.guest_size,
+        .size = buffer_size,
     };
     const auto image_barriers =
         GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
@@ -488,7 +511,22 @@ static std::pair<u32, u32> SanitizeCopyLayers(const ImageInfo& src_info, const I
     return std::make_pair(src_layers, dst_layers);
 }
 
+void Image::ValidateCopyFormat(const Image& source) const {
+    if (!info.props.is_depth && !source.info.props.is_depth) {
+        return;
+    }
+    // A raw copy cannot convert a promoted depth representation. Keep unsupported overlap
+    // conversions out of the GPU queue instead of risking a device loss or corrupt depth values.
+    const bool unchanged = GetImageFormat() == info.pixel_format &&
+                           source.GetImageFormat() == source.info.pixel_format;
+    ASSERT_MSG(unchanged || GetImageFormat() == source.GetImageFormat(),
+               "Depth copy requires representation conversion: {} ({}) -> {} ({})",
+               vk::to_string(source.info.pixel_format), vk::to_string(source.GetImageFormat()),
+               vk::to_string(info.pixel_format), vk::to_string(GetImageFormat()));
+}
+
 void Image::CopyImage(Image& src_image) {
+    ValidateCopyFormat(src_image);
     const auto& src_info = src_image.info;
 
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
@@ -590,6 +628,7 @@ void Image::CopyImage(Image& src_image) {
             vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {});
 }
 void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset) {
+    ValidateCopyFormat(src_image);
     const auto& src_info = src_image.info;
     const u32 num_mips = std::min(src_info.resources.levels, info.resources.levels);
     const u32 num_layers = std::min(src_info.resources.layers, info.resources.layers);
@@ -670,6 +709,7 @@ void Image::CopyImageWithBuffer(Image& src_image, vk::Buffer buffer, u64 offset)
 }
 
 void Image::CopyMip(Image& src_image, u32 mip, u32 slice) {
+    ValidateCopyFormat(src_image);
     const auto& src_info = src_image.info;
 
     const auto dst_dim = info.props.is_block ? 2 : 0;

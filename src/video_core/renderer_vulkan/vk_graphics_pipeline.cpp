@@ -251,9 +251,7 @@ GraphicsPipeline::GraphicsPipeline(
         stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
     }
 
-    const auto depth_format =
-        instance.GetSupportedFormat(LiverpoolToVK::DepthFormat(key.z_format, key.stencil_format),
-                                    vk::FormatFeatureFlagBits2::eDepthStencilAttachment);
+    const auto depth_format = key.depth_stencil_format;
     std::array<vk::Format, Shader::IR::NumRenderTargets> color_formats;
     for (s32 i = 0; i < key.num_color_attachments; ++i) {
         const auto& col_buf = key.color_buffers[i];

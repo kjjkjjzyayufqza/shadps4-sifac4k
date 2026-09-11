@@ -107,7 +107,7 @@ bool Rasterizer::FilterDraw() {
     return true;
 }
 
-void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
+const GraphicsPipeline* Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
@@ -145,6 +145,14 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     } else {
         db_desc.first = {};
     }
+    if (db_desc.first) {
+        const auto format = texture_cache.GetImage(db_desc.first).GetImageFormat();
+        if (format != key.depth_stencil_format) {
+            // A resource-specific fallback must also select a matching rendering pipeline.
+            return pipeline_cache.GetGraphicsPipeline(format);
+        }
+    }
+    return pipeline;
 }
 
 static std::pair<u32, u32> GetDrawOffsets(
@@ -201,8 +209,8 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
+    pipeline = PrepareRenderState(pipeline);
+    if (!pipeline || !BindResources(pipeline)) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -250,8 +258,8 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
 
-    PrepareRenderState(pipeline);
-    if (!BindResources(pipeline)) {
+    pipeline = PrepareRenderState(pipeline);
+    if (!pipeline || !BindResources(pipeline)) {
         return;
     }
     const auto state = BeginRendering(pipeline);
@@ -1018,6 +1026,11 @@ void Rasterizer::DepthStencilCopy(bool is_depth, bool is_stencil) {
 
     auto& read_image = texture_cache.GetImage(texture_cache.FindImage(read_desc));
     auto& write_image = texture_cache.GetImage(texture_cache.FindImage(write_desc));
+
+    ASSERT_MSG(read_image.GetImageFormat() == write_image.GetImageFormat(),
+               "Depth/stencil copy requires format conversion: {} -> {}",
+               vk::to_string(read_image.GetImageFormat()),
+               vk::to_string(write_image.GetImageFormat()));
 
     VideoCore::SubresourceRange sub_range;
     sub_range.base.layer = liverpool->regs.depth_view.slice_start;
