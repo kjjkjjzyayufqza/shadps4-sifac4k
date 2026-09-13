@@ -220,7 +220,11 @@ s32 PS4_SYSV_ABI sceNpScoreWaitAsync(s32 reqId, s32* result) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
     }
     std::unique_lock rlock(req->mutex);
-    req->cv.wait(rlock, [&] { return req->result.has_value(); });
+    // Bounded: a reply that never arrives must not block this guest thread for the session.
+    if (!req->cv.wait_for(rlock, kNpRequestWaitTimeout, [&] { return req->result.has_value(); })) {
+        req->result = ORBIS_NP_ERROR_TIMEOUT;
+        LOG_ERROR(Lib_NpScore, "WaitAsync reqId={} timed out with no reply", reqId);
+    }
     if (result != nullptr) {
         *result = *req->result;
     }

@@ -14,16 +14,22 @@ int PS4_SYSV_ABI sceSharePlayCrashDaemon() {
     return ORBIS_OK;
 }
 
+// Both connection-info queries reject the call before reading the caller's buffer unless the share
+// daemon reports an established session. There is never one here, so they always take that path:
+// reporting success would leave the caller reading whatever its own buffer happened to hold, and
+// titles that poll this every frame act on that garbage.
 int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfo(OrbisSharePlayConnectionInfo* pInfo) {
-    memset(pInfo, 0, sizeof(*pInfo));
-    pInfo->status = ORBIS_SHARE_PLAY_CONNECTION_STATUS_DORMANT;
-    LOG_DEBUG(Lib_SharePlay, "(STUBBED) called");
-    return ORBIS_OK;
+    if (pInfo == nullptr) {
+        return ORBIS_SHARE_PLAY_ERROR_INVALID_ARGUMENT;
+    }
+    return ORBIS_SHARE_PLAY_ERROR_NOT_CONNECTED;
 }
 
-int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfoA() {
-    LOG_ERROR(Lib_SharePlay, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfoA(OrbisSharePlayConnectionInfoA* pInfo) {
+    if (pInfo == nullptr) {
+        return ORBIS_SHARE_PLAY_ERROR_INVALID_ARGUMENT;
+    }
+    return ORBIS_SHARE_PLAY_ERROR_NOT_CONNECTED;
 }
 
 int PS4_SYSV_ABI sceSharePlayGetCurrentInfo() {

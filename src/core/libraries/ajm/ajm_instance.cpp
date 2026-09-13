@@ -117,13 +117,22 @@ void AjmInstance::ExecuteJob(AjmJob& job) {
                 m_gapless.Reset();
                 m_total_samples = 0;
             }
+            // Report these as reasons work was left undone, not as a side effect of finishing:
+            // a block whose input is consumed exactly and whose output is filled exactly is a
+            // clean job. Titles that submit one superframe at a time (MAXIBOOST ON submits 512
+            // bytes in and 4096 out) otherwise see NOT_ENOUGH_ROOM on every successful decode and
+            // restart the stream.
+            if (in_buf.size() < m_codec->GetMinimumInputSize()) {
+                if (!in_buf.empty()) {
+                    job.output.p_result->result |= ORBIS_AJM_RESULT_PARTIAL_INPUT;
+                }
+                break;
+            }
             if (!HasEnoughSpace(out_buf)) {
                 LOG_TRACE(Lib_Ajm, "ORBIS_AJM_RESULT_NOT_ENOUGH_ROOM ({} < {})", out_buf.Size(),
                           m_codec->GetNextFrameSize(m_gapless));
                 job.output.p_result->result |= ORBIS_AJM_RESULT_NOT_ENOUGH_ROOM;
-            }
-            if (in_buf.size() < m_codec->GetMinimumInputSize()) {
-                job.output.p_result->result |= ORBIS_AJM_RESULT_PARTIAL_INPUT;
+                break;
             }
             if (job.output.p_result->result != 0) {
                 break;

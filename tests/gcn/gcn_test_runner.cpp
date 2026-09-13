@@ -153,8 +153,15 @@ std::expected<void, ErrorInfo> Runner::initialize() {
         .apiVersion = vk::ApiVersion13,
     };
     std::vector<const char*> layers;
-    if (kEnableValidation)
-        layers.push_back("VK_LAYER_KHRONOS_validation");
+    if (kEnableValidation) {
+        const auto [result, available_layers] = vk::enumerateInstanceLayerProperties();
+        if (result == vk::Result::eSuccess &&
+            std::ranges::any_of(available_layers, [](const auto& layer) {
+                return std::string_view{layer.layerName} == "VK_LAYER_KHRONOS_validation";
+            })) {
+            layers.push_back("VK_LAYER_KHRONOS_validation");
+        }
+    }
 
     auto [ir, inst] = vk::createInstance({
         .pApplicationInfo = &app_info,

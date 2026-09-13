@@ -34,7 +34,8 @@ void Resolver::Resolve() {
 
     if (async_resolution) {
         auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
-        auto ret = netinfo->ResolveHostname(async_resolution->hostname, async_resolution->addr);
+        auto ret = netinfo->ResolveHostname(async_resolution->hostname, async_resolution->addr,
+                                            async_resolution->timeout, async_resolution->retry);
         resolution_error = ret;
         if (ret != ORBIS_OK) {
             // Resolver errors are stored as ORBIS_NET_ERROR values.

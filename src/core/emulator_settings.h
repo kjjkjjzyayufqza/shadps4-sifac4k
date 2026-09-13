@@ -209,6 +209,10 @@ struct GeneralSettings {
     Setting<bool> connected_to_network{false};
     Setting<std::string> network_interface_address{};
     Setting<std::string> loopback_broadcast_peers{};
+    // UDP port the NP P2P transport binds; 3658 is what a real console uses. It is
+    // configurable because the transport sets no SO_REUSEADDR, so two instances on one
+    // machine cannot share a routable bind of the same port.
+    Setting<int> p2p_port{3658};
     Setting<bool> discord_rpc_enabled{false};
     Setting<bool> show_fps_counter{false};
     Setting<int> console_language{1};
@@ -240,6 +244,7 @@ struct GeneralSettings {
                                            &GeneralSettings::connected_to_network),
             make_override<GeneralSettings>("network_interface_address",
                                            &GeneralSettings::network_interface_address),
+            make_override<GeneralSettings>("p2p_port", &GeneralSettings::p2p_port),
             make_override<GeneralSettings>("loopback_broadcast_peers",
                                            &GeneralSettings::loopback_broadcast_peers),
             make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
@@ -257,6 +262,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
                                    network_interface_address, loopback_broadcast_peers,
+                                   p2p_port,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
                                    signaling_info, enable_upnp)
@@ -689,6 +695,7 @@ public:
     SETTING_FORWARD_BOOL(m_general, ShowSplash, show_splash)
     SETTING_FORWARD_BOOL(m_general, ConnectedToNetwork, connected_to_network)
     SETTING_FORWARD(m_general, NetworkInterfaceAddress, network_interface_address)
+    SETTING_FORWARD(m_general, P2PPort, p2p_port)
     SETTING_FORWARD(m_general, LoopbackBroadcastPeers, loopback_broadcast_peers)
     SETTING_FORWARD_BOOL(m_general, DiscordRPCEnabled, discord_rpc_enabled)
     SETTING_FORWARD_BOOL(m_general, ShowFpsCounter, show_fps_counter)

@@ -15,6 +15,7 @@
 #include "core/libraries/np/np_error.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
+#include "core/libraries/np/np_request_timeout.h"
 #include "core/libraries/np/np_score/np_score.h"
 #include "core/libraries/np/np_web_api/np_web_api.h"
 #include "core/libraries/system/systemservice.h"
@@ -149,22 +150,17 @@ void NpHandler::Initialize() {
         }
     }
 
+    // Connecting waits out two ten second timeouts per user, so the attempts belong on the
+    // worker thread rather than on the thread that is bringing the emulator up. Titles learn the
+    // outcome from the NP state callback either way, which is also how a real console reports an
+    // asynchronous PSN sign-in.
     const auto logged_in = UserManagement.GetLoggedInUsers(); // get all login users
-    int connected_count = 0;
     for (int i = 0; i < Libraries::UserService::ORBIS_USER_SERVICE_MAX_LOGIN_USERS; ++i) {
         const User* u = logged_in[i];
-        if (!u)
-            continue;
-        if (ConnectUserById(u->user_id))
-            ++connected_count;
+        if (u != nullptr) {
+            ScheduleConnect(u->user_id);
+        }
     }
-
-    if (connected_count == 0) {
-        LOG_WARNING(NpHandler, "no users connected to shadNet");
-        return;
-    }
-
-    StartWorker();
 }
 
 void NpHandler::Shutdown() {
@@ -260,6 +256,40 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
         }
     };
 
+    // A server that rejects the credentials will reject the same ones on every retry, so the
+    // reconnect loop would run for the rest of the session while shadNet stayed enabled with
+    // nobody signed in. That half-online state is neither the online path nor the offline one:
+    // the IsShadNetEnabled() checks keep choosing their online branch even though no user is
+    // ever signed in. Drop to the offline path for this run instead, as a protocol mismatch does.
+    const auto handle_credential_rejection = [](ShadNet::ShadNetState st) {
+        const char* reason = nullptr;
+        switch (st) {
+        case ShadNet::ShadNetState::FailureUsername:
+            reason = "the account is not registered on this server";
+            break;
+        case ShadNet::ShadNetState::FailurePassword:
+            reason = "the password does not match the one held by this server";
+            break;
+        case ShadNet::ShadNetState::FailureToken:
+            reason = "the saved login token was refused";
+            break;
+        case ShadNet::ShadNetState::FailureAuth:
+            reason = "the server refused the login";
+            break;
+        default:
+            return; // retryable: a dropped connection or an account still held by another session
+        }
+        EmulatorSettings.SetShadNetSessionDisabled(true);
+        LOG_ERROR(NpHandler,
+                  "shadNet login rejected ({}); disabling shadNet for this run (saved setting "
+                  "unchanged)",
+                  reason);
+        ImGui::ShadNetNotify::Push(
+            ImGui::ShadNetNotify::Kind::Info,
+            fmt::format("shadNet login failed: {}. Online features are disabled for this session.",
+                        reason));
+    };
+
     const ShadNet::ShadNetState conn_state = client->WaitForConnection();
     if (conn_state != ShadNet::ShadNetState::Ok) {
         LOG_ERROR(NpHandler, "user_id={} connection failed (state={})", user_id,
@@ -274,6 +304,7 @@ bool NpHandler::ConnectUser(s32 user_id, const std::string& host, u16 port, cons
         LOG_ERROR(NpHandler, "user_id={} authentication failed (state={})", user_id,
                   static_cast<int>(auth_state));
         handle_protocol_mismatch(auth_state);
+        handle_credential_rejection(auth_state);
         client->Stop();
         return false;
     }
@@ -307,6 +338,114 @@ void NpHandler::SetAppearOffline(bool enable) {
     for (auto& [uid, client] : m_clients) {
         if (client)
             client->SetAppearOffline(enable); // sends the toggle to connected sessions
+    }
+}
+
+u64 NpHandler::SubmitScoreRequest(ShadNet::ShadNetClient& client, ShadNet::CommandType cmd,
+                                  const std::vector<u8>& payload, PendingScoreRequest pending) {
+    pending.cmd = cmd;
+    pending.deadline = std::chrono::steady_clock::now() + kNpRequestTimeout;
+    return client.SubmitRequest(cmd, payload, [this, &pending](u64 pkt_id) {
+        std::lock_guard lock(m_mutex_pending_score);
+        m_pending_score.emplace(pkt_id, std::move(pending));
+    });
+}
+
+u64 NpHandler::SubmitTusRequest(ShadNet::ShadNetClient& client, ShadNet::CommandType cmd,
+                                const std::vector<u8>& payload, PendingTusRequest pending) {
+    pending.cmd = cmd;
+    pending.deadline = std::chrono::steady_clock::now() + kNpRequestTimeout;
+    return client.SubmitRequest(cmd, payload, [this, &pending](u64 pkt_id) {
+        std::lock_guard lock(m_mutex_pending_tus);
+        m_pending_tus.emplace(pkt_id, std::move(pending));
+    });
+}
+
+void NpHandler::ExpirePendingRequests() {
+    const auto now = std::chrono::steady_clock::now();
+
+    // Waiters are woken outside the pending locks: SetResult takes the request context's own
+    // mutex, and holding both at once would pin an ordering between them for no reason.
+    std::vector<std::shared_ptr<NpScore::ScoreRequestCtx>> expired_score;
+    std::vector<std::shared_ptr<NpTus::TusRequestCtx>> expired_tus;
+
+    {
+        std::lock_guard lock(m_mutex_pending_score);
+        for (auto it = m_pending_score.begin(); it != m_pending_score.end();) {
+            if (now < it->second.deadline) {
+                ++it;
+                continue;
+            }
+            LOG_ERROR(
+                NpHandler,
+                "score request pkt_id={} cmd={} user_id={} had no reply after {}s; failing it",
+                it->first, static_cast<int>(it->second.cmd), it->second.user_id,
+                kNpRequestTimeout.count());
+            if (it->second.req) {
+                expired_score.push_back(it->second.req);
+            }
+            it = m_pending_score.erase(it);
+        }
+    }
+    {
+        std::lock_guard lock(m_mutex_pending_tus);
+        for (auto it = m_pending_tus.begin(); it != m_pending_tus.end();) {
+            if (now < it->second.deadline) {
+                ++it;
+                continue;
+            }
+            LOG_ERROR(NpHandler,
+                      "TUS request pkt_id={} cmd={} user_id={} had no reply after {}s; failing it",
+                      it->first, static_cast<int>(it->second.cmd), it->second.user_id,
+                      kNpRequestTimeout.count());
+            if (it->second.req) {
+                expired_tus.push_back(it->second.req);
+            }
+            it = m_pending_tus.erase(it);
+        }
+    }
+    for (const auto& req : expired_score) {
+        req->SetResult(ORBIS_NP_ERROR_TIMEOUT);
+    }
+    for (const auto& req : expired_tus) {
+        req->SetResult(ORBIS_NP_ERROR_TIMEOUT);
+    }
+    {
+        std::lock_guard lock(m_mutex_pending_trophy);
+        for (auto it = m_pending_trophy.begin(); it != m_pending_trophy.end();) {
+            if (now < it->second.deadline) {
+                ++it;
+                continue;
+            }
+            // The merge callback has no error channel, so a timed-out sync is dropped rather than
+            // invoked with an empty set, which the caller would read as "the server holds no
+            // trophies" and would use to overwrite good local state.
+            LOG_ERROR(NpHandler,
+                      "trophy sync pkt_id={} user_id={} had no reply after {}s; dropping it",
+                      it->first, it->second.user_id, kNpRequestTimeout.count());
+            it = m_pending_trophy.erase(it);
+        }
+    }
+    std::vector<std::function<void(s32, u64, const std::string&)>> expired_lookup;
+    {
+        std::lock_guard lock(m_mutex_pending_lookup);
+        for (auto it = m_pending_lookup.begin(); it != m_pending_lookup.end();) {
+            if (now < it->second.deadline) {
+                ++it;
+                continue;
+            }
+            LOG_ERROR(NpHandler,
+                      "lookup request pkt_id={} user_id={} had no reply after {}s; "
+                      "failing it",
+                      it->first, it->second.user_id, kNpRequestTimeout.count());
+            if (it->second.on_result) {
+                expired_lookup.push_back(std::move(it->second.on_result));
+            }
+            it = m_pending_lookup.erase(it);
+        }
+    }
+    for (const auto& on_result : expired_lookup) {
+        on_result(ORBIS_NP_ERROR_TIMEOUT, 0, {});
     }
 }
 
@@ -354,6 +493,18 @@ void NpHandler::FailPendingRequests(s32 user_id, s32 error_code) {
             }
         }
     }
+    {
+        // Dropped rather than invoked: see the note in ExpirePendingRequests.
+        std::lock_guard lock(m_mutex_pending_trophy);
+        for (auto it = m_pending_trophy.begin(); it != m_pending_trophy.end();) {
+            if (it->second.user_id == user_id) {
+                it = m_pending_trophy.erase(it);
+                ++failed;
+            } else {
+                ++it;
+            }
+        }
+    }
     if (failed > 0) {
         LOG_WARNING(NpHandler, "user_id={} failed {} pending request(s) with {:#x}", user_id,
                     failed, static_cast<u32>(error_code));
@@ -375,6 +526,21 @@ void NpHandler::DisconnectUser(s32 user_id) {
         m_friend_state.erase(user_id);
     }
     client->Stop();
+
+    // Matching2 and signaling keep their own reference to the client plus a STUN ping thread
+    // aimed at the server. Nothing cleared them before, so after a disconnect those threads went
+    // on pinging a server this user can no longer reach, through a client that is already
+    // stopped. Only the last client tears them down: the matching2 backend is a single global
+    // binding, and clearing it while another user is still signed in would cut that user off.
+    bool had_last_client = false;
+    {
+        std::lock_guard lock(m_mutex_clients);
+        had_last_client = m_clients.empty();
+    }
+    if (had_last_client) {
+        NpMatching2::ClearMmShadNetClient();
+    }
+
     // The reader thread is joined, so no reply can race us: complete every
     // in-flight request now, or PollAsync spins and WaitAsync blocks forever.
     FailPendingRequests(user_id, ORBIS_NP_ERROR_SIGNED_OUT);
@@ -383,8 +549,10 @@ void NpHandler::DisconnectUser(s32 user_id) {
 }
 
 void NpHandler::OnUserLoggedIn(s32 user_id) {
-    if (ConnectUserById(user_id))
-        StartWorker();
+    // sceUserServiceGetEvent hands this event to the title's own thread, so the connect is queued
+    // for the worker instead of being run here. Connecting inline froze the game for the length of
+    // the connect and authentication timeouts.
+    ScheduleConnect(user_id);
 }
 
 void NpHandler::OnUserLoggedOut(s32 user_id) {
@@ -396,11 +564,12 @@ void NpHandler::OnUserLoggedOut(s32 user_id) {
 }
 
 void NpHandler::WorkerThread() {
+    // The interval paces polling; it must not postpone the first attempt, so the sleep happens at
+    // the end of the loop. Sleeping first left a window at startup where shadNet still looked
+    // enabled to the title while no login had even been attempted yet.
     constexpr auto INTERVAL = std::chrono::milliseconds(500);
 
     while (m_worker_running) {
-        std::this_thread::sleep_for(INTERVAL);
-
         // Collect ids of dropped clients
         std::vector<s32> dropped;
         {
@@ -418,18 +587,50 @@ void NpHandler::WorkerThread() {
         }
 
         TryReconnect();
+        ExpirePendingRequests();
+        NpMatching2::ExpireMatchingRequests();
+
+        std::this_thread::sleep_for(INTERVAL);
     }
+}
+
+// Seeds the exponential backoff in TryReconnect. A zero seed would never grow, leaving the worker
+// retrying a refusing server back to back.
+static constexpr auto kInitialReconnectBackoff = std::chrono::milliseconds(2000);
+
+void NpHandler::ScheduleConnect(s32 user_id) {
+    if (!EmulatorSettings.IsShadNetEnabled()) {
+        return; // offline mode: nothing to connect to
+    }
+    // Mirror the checks ConnectUserById makes, so a user it would refuse is never queued: the
+    // worker would otherwise retry that refusal for the rest of the session.
+    const User* u = UserManagement.GetUserByID(user_id);
+    if (u == nullptr || !u->shadnet_enabled || u->shadnet_npid.empty() ||
+        u->shadnet_password.empty()) {
+        return;
+    }
+    {
+        std::lock_guard lock(m_mutex_clients);
+        auto& st = m_reconnect[user_id];
+        st.backoff = kInitialReconnectBackoff;
+        st.next_attempt = std::chrono::steady_clock::now(); // first attempt is not delayed
+    }
+    StartWorker();
 }
 
 void NpHandler::MarkForReconnect(s32 user_id) {
     if (!EmulatorSettings.IsShadNetEnabled())
         return; // offline mode: nothing to reconnect to
-    constexpr auto kInitialBackoff = std::chrono::milliseconds(2000);
     std::lock_guard lock(m_mutex_clients);
     auto& st = m_reconnect[user_id];
-    st.backoff = kInitialBackoff;
+    st.backoff = kInitialReconnectBackoff;
     st.next_attempt = std::chrono::steady_clock::now() + st.backoff;
 }
+
+// A server that has ignored or refused this many consecutive attempts is not going to start
+// answering later in the run. Each attempt costs a full connect budget on the worker thread, so
+// retrying forever keeps that thread busy and the title half-online for the whole session.
+static constexpr u32 kMaxConnectAttempts = 5;
 
 void NpHandler::TryReconnect() {
     constexpr auto kMaxBackoff = std::chrono::milliseconds(30000);
@@ -438,12 +639,23 @@ void NpHandler::TryReconnect() {
     std::vector<s32> due;
     {
         std::lock_guard lock(m_mutex_clients);
-        for (auto& [uid, st] : m_reconnect) {
-            if (m_clients.count(uid) || now >= st.next_attempt)
-                due.push_back(uid);
+        for (auto it = m_reconnect.begin(); it != m_reconnect.end();) {
+            // Already connected: the entry is stale. Dropping it here stops the worker from
+            // opening a second session for a user that already has one - ConnectUser has no
+            // "already connected" guard and would build a whole new client, rebind matching2 to
+            // it and orphan the original.
+            if (m_clients.count(it->first) != 0) {
+                it = m_reconnect.erase(it);
+                continue;
+            }
+            if (now >= it->second.next_attempt) {
+                due.push_back(it->first);
+            }
+            ++it;
         }
     }
 
+    bool unreachable = false;
     for (s32 uid : due) {
         if (!m_worker_running)
             return;
@@ -457,13 +669,38 @@ void NpHandler::TryReconnect() {
         std::lock_guard lock(m_mutex_clients);
         if (ok || m_clients.count(uid)) {
             m_reconnect.erase(uid);
-            LOG_INFO(NpHandler, "user_id={} reconnected to shadNet", uid);
-        } else if (auto it = m_reconnect.find(uid); it != m_reconnect.end()) {
-            it->second.backoff = std::min(it->second.backoff * 2, kMaxBackoff);
-            it->second.next_attempt = std::chrono::steady_clock::now() + it->second.backoff;
-            LOG_DEBUG(NpHandler, "user_id={} reconnect failed; next attempt in {}ms", uid,
-                      it->second.backoff.count());
+            LOG_INFO(NpHandler, "user_id={} connected to shadNet", uid);
+            continue;
         }
+        auto it = m_reconnect.find(uid);
+        if (it == m_reconnect.end()) {
+            continue;
+        }
+        if (++it->second.attempts >= kMaxConnectAttempts) {
+            LOG_ERROR(NpHandler,
+                      "user_id={} could not reach shadNet in {} attempts; disabling shadNet for "
+                      "this run (saved setting unchanged)",
+                      uid, it->second.attempts);
+            m_reconnect.erase(it);
+            unreachable = true;
+            continue;
+        }
+        it->second.backoff = std::min(it->second.backoff * 2, kMaxBackoff);
+        it->second.next_attempt = std::chrono::steady_clock::now() + it->second.backoff;
+        LOG_DEBUG(NpHandler, "user_id={} connect attempt {} failed; next attempt in {}ms", uid,
+                  it->second.attempts, it->second.backoff.count());
+    }
+
+    if (unreachable) {
+        // Every shadNet entry point tests IsShadNetEnabled(), so this drops the whole feature to
+        // the offline path for the rest of the run rather than leaving it half-online with
+        // nobody signed in.
+        EmulatorSettings.SetShadNetSessionDisabled(true);
+        ImGui::ShadNetNotify::Push(
+            ImGui::ShadNetNotify::Kind::Info,
+            "shadNet server could not be reached. Online features are disabled for this session.");
+        std::lock_guard lock(m_mutex_clients);
+        m_reconnect.clear();
     }
 }
 
@@ -1145,15 +1382,11 @@ s32 NpHandler::RecordScore(s32 user_id, s32 service_label, u32 boardId, s32 pcId
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::RecordScore, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::RecordScore;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.user_id = user_id;
+    const u64 pkt_id =
+        SubmitScoreRequest(*client, ShadNet::CommandType::RecordScore, payload, std::move(pending));
     LOG_INFO(NpHandler,
              "RecordScore: user_id={} service_label={} board={} pcId={} score={} commentLen={} "
              "gameInfoSize={} pkt_id={} com_id='{}'",
@@ -1206,15 +1439,11 @@ s32 NpHandler::RecordGameData(s32 user_id, s32 service_label, u32 boardId, s32 p
         payload.insert(payload.end(), data, data + size);
     }
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::RecordScoreData, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::RecordScoreData;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::RecordScoreData, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "RecordGameData: user_id={} service_label={} board={} pcId={} score={} dataSize={} "
              "pkt_id={} com_id='{}'",
@@ -1263,18 +1492,14 @@ s32 NpHandler::GetGameData(s32 user_id, s32 service_label, u32 boardId, const st
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreData, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreData;
-        pending.dataOut = dataOut;
-        pending.recvSize = recvSize;
-        pending.totalSizeOut = totalSizeOut;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.dataOut = dataOut;
+    pending.recvSize = recvSize;
+    pending.totalSizeOut = totalSizeOut;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreData, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetGameData: user_id={} service_label={} board={} npId='{}' pcId={} recvSize={} "
              "pkt_id={} com_id='{}'",
@@ -1323,19 +1548,14 @@ s32 NpHandler::GetGameDataByAccountId(s32 user_id, s32 service_label, u32 boardI
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id =
-        client->SubmitRequest(ShadNet::CommandType::GetScoreGameDataByAccId, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreGameDataByAccId;
-        pending.dataOut = dataOut;
-        pending.recvSize = recvSize;
-        pending.totalSizeOut = totalSizeOut;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.dataOut = dataOut;
+    pending.recvSize = recvSize;
+    pending.totalSizeOut = totalSizeOut;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreGameDataByAccId,
+                                          payload, std::move(pending));
     LOG_INFO(NpHandler,
              "GetGameDataByAccountId: user_id={} service_label={} board={} accountId={} pcId={} "
              "recvSize={} pkt_id={} com_id='{}'",
@@ -1375,16 +1595,12 @@ s32 NpHandler::GetBoardInfo(s32 user_id, s32 service_label, u32 boardId,
     payload.push_back(static_cast<u8>(boardId >> 16));
     payload.push_back(static_cast<u8>(boardId >> 24));
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetBoardInfos, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetBoardInfos;
-        pending.boardInfo = boardInfo;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.boardInfo = boardInfo;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetBoardInfos, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler, "GetBoardInfo: user_id={} service_label={} board={} pkt_id={} com_id='{}'",
              user_id, service_label, boardId, pkt_id, com_id);
     return ORBIS_OK;
@@ -1449,22 +1665,18 @@ s32 NpHandler::GetRankingByNpId(s32 user_id, s32 service_label, u32 boardId,
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreNpid, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreNpid;
-        pending.requestedNpIds = npIds;
-        pending.rankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = npIds.size();
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.requestedNpIds = npIds;
+    pending.rankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = npIds.size();
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreNpid, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetRankingByNpId: user_id={} service_label={} board={} npIdCount={} "
              "withPcId={} withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -1519,21 +1731,17 @@ s32 NpHandler::GetRankingByRange(s32 user_id, s32 service_label, u32 boardId, u3
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreRange, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreRange;
-        pending.plainRankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = arrayNum;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.plainRankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = arrayNum;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreRange, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetRankingByRange: user_id={} service_label={} board={} startRank={} numRanks={} "
              "withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -1588,24 +1796,20 @@ s32 NpHandler::GetRankingByRangeA(s32 user_id, s32 service_label, u32 boardId, u
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreRange, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreRange;
-        // Note: aRankArray is set, plainRankArray remains null. The shared
-        // GetScoreRange/GetScoreFriends branch in OnScoreReply dispatches
-        // on which one is non-null to pick the right fill helper.
-        pending.aRankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = arrayNum;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    // Note: aRankArray is set, plainRankArray remains null. The shared
+    // GetScoreRange/GetScoreFriends branch in OnScoreReply dispatches
+    // on which one is non-null to pick the right fill helper.
+    pending.aRankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = arrayNum;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreRange, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetRankingByRangeA: user_id={} service_label={} board={} startRank={} numRanks={} "
              "withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -1665,21 +1869,17 @@ s32 NpHandler::GetRankingByAccountId(s32 user_id, s32 service_label, u32 boardId
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreAccountId, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreAccountId;
-        pending.aPlayerRankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = accountIds.size();
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.aPlayerRankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = accountIds.size();
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreAccountId, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetRankingByAccountId: user_id={} service_label={} board={} accountIdCount={} "
              "withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -1734,21 +1934,17 @@ s32 NpHandler::GetFriendsRanking(s32 user_id, s32 service_label, u32 boardId, bo
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreFriends, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreFriends;
-        pending.plainRankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = arrayNum;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    pending.plainRankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = arrayNum;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreFriends, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetFriendsRanking: user_id={} service_label={} board={} includeSelf={} "
              "arrayNum={} withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -1803,23 +1999,19 @@ s32 NpHandler::GetFriendsRankingA(s32 user_id, s32 service_label, u32 boardId, b
     payload.push_back(static_cast<u8>(sz >> 24));
     payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
 
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::GetScoreFriends, payload);
-    {
-        std::lock_guard lock(m_mutex_pending_score);
-        PendingScoreRequest pending;
-        pending.req = std::move(req);
-        pending.cmd = ShadNet::CommandType::GetScoreFriends;
-        // Note: aRankArray is set, plainRankArray remains null. OnScoreReply
-        // dispatches on which one is non-null.
-        pending.aRankArray = rankArray;
-        pending.commentArray = commentArray;
-        pending.infoArray = infoArray;
-        pending.lastSortDate = lastSortDate;
-        pending.totalRecord = totalRecord;
-        pending.arrayNum = arrayNum;
-        pending.user_id = user_id;
-        m_pending_score.emplace(pkt_id, std::move(pending));
-    }
+    PendingScoreRequest pending;
+    pending.req = std::move(req);
+    // Note: aRankArray is set, plainRankArray remains null. OnScoreReply
+    // dispatches on which one is non-null.
+    pending.aRankArray = rankArray;
+    pending.commentArray = commentArray;
+    pending.infoArray = infoArray;
+    pending.lastSortDate = lastSortDate;
+    pending.totalRecord = totalRecord;
+    pending.arrayNum = arrayNum;
+    pending.user_id = user_id;
+    const u64 pkt_id = SubmitScoreRequest(*client, ShadNet::CommandType::GetScoreFriends, payload,
+                                          std::move(pending));
     LOG_INFO(NpHandler,
              "GetFriendsRankingA: user_id={} service_label={} board={} includeSelf={} "
              "arrayNum={} withComment={} withGameInfo={} pkt_id={} com_id='{}'",
@@ -2074,18 +2266,15 @@ s32 NpHandler::TusGetMultiSlotVariable(
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetMultiSlotVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetMultiSlotVariable;
     p.variableArray = variablesOut;
     p.variableArrayA = variablesAOut;
     p.variableArrayCS = variablesCSOut;
     p.arrayNum = arrayNum;
     p.user_id = user_id;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetMultiSlotVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2125,14 +2314,11 @@ s32 NpHandler::TusSetMultiSlotVariable(s32 user_id, s32 service_label, const std
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusSetMultiSlotVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusSetMultiSlotVariable;
     p.user_id = user_id;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusSetMultiSlotVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2169,18 +2355,15 @@ s32 NpHandler::TssGetData(s32 user_id, s32 service_label, s32 slotId, bool hasOf
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TssGetData,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TssGetData;
     p.user_id = user_id;
     p.tssStatusOut = statusOut;
     p.tssContentLengthOut = contentLengthOut;
     p.dataOut = dataOut;
     p.dataCap = dataCap;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TssGetData,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2215,12 +2398,8 @@ s32 NpHandler::TusGetData(s32 user_id, s32 service_label, const std::string& own
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetData,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetData;
     p.user_id = user_id;
     p.statusArrayA = statusAOut;
     p.statusArray = statusOut;
@@ -2230,7 +2409,8 @@ s32 NpHandler::TusGetData(s32 user_id, s32 service_label, const std::string& own
     p.dataCap = dataCap;
     p.dataOffset = dataOffset;
     p.arrayNum = 1;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetData,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2264,14 +2444,11 @@ s32 NpHandler::TusDeleteMultiSlotData(s32 user_id, s32 service_label, const std:
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusDeleteMultiSlotData,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusDeleteMultiSlotData;
     p.user_id = user_id;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusDeleteMultiSlotData,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2306,14 +2483,11 @@ s32 NpHandler::TusDeleteMultiSlotVariable(s32 user_id, s32 service_label,
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusDeleteMultiSlotVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusDeleteMultiSlotVariable;
     p.user_id = user_id;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusDeleteMultiSlotVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2349,18 +2523,15 @@ s32 NpHandler::TusGetMultiUserDataStatus(s32 user_id, s32 service_label, s32 slo
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetMultiUserDataStatus,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetMultiUserDataStatus;
     p.user_id = user_id;
     p.statusArray = statusOut;
     p.statusArrayA = statusAOut;
     p.statusArrayCS = statusCSOut;
     p.arrayNum = arrayNum;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetMultiUserDataStatus,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2396,18 +2567,15 @@ s32 NpHandler::TusGetMultiUserVariable(s32 user_id, s32 service_label, s32 slotI
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetMultiUserVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetMultiUserVariable;
     p.user_id = user_id;
     p.variableArray = variablesOut;
     p.variableArrayA = variablesAOut;
     p.variableArrayCS = variablesCSOut;
     p.arrayNum = arrayNum;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetMultiUserVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2462,18 +2630,15 @@ s32 NpHandler::TusTryAndSetVariable(s32 user_id, s32 service_label, const std::s
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusTryAndSetVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusTryAndSetVariable;
     p.user_id = user_id;
     p.variableArray = variableOut;
     p.variableArrayA = variableAOut;
     p.variableArrayCS = variableCSOut;
     p.arrayNum = 1;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusTryAndSetVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2521,18 +2686,15 @@ s32 NpHandler::TusAddAndGetVariable(s32 user_id, s32 service_label, const std::s
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusAddAndGetVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusAddAndGetVariable;
     p.user_id = user_id;
     p.variableArray = variableOut;
     p.variableArrayA = variableAOut;
     p.variableArrayCS = variableCSOut;
     p.arrayNum = 1;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusAddAndGetVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2563,19 +2725,16 @@ s32 NpHandler::TusGetFriendsDataStatus(s32 user_id, s32 service_label, s32 slotI
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetFriendsDataStatus,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetFriendsDataStatus;
     p.user_id = user_id;
     p.statusArray = statusOut;
     p.statusArrayA = statusAOut;
     p.statusArrayCS = statusCSOut;
     p.arrayNum = arrayNum;
     p.totalOut = hitsOut;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetFriendsDataStatus,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2605,19 +2764,16 @@ s32 NpHandler::TusGetFriendsVariable(s32 user_id, s32 service_label, s32 slotId,
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetFriendsVariable,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetFriendsVariable;
     p.user_id = user_id;
     p.variableArray = variablesOut;
     p.variableArrayA = variablesAOut;
     p.variableArrayCS = variablesCSOut;
     p.arrayNum = arrayNum;
     p.totalOut = hitsOut;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetFriendsVariable,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2655,18 +2811,15 @@ s32 NpHandler::TusGetMultiSlotDataStatus(s32 user_id, s32 service_label,
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusGetMultiSlotDataStatus,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusGetMultiSlotDataStatus;
     p.user_id = user_id;
     p.statusArray = statusOut;
     p.statusArrayA = statusAOut;
     p.statusArrayCS = statusCSOut;
     p.arrayNum = arrayNum;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusGetMultiSlotDataStatus,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2715,14 +2868,11 @@ s32 NpHandler::TusSetData(s32 user_id, s32 service_label, const std::string& own
     if (!IsValidNpCommId(com_id)) {
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::TusSetData,
-                                             BuildTusPayload(com_id, proto.SerializeAsString()));
-    std::lock_guard lock(m_mutex_pending_tus);
     PendingTusRequest p;
     p.req = std::move(ctx);
-    p.cmd = ShadNet::CommandType::TusSetData;
     p.user_id = user_id;
-    m_pending_tus.emplace(pkt_id, std::move(p));
+    SubmitTusRequest(*client, ShadNet::CommandType::TusSetData,
+                     BuildTusPayload(com_id, proto.SerializeAsString()), std::move(p));
     return ORBIS_OK;
 }
 
@@ -2731,14 +2881,42 @@ void NpHandler::OnAsyncReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
     const auto cmd_val = static_cast<u16>(cmd);
     if (cmd_val >= 100 && cmd_val <= 200) {
         NpMatching2::OnMatchingReply(cmd, pkt_id, error, body);
-    } else if (cmd_val >= 201 && cmd_val <= 300) {
+        return;
+    }
+    if (cmd_val >= 201 && cmd_val <= 300) {
         OnTusReply(user_id, cmd, pkt_id, error, body);
-    } else if (cmd_val >= 301 && cmd_val <= 400) {
+        return;
+    }
+    if (cmd_val >= 301 && cmd_val <= 400) {
         OnTrophyReply(user_id, cmd, pkt_id, error, body);
-    } else if (cmd == ShadNet::CommandType::LookupOnlineId) {
+        return;
+    }
+    if (cmd == ShadNet::CommandType::LookupOnlineId) {
         OnLookupReply(user_id, cmd, pkt_id, error, body);
-    } else {
+        return;
+    }
+
+    // Score commands are listed explicitly rather than caught by an else. A catch-all sent every
+    // unrelated low-numbered reply (session setup, friend and block commands) into the score
+    // handler, where it logged a bogus "no pending request" warning; worse, any command added
+    // later would be silently absorbed here instead of failing visibly.
+    switch (cmd) {
+    case ShadNet::CommandType::GetBoardInfos:
+    case ShadNet::CommandType::RecordScore:
+    case ShadNet::CommandType::RecordScoreData:
+    case ShadNet::CommandType::GetScoreData:
+    case ShadNet::CommandType::GetScoreRange:
+    case ShadNet::CommandType::GetScoreFriends:
+    case ShadNet::CommandType::GetScoreNpid:
+    case ShadNet::CommandType::GetScoreAccountId:
+    case ShadNet::CommandType::GetScoreGameDataByAccId:
         OnScoreReply(user_id, cmd, pkt_id, error, body);
+        return;
+    default:
+        // Commands with no async handler: their replies carry no pending request and are
+        // handled inline by the client (login, token, features, friend and block edits).
+        LOG_DEBUG(NpHandler, "reply for cmd={} pkt_id={} has no async handler", cmd_val, pkt_id);
+        return;
     }
 }
 
@@ -2821,11 +2999,19 @@ void NpHandler::SyncTrophies(
         return;
     }
 
-    const u64 pkt_id = client->SyncTrophies(com_id, local_trophies);
-    if (on_merged) {
-        std::lock_guard lock(m_mutex_pending_trophy);
-        m_pending_trophy.emplace(pkt_id, std::move(on_merged));
-    }
+    PendingTrophyRequest pending;
+    pending.user_id = user_id;
+    pending.deadline = std::chrono::steady_clock::now() + kNpRequestTimeout;
+    pending.on_merged = std::move(on_merged);
+    const bool track = static_cast<bool>(pending.on_merged);
+    const u64 pkt_id =
+        client->SyncTrophies(com_id, local_trophies, [this, &pending, track](u64 id) {
+            if (!track) {
+                return;
+            }
+            std::lock_guard lock(m_mutex_pending_trophy);
+            m_pending_trophy.emplace(id, std::move(pending));
+        });
     LOG_INFO(NpHandler, "SyncTrophies: user_id={} uploading {} com_id='{}' pkt_id={}", user_id,
              local_trophies.size(), com_id, pkt_id);
 }
@@ -2848,7 +3034,7 @@ void NpHandler::OnTrophyReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
         auto it = m_pending_trophy.find(pkt_id);
         if (it == m_pending_trophy.end())
             return;
-        on_merged = std::move(it->second);
+        on_merged = std::move(it->second.on_merged);
         m_pending_trophy.erase(it);
     }
 
@@ -2915,14 +3101,18 @@ void NpHandler::ResolveOnlineId(
         return;
     }
 
-    const u64 pkt_id = client->LookupOnlineId(online_id);
-    if (on_result) {
+    PendingLookupRequest pending;
+    pending.user_id = user_id;
+    pending.deadline = std::chrono::steady_clock::now() + kNpRequestTimeout;
+    pending.on_result = std::move(on_result);
+    const bool track = static_cast<bool>(pending.on_result);
+    const u64 pkt_id = client->LookupOnlineId(online_id, [this, &pending, track](u64 id) {
+        if (!track) {
+            return;
+        }
         std::lock_guard lock(m_mutex_pending_lookup);
-        PendingLookupRequest pending;
-        pending.user_id = user_id;
-        pending.on_result = std::move(on_result);
-        m_pending_lookup.emplace(pkt_id, std::move(pending));
-    }
+        m_pending_lookup.emplace(id, std::move(pending));
+    });
     LOG_INFO(NpHandler, "user_id={} onlineId='{}' pkt_id={}", user_id, online_id, pkt_id);
 }
 
@@ -3487,6 +3677,14 @@ void NpHandler::OnTusReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
         shadnet::TusGetDataResponse resp;
         if (!parseTusBody(resp)) {
             req->SetResult(ORBIS_NP_COMMUNITY_ERROR_BAD_RESPONSE);
+            return;
+        }
+        // PSN fails a data read from a slot that holds no data with USER_STORAGE_DATA_NOT_FOUND
+        // instead of completing it with an empty status. Titles rely on this: GUNDAM VERSUS only
+        // leaves its slot-fetch state machine through that error, and keeps polling forever when
+        // the read succeeds with dataSize 0.
+        if (!resp.status().set()) {
+            req->SetResult(ORBIS_NP_COMMUNITY_SERVER_ERROR_USER_STORAGE_DATA_NOT_FOUND);
             return;
         }
         u64 recv = 0;

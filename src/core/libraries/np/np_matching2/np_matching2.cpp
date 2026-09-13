@@ -6,10 +6,14 @@
 #include <memory>
 
 #include "common/logging/log.h"
+#include "common/singleton.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/network/net.h"
+#include "core/libraries/network/net_util.h"
+#include "core/libraries/network/netctl.h"
+#include "core/libraries/network/sockets.h"
 #include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_matching2/np_matching2.h"
@@ -680,8 +684,53 @@ int PS4_SYSV_ABI sceNpMatching2GetSignalingOptParamLocal() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNpMatching2GetLobbyInfoList() {
-    LOG_INFO(Lib_NpMatching2, "called");
+int PS4_SYSV_ABI sceNpMatching2GetLobbyInfoList(OrbisNpMatching2ContextId ctxId,
+                                                OrbisNpMatching2GetLobbyInfoListRequest* request,
+                                                OrbisNpMatching2RequestOptParam* requestOpt,
+                                                OrbisNpMatching2RequestId* requestId) {
+    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, requestOpt = {}", ctxId, fmt::ptr(requestOpt));
+
+    if (!IsInitialized()) {
+        LOG_ERROR(Lib_NpMatching2, "not initialized");
+        return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
+    }
+    // libSceNpMatching2 validates the request in this order and leaves requestId optional.
+    if (!request) {
+        LOG_ERROR(Lib_NpMatching2, "request null");
+        return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
+    }
+    if (request->worldId == 0) {
+        LOG_ERROR(Lib_NpMatching2, "worldId is zero");
+        return ORBIS_NP_MATCHING2_ERROR_INVALID_MATCHING_SPACE;
+    }
+    if (request->rangeFilter.max > ORBIS_NP_MATCHING2_RANGE_FILTER_MAX) {
+        LOG_ERROR(Lib_NpMatching2, "rangeFilter.max {} exceeds {}", request->rangeFilter.max,
+                  ORBIS_NP_MATCHING2_RANGE_FILTER_MAX);
+        return ORBIS_NP_MATCHING2_ERROR_RANGE_FILTER_MAX;
+    }
+    if (request->rangeFilter.start == 0) {
+        LOG_ERROR(Lib_NpMatching2, "rangeFilter.start is zero");
+        return ORBIS_NP_MATCHING2_ERROR_INVALID_REQUEST_PARAMETER;
+    }
+    for (u8 reserved : request->reserved) {
+        if (reserved != 0) {
+            LOG_ERROR(Lib_NpMatching2, "reserved bytes are not zero");
+            return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
+        }
+    }
+
+    ContextObject* ctx = ContextManager::Instance().Get(ctxId);
+    if (!ctx) {
+        LOG_ERROR(Lib_NpMatching2, "invalid context id");
+        return ORBIS_NP_MATCHING2_ERROR_INVALID_CONTEXT_ID;
+    }
+
+    StoreRequestCallback(ctx, requestOpt);
+    const OrbisNpMatching2RequestId reqId = AllocRequestId();
+    if (requestId) {
+        *requestId = reqId;
+    }
+    MmGetLobbyInfoList(ctxId, reqId, *request);
     return ORBIS_OK;
 }
 
@@ -1041,9 +1090,43 @@ int PS4_SYSV_ABI sceNpMatching2SignalingGetConnectionInfo(OrbisNpMatching2Contex
     return FillMatching2ConnectionInfo(*ctx, roomId, memberId, infoType, connInfo, false);
 }
 
-int PS4_SYSV_ABI sceNpMatching2SignalingGetLocalNetInfo(OrbisNpMatching2ContextId ctxId,
-                                                        void* info) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}", ctxId);
+// The SDK entry point takes only the output block: SceNpMatching2SignalingNetInfo shares the
+// layout of NpSignaling::OrbisNpSignalingNetInfo, and there is no context argument.
+int PS4_SYSV_ABI
+sceNpMatching2SignalingGetLocalNetInfo(NpSignaling::OrbisNpSignalingNetInfo* netInfo) {
+    if (!IsInitialized()) {
+        LOG_ERROR(Lib_NpMatching2, "not initialized");
+        return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
+    }
+    if (netInfo == nullptr || netInfo->size != sizeof(NpSignaling::OrbisNpSignalingNetInfo)) {
+        LOG_ERROR(Lib_NpMatching2, "invalid netInfo");
+        return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
+    }
+    // Titles bind their P2P sockets to the reported local address, so it must be the address the
+    // shared P2P transport port is bound to.
+    if (!Net::EnsureP2PTransport()) {
+        LOG_ERROR(Lib_NpMatching2, "P2P transport unavailable");
+        return ORBIS_NP_MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE;
+    }
+    netInfo->localAddr = Net::GetP2PAdvertisedAddr();
+
+    NetCtl::OrbisNetCtlNatInfo nat_info{};
+    nat_info.size = sizeof(nat_info);
+    netInfo->mappedAddr = 0;
+    netInfo->natStatus = 0;
+    if (NetCtl::sceNetCtlGetNatInfo(&nat_info) >= 0) {
+        netInfo->mappedAddr = nat_info.mapped_addr;
+        netInfo->natStatus = nat_info.nat_type;
+    }
+    if (netInfo->mappedAddr == 0) {
+        const u32 external =
+            Common::Singleton<NetUtil::NetUtilInternal>::Instance()->GetExternalIp();
+        netInfo->mappedAddr = external != 0 ? external : netInfo->localAddr;
+    }
+    netInfo->_pad_14 = 0;
+
+    LOG_INFO(Lib_NpMatching2, "localAddr={:#x} mappedAddr={:#x} natStatus={}", netInfo->localAddr,
+             netInfo->mappedAddr, netInfo->natStatus);
     return ORBIS_OK;
 }
 

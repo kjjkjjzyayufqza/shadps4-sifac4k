@@ -6,6 +6,8 @@
 #include <mutex>
 #include <optional>
 #include "common/types.h"
+#include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_request_timeout.h"
 
 namespace Libraries::Np::NpTus {
 
@@ -31,10 +33,13 @@ struct TusRequestCtx {
         return result.has_value();
     }
 
-    // Block until the handler (or an abort/delete) sets the result.
+    // Block until the handler (or an abort/delete) sets the result. Bounded so a reply that
+    // never arrives fails the call instead of blocking the calling guest thread forever.
     s32 Wait() {
         std::unique_lock lock(mutex);
-        cv.wait(lock, [this] { return result.has_value(); });
+        if (!cv.wait_for(lock, kNpRequestWaitTimeout, [this] { return result.has_value(); })) {
+            result = ORBIS_NP_ERROR_TIMEOUT;
+        }
         return *result;
     }
 };

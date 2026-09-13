@@ -92,6 +92,15 @@ struct OrbisNpCheckPlusParameter {
     u8 reserved[32];
 };
 
+struct OrbisNpNotifyPlusFeatureParameter {
+    u64 size;
+    Libraries::UserService::OrbisUserServiceUserId user_id;
+    u8 padding[4];
+    u64 features;
+    u8 reserved[32];
+};
+static_assert(sizeof(OrbisNpNotifyPlusFeatureParameter) == 56);
+
 struct OrbisNpCheckPlusResult {
     bool authorized;
     u8 reserved[32];

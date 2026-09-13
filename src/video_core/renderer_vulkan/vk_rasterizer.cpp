@@ -693,10 +693,14 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
             }
             push_data.AddOffset(binding.buffer, adjust);
             buffer_infos.emplace_back(vk_buffer->Handle(), offset_aligned, size + adjust);
+            // Writable bindings are usually read-modify-write, so earlier writes must also be
+            // made visible to the shader's reads, not only ordered against its writes.
+            const vk::AccessFlags2 dst_access =
+                desc.is_written
+                    ? vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite
+                    : vk::AccessFlags2{vk::AccessFlagBits2::eShaderRead};
             if (auto barrier =
-                    vk_buffer->GetBarrier(desc.is_written ? vk::AccessFlagBits2::eShaderWrite
-                                                          : vk::AccessFlagBits2::eShaderRead,
-                                          vk::PipelineStageFlagBits2::eAllCommands)) {
+                    vk_buffer->GetBarrier(dst_access, vk::PipelineStageFlagBits2::eAllCommands)) {
                 buffer_barriers.emplace_back(*barrier);
             }
             if (desc.is_written && desc.is_formatted) {

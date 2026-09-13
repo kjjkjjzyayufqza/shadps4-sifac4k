@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "common/types.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/rtc/rtc.h"
@@ -56,6 +58,7 @@ enum OrbisNpMatching2Event : u16 {
     ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_MEMBER_DATA_EXTERNAL_LIST = 0x0003,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_EXTERNAL = 0x0004,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_DATA_EXTERNAL_LIST = 0x0005,
+    ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_INFO_LIST = 0x0006,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_USER_INFO = 0x0007,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_USER_INFO_LIST = 0x0008,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM = 0x0101,
@@ -246,6 +249,9 @@ struct OrbisNpMatching2BinAttr {
 };
 
 // Range filter
+// libSceNpMatching2 rejects any range filter asking for more than this many results at once.
+constexpr u32 ORBIS_NP_MATCHING2_RANGE_FILTER_MAX = 20;
+
 struct OrbisNpMatching2RangeFilter {
     u32 start;
     u32 max;
@@ -580,6 +586,40 @@ struct OrbisNpMatching2GetWorldInfoListResponse {
     u64 worldNum;
 };
 
+// GetLobbyInfoList request. libSceNpMatching2 only serialises worldId and the range filter, and
+// rejects the request unless the four reserved bytes are zero.
+struct OrbisNpMatching2GetLobbyInfoListRequest {
+    OrbisNpMatching2WorldId worldId;
+    u8 reserved[4];
+    OrbisNpMatching2RangeFilter rangeFilter;
+};
+static_assert(sizeof(OrbisNpMatching2GetLobbyInfoListRequest) == 16);
+
+// Lobby-external lobby information. Field order matches OrbisNpMatching2RoomDataExternal:
+// serverId, padding, worldId, lobbyId.
+struct OrbisNpMatching2LobbyDataExternal {
+    OrbisNpMatching2LobbyDataExternal* next;
+    OrbisNpMatching2ServerId serverId;
+    u8 pad[2];
+    OrbisNpMatching2WorldId worldId;
+    OrbisNpMatching2LobbyId lobbyId;
+    u32 maxSlot;
+    u32 curMemberNum;
+    OrbisNpMatching2Flags flagAttr;
+    u8 pad2[4];
+    OrbisNpMatching2BinAttr* lobbyBinAttrExternal;
+    u64 lobbyBinAttrExternals;
+};
+// Titles read these two fields straight out of the linked list, so the offsets are part of the ABI.
+static_assert(offsetof(OrbisNpMatching2LobbyDataExternal, worldId) == 12);
+static_assert(offsetof(OrbisNpMatching2LobbyDataExternal, lobbyId) == 16);
+
+// GetLobbyInfoList response
+struct OrbisNpMatching2GetLobbyInfoListResponse {
+    OrbisNpMatching2Range range;
+    OrbisNpMatching2LobbyDataExternal* lobbyDataExternal;
+};
+
 // CreateJoinRoom request
 struct OrbisNpMatching2CreateJoinRoomRequest {
     u16 maxSlot;
@@ -588,7 +628,7 @@ struct OrbisNpMatching2CreateJoinRoomRequest {
     OrbisNpMatching2Flags flags;
     OrbisNpMatching2WorldId worldId;
     OrbisNpMatching2LobbyId lobbyId;
-    void* roomPasswd;
+    OrbisNpMatching2SessionPassword* roomPasswd;
     OrbisNpMatching2RoomPasswordSlotMask* passwdSlotMask;
     void* groupConfig;
     u64 groupConfigs;
@@ -619,7 +659,7 @@ struct OrbisNpMatching2CreateJoinRoomRequestA {
     OrbisNpMatching2Flags flags;
     OrbisNpMatching2WorldId worldId;
     OrbisNpMatching2LobbyId lobbyId;
-    void* roomPasswd;
+    OrbisNpMatching2SessionPassword* roomPasswd;
     OrbisNpMatching2RoomPasswordSlotMask* passwdSlotMask;
     void* groupConfig;
     u64 groupConfigs;

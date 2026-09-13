@@ -17,6 +17,12 @@ constexpr int ORBIS_SHARE_PLAY_CONNECTION_STATUS_DORMANT = 0x00;
 constexpr int ORBIS_SHARE_PLAY_CONNECTION_STATUS_READY = 0x01;
 constexpr int ORBIS_SHARE_PLAY_CONNECTION_STATUS_CONNECTED = 0x02;
 
+// Returned by the connection-info queries in libSceSharePlay.sprx. Both queries check the share
+// daemon's state word first and fail without touching the caller's buffer when no Share Play
+// session is up, which is always the case here.
+constexpr int ORBIS_SHARE_PLAY_ERROR_INVALID_ARGUMENT = 0x810E0001;
+constexpr int ORBIS_SHARE_PLAY_ERROR_NOT_CONNECTED = 0x810E0004;
+
 struct OrbisSharePlayConnectionInfo {
     int status;
     int mode;
@@ -25,10 +31,25 @@ struct OrbisSharePlayConnectionInfo {
     Libraries::UserService::OrbisUserServiceUserId hostUserId;
     Libraries::UserService::OrbisUserServiceUserId visitorUserId;
 };
+static_assert(sizeof(OrbisSharePlayConnectionInfo) == 0x38);
+
+// The "A" query reports the same session over a wider record: sixteen bytes the shorter record
+// drops sit between the visitor online id and the user ids. The module copies the daemon state
+// verbatim, so the meaning of those bytes is not recoverable from the copy alone.
+struct OrbisSharePlayConnectionInfoA {
+    int status;
+    int mode;
+    Libraries::Np::OrbisNpOnlineId hostOnlineId;
+    Libraries::Np::OrbisNpOnlineId visitorOnlineId;
+    u8 unresolved[16];
+    Libraries::UserService::OrbisUserServiceUserId hostUserId;
+    Libraries::UserService::OrbisUserServiceUserId visitorUserId;
+};
+static_assert(sizeof(OrbisSharePlayConnectionInfoA) == 0x48);
 
 int PS4_SYSV_ABI sceSharePlayCrashDaemon();
 int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfo(OrbisSharePlayConnectionInfo* pInfo);
-int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfoA();
+int PS4_SYSV_ABI sceSharePlayGetCurrentConnectionInfoA(OrbisSharePlayConnectionInfoA* pInfo);
 int PS4_SYSV_ABI sceSharePlayGetCurrentInfo();
 int PS4_SYSV_ABI sceSharePlayGetEvent();
 int PS4_SYSV_ABI sceSharePlayInitialize();

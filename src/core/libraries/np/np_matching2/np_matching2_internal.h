@@ -20,6 +20,7 @@
 
 namespace shadnet {
 class CreateJoinRoomResponse;
+class GetLobbyInfoListReply;
 class GetWorldInfoListReply;
 class GetRoomDataExternalListReply;
 class GetRoomMemberDataExternalListReply;
@@ -42,8 +43,25 @@ struct PeerInfo {
     bool sent_established = false;
     u64 nonce = 0;
     u32 ping_us = 0;
+    u32 packet_loss_pct = 0;
+    u32 bandwidth_bps = 0;
+    u64 ping_seq = 0;
+    bool ping_pending = false;
+    u32 pings_resolved = 0;
+    u32 pings_lost = 0;
+    bool relay_active = false;
+    bool relay_warned = false;
+    // Deadlines are measured from the first attempt, not from the last successful send: a peer
+    // whose endpoint never resolves sends nothing at all, and must still be declared dead.
+    std::chrono::steady_clock::time_point first_attempt{};
+    std::chrono::steady_clock::time_point last_attempt{};
+    std::chrono::steady_clock::time_point last_resolve_request{};
     std::chrono::steady_clock::time_point last_send{};
     std::chrono::steady_clock::time_point last_check_send{};
+    std::chrono::steady_clock::time_point last_ping_send{};
+    u32 handshake_sent = 0;
+    u32 handshake_recv = 0;
+    u32 resolve_failures = 0;
 };
 
 struct MemberBinCache {
@@ -109,8 +127,10 @@ struct CallbackPayload {
     std::unique_ptr<OrbisNpMatching2GetUserInfoListResponse> user_info_list_response;
     std::unique_ptr<OrbisNpMatching2GetUserInfoListResponseA> user_info_list_response_a;
     std::unique_ptr<OrbisNpMatching2GetWorldInfoListResponse> world_info_response;
+    std::unique_ptr<OrbisNpMatching2GetLobbyInfoListResponse> lobby_info_response;
     std::unique_ptr<OrbisNpMatching2SignalingGetPingInfoResponse> ping_info_response;
     std::vector<OrbisNpMatching2World> world_list;
+    std::vector<OrbisNpMatching2LobbyDataExternal> lobby_list;
     std::vector<OrbisNpMatching2RoomMemberDataInternal> member_data;
     std::vector<OrbisNpMatching2RoomMemberDataInternalA> member_data_a;
     std::vector<OrbisNpMatching2RoomMemberDataExternal> member_data_external;
@@ -174,8 +194,10 @@ struct CallbackPayload {
         user_info_list_response.reset();
         user_info_list_response_a.reset();
         world_info_response.reset();
+        lobby_info_response.reset();
         ping_info_response.reset();
         world_list.clear();
+        lobby_list.clear();
         member_data.clear();
         member_data_a.clear();
         member_data_external.clear();
@@ -415,6 +437,7 @@ void* BuildCreateJoinRoomPayload(ContextObject& ctx, const shadnet::CreateJoinRo
 void* BuildCreateJoinRoomPayloadA(ContextObject& ctx, const shadnet::CreateJoinRoomResponse& resp);
 void* BuildLeaveRoomPayload(ContextObject& ctx, const shadnet::LeaveRoomReply& resp);
 void* BuildGetWorldInfoListPayload(ContextObject& ctx, const shadnet::GetWorldInfoListReply& resp);
+void* BuildGetLobbyInfoListPayload(ContextObject& ctx, const shadnet::GetLobbyInfoListReply& resp);
 void* BuildSearchRoomPayload(ContextObject& ctx, const shadnet::SearchRoomReply& resp);
 void* BuildSearchRoomPayloadA(ContextObject& ctx, const shadnet::SearchRoomReply& resp);
 void* BuildGetRoomDataExternalListPayload(ContextObject& ctx,

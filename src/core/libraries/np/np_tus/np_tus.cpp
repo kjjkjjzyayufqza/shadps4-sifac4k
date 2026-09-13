@@ -311,7 +311,11 @@ s32 PS4_SYSV_ABI sceNpTusWaitAsync(int reqId, int* result) {
     }
 
     std::unique_lock lock(ctx->mutex);
-    ctx->cv.wait(lock, [&] { return ctx->result.has_value(); });
+    // Bounded: a reply that never arrives must not block this guest thread for the session.
+    if (!ctx->cv.wait_for(lock, kNpRequestWaitTimeout, [&] { return ctx->result.has_value(); })) {
+        ctx->result = ORBIS_NP_ERROR_TIMEOUT;
+        LOG_ERROR(Lib_NpTus, "reqId = {:#x} timed out with no reply", reqId);
+    }
     const s32 res = *ctx->result;
     if (result) {
         *result = res;

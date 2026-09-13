@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstring>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -52,6 +55,105 @@ struct Inbox {
         payload.assign(buffer + sizeof(header), received - sizeof(header));
         return true;
     }
+};
+
+// Stands in for shadNet's UDP forwarder: unwraps a RelayForward, and re-sends the inner frame to
+// the named endpoint behind a RelayDeliver naming the true origin. Everything above the port then
+// sees a direct conversation, which is the whole point of the relay path.
+class FakeRelay {
+public:
+    FakeRelay() {
+        sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        EXPECT_TRUE(IsValidP2PSocket(sock));
+        sockaddr_in bind_addr = Loopback(0);
+        EXPECT_EQ(::bind(sock, reinterpret_cast<const sockaddr*>(&bind_addr), sizeof(bind_addr)),
+                  0);
+        socklen_t len = sizeof(addr);
+        EXPECT_EQ(getsockname(sock, reinterpret_cast<sockaddr*>(&addr), &len), 0);
+        worker = std::thread([this] { Run(); });
+    }
+
+    ~FakeRelay() {
+        stop.store(true);
+        // Wake the blocking receive with an empty datagram the loop discards.
+        sendto(sock, "", 0, 0, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+        if (worker.joinable()) {
+            worker.join();
+        }
+        CloseP2PSocket(sock);
+    }
+
+    u16 Port() const {
+        return addr.sin_port;
+    }
+    u32 Addr() const {
+        return addr.sin_addr.s_addr;
+    }
+    u64 Forwarded() const {
+        return forwarded.load();
+    }
+
+    /// Sends a RelayDeliver that did not come from the relay, to prove the receiver refuses it.
+    static void SendSpoofedDeliver(const sockaddr_in& victim, u32 claimed_addr, u16 claimed_port,
+                                   const std::string& inner) {
+        net_socket rogue = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        std::string frame;
+        const u16 header[2] = {htons(kP2PInternalMarker),
+                               htons(static_cast<u16>(P2PInternalChannel::Relay))};
+        frame.append(reinterpret_cast<const char*>(header), kP2PInternalHeaderSize);
+        frame.push_back(static_cast<char>(kP2PRelayDeliver));
+        frame.append(reinterpret_cast<const char*>(&claimed_addr), sizeof(claimed_addr));
+        frame.append(reinterpret_cast<const char*>(&claimed_port), sizeof(claimed_port));
+        frame.append(inner);
+        sendto(rogue, frame.data(), static_cast<int>(frame.size()), 0,
+               reinterpret_cast<const sockaddr*>(&victim), sizeof(victim));
+        CloseP2PSocket(rogue);
+    }
+
+private:
+    void Run() {
+        std::vector<char> buffer(kP2PMaxDatagram);
+        while (!stop.load()) {
+            sockaddr_in from{};
+            socklen_t from_len = sizeof(from);
+            const int received = recvfrom(sock, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                          reinterpret_cast<sockaddr*>(&from), &from_len);
+            if (received <= static_cast<int>(kP2PInternalHeaderSize + kP2PRelayHeaderSize)) {
+                continue;
+            }
+            u16 header[2];
+            std::memcpy(header, buffer.data(), kP2PInternalHeaderSize);
+            if (ntohs(header[0]) != kP2PInternalMarker ||
+                ntohs(header[1]) != static_cast<u16>(P2PInternalChannel::Relay)) {
+                continue;
+            }
+            const char* body = buffer.data() + kP2PInternalHeaderSize;
+            if (static_cast<u8>(body[0]) != kP2PRelayForward) {
+                continue;
+            }
+            sockaddr_in dst{};
+            dst.sin_family = AF_INET;
+            std::memcpy(&dst.sin_addr.s_addr, body + 1, sizeof(u32));
+            std::memcpy(&dst.sin_port, body + 5, sizeof(u16));
+
+            std::string out;
+            out.append(reinterpret_cast<const char*>(header), kP2PInternalHeaderSize);
+            out.push_back(static_cast<char>(kP2PRelayDeliver));
+            out.append(reinterpret_cast<const char*>(&from.sin_addr.s_addr), sizeof(u32));
+            out.append(reinterpret_cast<const char*>(&from.sin_port), sizeof(u16));
+            out.append(body + kP2PRelayHeaderSize,
+                       received - kP2PInternalHeaderSize - kP2PRelayHeaderSize);
+            sendto(sock, out.data(), static_cast<int>(out.size()), 0,
+                   reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+            forwarded.fetch_add(1);
+        }
+    }
+
+    net_socket sock{};
+    sockaddr_in addr{};
+    std::atomic<bool> stop{false};
+    std::atomic<u64> forwarded{0};
+    std::thread worker;
 };
 
 class P2PPortTest : public ::testing::Test {
@@ -245,6 +347,151 @@ TEST_F(P2PPortTest, ReleaseStopsDelivery) {
     P2PInboxHeader header{};
     std::string payload;
     EXPECT_FALSE(inbox.Receive(header, payload, kNoDeliveryTimeoutUs));
+}
+
+// ===========================================================================
+// Relay path
+// ===========================================================================
+
+// The relay has to be transparent: a guest datagram that travelled through it must reach the same
+// inbox, carrying the *peer's* endpoint and vport, not the relay's. Anything else and the title
+// would answer the relay directly and the reply would go nowhere.
+TEST_F(P2PPortTest, RelayedGuestDatagramIsAttributedToItsOrigin) {
+    FakeRelay relay;
+    auto sender = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    auto receiver = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    ASSERT_NE(sender, nullptr);
+    ASSERT_NE(receiver, nullptr);
+
+    sender->SetRelayEndpoint(relay.Addr(), relay.Port());
+    receiver->SetRelayEndpoint(relay.Addr(), relay.Port());
+    sender->SetPeerRelayed(htonl(INADDR_LOOPBACK), receiver->BoundPort(), true);
+    EXPECT_TRUE(sender->IsPeerRelayed(htonl(INADDR_LOOPBACK), receiver->BoundPort()));
+
+    Inbox inbox;
+    const u16 vport = htons(30000);
+    ASSERT_EQ(receiver->Claim(vport, false, &inbox, inbox.addr), vport);
+
+    const std::string message = "through the relay";
+    ASSERT_EQ(sender->Send(message.data(), static_cast<u32>(message.size()), vport, vport,
+                           Loopback(receiver->BoundPort()), kP2PFlagDgram),
+              static_cast<int>(message.size()));
+
+    P2PInboxHeader header{};
+    std::string payload;
+    ASSERT_TRUE(inbox.Receive(header, payload, kDeliveryTimeoutUs));
+    EXPECT_EQ(payload, message);
+    EXPECT_EQ(header.from_addr, htonl(INADDR_LOOPBACK));
+    EXPECT_EQ(header.from_port, sender->BoundPort());
+    EXPECT_EQ(header.from_vport, vport);
+    EXPECT_NE(header.from_port, relay.Port());
+    EXPECT_EQ(relay.Forwarded(), 1u);
+
+    EXPECT_EQ(sender->Stats().sent_relayed, 1u);
+    EXPECT_EQ(sender->Stats().sent_direct, 0u);
+    EXPECT_EQ(receiver->Stats().recv_relayed, 1u);
+}
+
+// The handshake needs to know a peer answered through the relay, so it can stop trying to answer
+// that peer directly and converge on the working path.
+TEST_F(P2PPortTest, RelayedInternalDatagramReportsTheRelayFlag) {
+    FakeRelay relay;
+    auto sender = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    auto receiver = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    ASSERT_NE(sender, nullptr);
+    ASSERT_NE(receiver, nullptr);
+
+    sender->SetRelayEndpoint(relay.Addr(), relay.Port());
+    receiver->SetRelayEndpoint(relay.Addr(), relay.Port());
+    sender->SetPeerRelayed(htonl(INADDR_LOOPBACK), receiver->BoundPort(), true);
+
+    const std::string message = "matching2 handshake";
+    ASSERT_EQ(sender->SendInternal(P2PInternalChannel::Matching2, message.data(),
+                                   static_cast<u32>(message.size()),
+                                   Loopback(receiver->BoundPort())),
+              static_cast<int>(message.size()));
+
+    char buffer[128]{};
+    u32 from_addr = 0;
+    u16 from_port = 0;
+    bool relayed = false;
+    int received = -1;
+    for (int attempt = 0; attempt < 200 && received < 0; ++attempt) {
+        received = receiver->ReceiveInternal(P2PInternalChannel::Matching2, buffer, sizeof(buffer),
+                                             &from_addr, &from_port, &relayed);
+        if (received < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
+    ASSERT_EQ(received, static_cast<int>(message.size()));
+    EXPECT_EQ(std::string(buffer, message.size()), message);
+    EXPECT_TRUE(relayed);
+    EXPECT_EQ(from_addr, htonl(INADDR_LOOPBACK));
+    EXPECT_EQ(from_port, sender->BoundPort());
+}
+
+// A relay envelope is a claim about who sent the inner frame. Accepting one from any source would
+// let a peer forge traffic from a third party, so only the configured relay may make that claim.
+TEST_F(P2PPortTest, RefusesRelayDeliverFromAnySourceButTheRelay) {
+    FakeRelay relay;
+    auto receiver = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    ASSERT_NE(receiver, nullptr);
+    receiver->SetRelayEndpoint(relay.Addr(), relay.Port());
+
+    Inbox inbox;
+    const u16 vport = htons(30001);
+    ASSERT_EQ(receiver->Claim(vport, false, &inbox, inbox.addr), vport);
+
+    std::string inner;
+    const u16 guest_header[3] = {vport, vport, htons(kP2PFlagDgram)};
+    inner.append(reinterpret_cast<const char*>(guest_header), kP2PHeaderSize);
+    inner.append("forged");
+    FakeRelay::SendSpoofedDeliver(Loopback(receiver->BoundPort()), htonl(INADDR_LOOPBACK),
+                                  htons(1234), inner);
+
+    P2PInboxHeader header{};
+    std::string payload;
+    EXPECT_FALSE(inbox.Receive(header, payload, kNoDeliveryTimeoutUs));
+    EXPECT_GE(receiver->Stats().recv_relay_rejected, 1u);
+}
+
+// Marking one peer must not divert anyone else, and clearing the marking must restore the direct
+// path for that peer too.
+TEST_F(P2PPortTest, OnlyMarkedPeersTakeTheRelay) {
+    FakeRelay relay;
+    auto sender = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    auto receiver = P2PPort::Acquire(htonl(INADDR_LOOPBACK), 0);
+    ASSERT_NE(sender, nullptr);
+    ASSERT_NE(receiver, nullptr);
+    sender->SetRelayEndpoint(relay.Addr(), relay.Port());
+    receiver->SetRelayEndpoint(relay.Addr(), relay.Port());
+
+    Inbox inbox;
+    const u16 vport = htons(30002);
+    ASSERT_EQ(receiver->Claim(vport, false, &inbox, inbox.addr), vport);
+
+    const std::string direct = "direct";
+    ASSERT_EQ(sender->Send(direct.data(), static_cast<u32>(direct.size()), vport, vport,
+                           Loopback(receiver->BoundPort()), kP2PFlagDgram),
+              static_cast<int>(direct.size()));
+    P2PInboxHeader header{};
+    std::string payload;
+    ASSERT_TRUE(inbox.Receive(header, payload, kDeliveryTimeoutUs));
+    EXPECT_EQ(payload, direct);
+    EXPECT_EQ(relay.Forwarded(), 0u);
+    EXPECT_EQ(sender->Stats().sent_direct, 1u);
+
+    sender->SetPeerRelayed(htonl(INADDR_LOOPBACK), receiver->BoundPort(), true);
+    sender->ClearRelayedPeers();
+    EXPECT_FALSE(sender->IsPeerRelayed(htonl(INADDR_LOOPBACK), receiver->BoundPort()));
+
+    const std::string again = "direct again";
+    ASSERT_EQ(sender->Send(again.data(), static_cast<u32>(again.size()), vport, vport,
+                           Loopback(receiver->BoundPort()), kP2PFlagDgram),
+              static_cast<int>(again.size()));
+    ASSERT_TRUE(inbox.Receive(header, payload, kDeliveryTimeoutUs));
+    EXPECT_EQ(payload, again);
+    EXPECT_EQ(relay.Forwarded(), 0u);
 }
 
 } // namespace

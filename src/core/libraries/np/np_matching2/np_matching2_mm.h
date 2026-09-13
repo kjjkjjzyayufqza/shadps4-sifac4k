@@ -35,12 +35,17 @@ enum class MmCommand : u16 {
     GetUserInfoList = 113,
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
+    GetLobbyInfoList = 116,
 };
 
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
                         std::string_view server_host, u16 tcp_port);
 void ClearMmShadNetClient();
 bool IsMmClientRunning();
+
+// Completes any tracked matching request whose reply never arrived, so the title's callback
+// still fires. Driven by the NP handler's worker thread.
+void ExpireMatchingRequests();
 
 void OnMatchingReply(ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                      const std::vector<u8>& body);
@@ -64,6 +69,8 @@ s32 MmLeaveRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_
                 const OrbisNpMatching2LeaveRoomRequest& request);
 s32 MmGetWorldInfoList(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                        const OrbisNpMatching2GetWorldInfoListRequest& request);
+s32 MmGetLobbyInfoList(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                       const OrbisNpMatching2GetLobbyInfoListRequest& request);
 s32 MmSearchRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                  const OrbisNpMatching2SearchRoomRequest& request, bool a_variant = false);
 s32 MmGetRoomDataExternalList(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
@@ -89,6 +96,25 @@ s32 MmKickoutRoomMember(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2Reques
 u32 GetMmServerAddr();
 u16 GetMmServerUdpPort();
 
-bool RequestSignalingInfos(std::string_view target_online_id, u32* out_addr, u16* out_port);
+/// Asks the matching server for `target_online_id`'s STUN-observed endpoint. Returns true only
+/// when the query was actually submitted; it is throttled per target. Never blocks: the reply is
+/// handled on the ShadNet reader thread and lands in the cache below.
+bool RequestSignalingInfoAsync(std::string_view target_online_id);
+
+/// Reads a cached endpoint without touching the network. Returns false when nothing usable is
+/// cached. `out_nat_type` is optional.
+bool LookupSignalingInfo(std::string_view target_online_id, u32* out_addr, u16* out_port,
+                         u32* out_nat_type);
+
+/// Cache lookup plus a background refresh: returns true with the endpoint when one is known, and
+/// otherwise schedules a query and returns false so the caller retries later. This is the only
+/// resolver callers on the ShadNet reader thread may use - a blocking query there would wait on
+/// a reply that only that same thread can deliver.
+bool ResolveSignalingInfo(std::string_view target_online_id, u32* out_addr, u16* out_port);
+
+/// True when the connected server forwards P2P datagrams for peers that cannot punch directly.
+bool IsSignalingRelayEnabled();
+/// Second STUN port advertised by the server for NAT classification, host order; 0 when absent.
+u16 GetStunAltPort();
 
 } // namespace Libraries::Np::NpMatching2

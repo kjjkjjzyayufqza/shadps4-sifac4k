@@ -96,7 +96,11 @@ int PS4_SYSV_ABI sceNetCtlUnregisterCallbackV6() {
 }
 
 int PS4_SYSV_ABI sceNetCtlCheckCallback() {
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called");
+    LOG_DEBUG(Lib_NetCtl, "called");
+    // This is the only point at which netctl events reach the title, and it runs on the thread
+    // that called it, which is what the library guarantees. Leaving it stubbed meant a title
+    // that waits for IPOBTAINED before continuing its connection setup waited forever.
+    netctl.CheckCallback();
     return ORBIS_OK;
 }
 
@@ -457,7 +461,8 @@ int PS4_SYSV_ABI Func_D8DCB6973537A3DC() {
 }
 
 int PS4_SYSV_ABI sceNetCtlCheckCallbackForNpToolkit() {
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called");
+    LOG_DEBUG(Lib_NetCtl, "called");
+    netctl.CheckNpToolkitCallback();
     return ORBIS_OK;
 }
 

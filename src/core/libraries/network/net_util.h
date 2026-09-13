@@ -25,6 +25,9 @@ private:
     std::string ip{};
     u32 external_ip{0};
     u32 nat_type{0};
+    u16 external_port{0};     // host order, as seen by the primary STUN endpoint
+    u16 external_port_alt{0}; // host order, as seen by the alternate STUN endpoint
+    void ClassifyNatLocked(u16 local_port);
     std::mutex m_mutex;
     bool selected_interface_checked{};
     std::string selected_interface_address;
@@ -40,10 +43,21 @@ public:
     u32 GetExternalIp() const;
     void SetExternalIp(u32 addr);
     u32 GetNatType() const;
+    u16 GetExternalPort() const;
+    /// Records what one STUN endpoint saw. Two endpoints are needed to tell an endpoint-independent
+    /// mapping (punchable) from an endpoint-dependent one (symmetric, not punchable), so the NAT
+    /// type stays 0 = undetermined until both have answered.
+    void UpdateStunMapping(u32 mapped_addr, u16 mapped_port, bool alternate, u16 local_port);
     bool RetrieveEthernetAddr();
     bool RetrieveDefaultGateway();
     bool RetrieveNetmask();
     bool RetrieveIp();
-    int ResolveHostname(const char* hostname, Libraries::Net::OrbisNetInAddr* addr);
+    /// Resolves  hostname, giving up after  timeout_us microseconds per attempt and making
+    ///  retry extra attempts. A budget of 0 means "library default". getaddrinfo cannot be
+    /// interrupted, so an attempt that overruns its budget is abandoned rather than waited on:
+    /// without this a title that asked for a short resolve blocks on the OS default instead,
+    /// which is tens of seconds for an unreachable DNS server.
+    int ResolveHostname(const char* hostname, Libraries::Net::OrbisNetInAddr* addr, int timeout_us,
+                        int retry);
 };
 } // namespace NetUtil

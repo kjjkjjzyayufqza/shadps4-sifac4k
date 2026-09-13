@@ -42,6 +42,30 @@ static constexpr u32 SHAD_CONNECT_TIMEOUT_MS = 10000; // 10 second connect/hands
 static constexpr u32 SHAD_CONNECT_MAX_ATTEMPTS = 4;
 static constexpr u32 SHAD_CONNECT_RETRY_BACKOFF_MS =
     1000; // base backoff, doubled per retry (cap 8s)
+// Upper bound on what ConnectThread can spend before it gives up: every attempt may burn the
+// full connect timeout, plus the backoff waited between attempts. Derived from the values above
+// rather than hardcoded, so changing either cannot leave a waiter giving up on a thread that is
+// still making progress.
+static constexpr u32 SHAD_CONNECT_TOTAL_BUDGET_MS = [] {
+    u32 total = SHAD_CONNECT_MAX_ATTEMPTS * SHAD_CONNECT_TIMEOUT_MS;
+    u32 backoff = SHAD_CONNECT_RETRY_BACKOFF_MS;
+    for (u32 i = 1; i < SHAD_CONNECT_MAX_ATTEMPTS; ++i) {
+        total += backoff;
+        backoff = backoff * 2 > 8000 ? 8000 : backoff * 2;
+    }
+    return total;
+}();
+
+// Grace added on top of a thread's own budget, covering scheduling slop between the moment the
+// thread gives up and the moment it releases the waiter.
+static constexpr u32 SHAD_WAIT_GRACE_MS = 2000;
+
+// Budget for the login exchange once the socket is up and the server has already answered the
+// ServerInfo handshake. The read side runs without a socket timeout by design (it is a push
+// connection), so a server that accepts the connection and then never answers the login would
+// otherwise strand the caller forever.
+static constexpr u32 SHAD_AUTH_TIMEOUT_MS = 15000;
+
 static constexpr u32 SHAD_PROTOCOL_VERSION = 1;
 static constexpr u32 SHAD_MAX_PACKET_SIZE = 0x800000; // 8 MiB
 
@@ -97,6 +121,7 @@ enum class CommandType : u16 {
     GetUserInfoList = 113,
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
+    GetLobbyInfoList = 116,
     // Title User Storage (TUS)
     TusSetData = 201,
     TusGetData = 202,
@@ -178,6 +203,10 @@ enum class ShadNetState {
     FailureToken,
     FailureProtocol,
     FailureOther,
+    // The worker never reported an outcome within its budget. Distinct from the Failure* states
+    // above because it says nothing about the credentials or the protocol: it is retryable, and
+    // must not be mistaken for a rejection that should disable shadNet for the session.
+    FailureTimeout,
 };
 
 // Callback data structures
@@ -302,12 +331,18 @@ public:
     u32 GetAddrServer() const;
     bool IsMatching2Enabled() const;
     bool IsTrophiesEnabled() const;
+    /// True when the server's STUN listener also forwards P2P datagrams between two registered
+    /// endpoints, which is the fallback path for peers that cannot punch a hole directly.
+    bool IsSignalingRelayEnabled() const;
+    /// Second STUN port used to classify NAT mapping behaviour, in host order; 0 when absent.
+    u16 GetStunAltPort() const;
     u64 ReportClientVersion();
     static std::string BuildVersionString();
 
     u64 UnlockTrophy(const std::string& com_id, s32 trophy_id, u64 timestamp);
     u64 SyncTrophies(const std::string& com_id,
-                     const std::vector<std::pair<s32, u64>>& local_trophies);
+                     const std::vector<std::pair<s32, u64>>& local_trophies,
+                     const std::function<void(u64 pkt_id)>& on_packet_id = {});
     u32 GetNumFriends() const;
     std::optional<std::string> GetFriendNpid(u32 index) const;
 
@@ -333,7 +368,13 @@ public:
     // Submit a Request packet for async processing.
     // Allocates a packet id, builds the packet, pushes it to the writer queue.
     // Returns the packet id so callers can correlate the eventual reply.
-    u64 SubmitRequest(CommandType cmd, const std::vector<u8>& payload);
+    //
+    // The reply can be dispatched by the reader thread as soon as the packet reaches the writer
+    // queue, which is before this call returns. A caller that tracks the request in a pending map
+    // must therefore register it from on_packet_id, which runs before the packet is queued;
+    // registering after this returns races the reply and loses it.
+    u64 SubmitRequest(CommandType cmd, const std::vector<u8>& payload,
+                      const std::function<void(u64 pkt_id)>& on_packet_id = {});
 
     // Friend / block commands.
     u64 AddFriend(const std::string& npid);
@@ -343,7 +384,8 @@ public:
     // Set the Appear-Offline preference mid-session (server handles us as offline while set).
     u64 SetAppearOffline(bool enable);
     // Global online ID to account ID resolution
-    u64 LookupOnlineId(const std::string& npid);
+    u64 LookupOnlineId(const std::string& npid,
+                       const std::function<void(u64 pkt_id)>& on_packet_id = {});
 
 private:
     void ConnectThread();
@@ -407,6 +449,8 @@ private:
     std::atomic<u32> m_server_protocol_version{0};
     std::atomic<bool> m_matching2_enabled{false};
     std::atomic<bool> m_trophies_enabled{false};
+    std::atomic<bool> m_signaling_relay_enabled{false};
+    std::atomic<u16> m_stun_alt_port{0};
     std::atomic<bool> m_server_features_received{false};
 
     mutable std::mutex m_mutex_friends;

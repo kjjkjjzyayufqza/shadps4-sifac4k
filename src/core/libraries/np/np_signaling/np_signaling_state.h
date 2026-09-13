@@ -46,6 +46,20 @@ struct StunEcho {
 static_assert(sizeof(StunEcho) == 6, "StunEcho must be exactly 6 bytes");
 #pragma pack(pop)
 
+// The alternate STUN endpoint answers with a tagged echo so one socket can tell the two replies
+// apart. Comparing the two mapped ports is what distinguishes a punchable NAT from a symmetric
+// one; a server without a second endpoint simply never sends this.
+inline constexpr u8 kStunAltPingCmd = 0x03;
+inline constexpr u8 kStunAltEchoCmd = 0x83;
+#pragma pack(push, 1)
+struct StunAltEcho {
+    u8 cmd = kStunAltEchoCmd;
+    u32 ext_ip = 0;
+    u16 ext_port = 0;
+};
+static_assert(sizeof(StunAltEcho) == 7, "StunAltEcho must be exactly 7 bytes");
+#pragma pack(pop)
+
 inline constexpr u8 kSignalingMagic[4] = {'S', 'H', 'A', 'D'};
 
 enum class SignalingPacketType : u8 {

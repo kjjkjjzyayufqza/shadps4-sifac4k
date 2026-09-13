@@ -225,15 +225,36 @@ struct UnixSocket : public Socket {
     }
 };
 
+/// Counters for the shared P2P host port, for diagnosing a session that will not connect.
+struct P2PPortStats {
+    u64 sent_direct = 0;
+    u64 sent_relayed = 0;
+    u64 recv_socket = 0; // datagrams read off the socket, relay envelopes included
+    u64 recv_relayed = 0;
+    u64 recv_relay_rejected = 0;
+    u64 send_failed = 0;
+};
+
 u16 GetP2PConfiguredPort();
 u32 GetP2PAdvertisedAddr();
 bool EnsureP2PTransport();
 bool P2PTransportIsReady();
+/// Points the transport's relay at the matching server's STUN endpoint; a port of 0 disables it.
+void SetP2PRelayEndpoint(u32 addr, u16 port);
+/// Routes one peer endpoint through the relay, or back to the direct path.
+void SetP2PPeerRelayed(u32 addr, u16 port, bool relayed);
+bool IsP2PPeerRelayed(u32 addr, u16 port);
+void ClearP2PRelayedPeers();
+/// Transport counters, for the periodic diagnostic line and for GetConnectionInfo.
+P2PPortStats GetP2PTransportStats();
+/// Releases the UPnP mapping the transport opened, if any. Safe to call when none exists.
+void ReleaseP2PPortMapping();
 int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
 int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
 int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
 int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
-int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
+int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port,
+                         bool* relayed = nullptr);
 
 } // namespace Libraries::Net

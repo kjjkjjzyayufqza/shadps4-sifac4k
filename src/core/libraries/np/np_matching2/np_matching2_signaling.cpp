@@ -20,6 +20,7 @@
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/libraries/np/np_matching2/np_matching2_signaling.h"
 #include "core/libraries/np/np_signaling/np_signaling_stubs.h"
+#include "core/libraries/np/np_utility/np_utility.h"
 
 namespace Libraries::Np::NpMatching2 {
 
@@ -29,8 +30,22 @@ constexpr s32 kMatching2ConnInactive = 0;
 constexpr s32 kMatching2ConnPending = 1;
 constexpr s32 kMatching2ConnActive = 2;
 constexpr auto kMatching2HandshakeRetry = std::chrono::milliseconds(350);
-constexpr auto kMatching2HandshakeTimeout = std::chrono::seconds(10);
+// Measured from the first attempt, not the last send: a peer whose endpoint never resolves sends
+// nothing at all and still has to be declared dead, or the title waits for an event that never
+// comes and its "joining room" screen never ends.
+constexpr auto kMatching2HandshakeTimeout = std::chrono::seconds(20);
+// Two NATs that were going to open for a direct punch have done so long before this. Past it the
+// handshake keeps retrying but through the server relay, which is the only path left for a peer
+// behind a symmetric NAT or CGNAT.
+constexpr auto kMatching2RelayAfter = std::chrono::seconds(6);
 constexpr auto kMatching2StunPingInterval = std::chrono::seconds(5);
+constexpr auto kMatching2PingInterval = std::chrono::seconds(1);
+// One line per interval describing every peer, so a session that will not connect can be
+// diagnosed from the log alone instead of from a rebuild with extra prints.
+constexpr auto kMatching2StatusInterval = std::chrono::seconds(5);
+constexpr u32 kMatching2LossWindow = 32;
+// Cap so a flooded socket cannot starve the periodic handshake and ping work below.
+constexpr u32 kMatching2MaxDrainPerTick = 64;
 
 std::atomic<bool> g_matching2_stop{false};
 std::mutex g_matching2_thread_mutex;
@@ -41,6 +56,8 @@ enum class Matching2HandshakeKind : u8 {
     Accept = 2,
     Check = 3,
     CheckAck = 4,
+    Ping = 5,
+    Pong = 6,
 };
 
 #pragma pack(push, 1)
@@ -54,15 +71,22 @@ struct Matching2HandshakePacket {
     u8 online_id_from[16]{};
     u32 mapped_addr = 0;
     u16 mapped_port = 0;
-    u16 reserved = 0;
+    // libSceNpMatching2 does not measure the peer link itself: connection info type 2 returns a
+    // value the peer advertised in signaling, so carry it here and report it back verbatim.
+    u32 bandwidth_bps = 0;
     u64 nonce = 0;
 };
 #pragma pack(pop)
-static_assert(sizeof(Matching2HandshakePacket) == 0x32);
+static_assert(sizeof(Matching2HandshakePacket) == 0x34);
+
+// 0x01 asks the primary STUN endpoint, 0x03 the alternate one; the alternate answers with a
+// tagged echo so one socket can tell the two replies apart. Mirrors shadNet's stun_server.cpp.
+constexpr u8 kMatching2StunPingCmd = 0x01;
+constexpr u8 kMatching2StunAltPingCmd = 0x03;
 
 #pragma pack(push, 1)
 struct Matching2StunPing {
-    u8 cmd = 0x01;
+    u8 cmd = kMatching2StunPingCmd;
     u8 online_id[ORBIS_NP_ONLINEID_MAX_LENGTH]{};
     u32 local_ip = 0;
 };
@@ -95,30 +119,63 @@ bool ShouldConnectToPeer(const RoomCache& room, OrbisNpMatching2RoomMemberId sel
     return true;
 }
 
+const char* Matching2ConnStateName(s32 status) {
+    switch (status) {
+    case kMatching2ConnInactive:
+        return "inactive";
+    case kMatching2ConnPending:
+        return "pending";
+    case kMatching2ConnActive:
+        return "active";
+    default:
+        return "unknown";
+    }
+}
+
+// Never blocks. Room callbacks reach this from the ShadNet reader thread, and that thread is the
+// only one that can deliver a signaling-info reply, so asking the server here and waiting for the
+// answer would deadlock. An unknown endpoint schedules the query instead and the handshake thread
+// picks the answer up on a later retry.
 bool ResolvePeerEndpoint(const MemberCache& member, PeerInfo& peer) {
+    if (peer.online_id.data[0] == 0) {
+        peer.online_id = member.np_id.handle;
+    }
     if (peer.addr != 0 && peer.port != 0) {
         return true;
     }
     if (member.addr != 0 && member.port != 0) {
         peer.addr = member.addr;
         peer.port = member.port;
-        if (peer.online_id.data[0] == 0) {
-            peer.online_id = member.np_id.handle;
-        }
+        LOG_INFO(Lib_NpMatching2, "Matching2 peer {} endpoint from room data: {:#010x}:{}",
+                 member.member_id, Libraries::Net::sceNetNtohl(peer.addr),
+                 Libraries::Net::sceNetNtohs(peer.port));
         return true;
     }
 
     const std::string online_id(member.np_id.handle.data);
+    if (online_id.empty()) {
+        return false;
+    }
     u32 resolved_addr = 0;
     u16 resolved_port = 0;
-    if (!online_id.empty() && RequestSignalingInfos(online_id, &resolved_addr, &resolved_port)) {
+    if (ResolveSignalingInfo(online_id, &resolved_addr, &resolved_port)) {
         peer.addr = resolved_addr;
         peer.port = resolved_port;
+        LOG_INFO(Lib_NpMatching2, "Matching2 peer {} ('{}') endpoint from server: {:#010x}:{}",
+                 member.member_id, online_id, Libraries::Net::sceNetNtohl(peer.addr),
+                 Libraries::Net::sceNetNtohs(peer.port));
+        return true;
     }
-    if (peer.online_id.data[0] == 0) {
-        peer.online_id = member.np_id.handle;
+
+    ++peer.resolve_failures;
+    peer.last_resolve_request = std::chrono::steady_clock::now();
+    if (peer.resolve_failures == 1) {
+        LOG_WARNING(Lib_NpMatching2,
+                    "Matching2 peer {} ('{}') has no endpoint yet: the room record carries no "
+                    "port and the server has no STUN entry. Waiting on the lookup.",
+                    member.member_id, online_id);
     }
-    return peer.addr != 0 && peer.port != 0;
+    return false;
 }
 
 void MarkMatching2PeerActive(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
@@ -143,9 +200,17 @@ void MarkMatching2PeerActive(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
         peer.sent_established = true;
         QueueMatching2SignalingEvent(ctx, room_id, member_id,
                                      ORBIS_NP_MATCHING2_SIGNALING_EVENT_ESTABLISHED, ORBIS_OK);
+        const auto elapsed_ms = peer.first_attempt.time_since_epoch().count() == 0
+                                    ? 0
+                                    : std::chrono::duration_cast<std::chrono::milliseconds>(
+                                          std::chrono::steady_clock::now() - peer.first_attempt)
+                                          .count();
         LOG_INFO(Lib_NpMatching2,
-                 "Matching2 signaling established: ctx={} room={} member={} addr={:#x}:{}",
-                 ctx.ctx_id, room_id, member_id, peer.addr, Libraries::Net::sceNetNtohs(peer.port));
+                 "Matching2 signaling established: ctx={} room={} member={} addr={:#010x}:{} "
+                 "path={} after={}ms sent={} recv={}",
+                 ctx.ctx_id, room_id, member_id, Libraries::Net::sceNetNtohl(peer.addr),
+                 Libraries::Net::sceNetNtohs(peer.port), peer.relay_active ? "relay" : "direct",
+                 elapsed_ms, peer.handshake_sent, peer.handshake_recv);
     }
 }
 
@@ -163,9 +228,17 @@ bool SendMatching2Handshake(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
 
     PeerInfo& peer = ctx.peers[member_id];
     peer.member_id = member_id;
+    const auto attempt_now = std::chrono::steady_clock::now();
+    // Stamped before the endpoint is known. The retry gate and the dead-peer deadline both read
+    // these, so an attempt that cannot even be addressed still has to advance them.
+    if (peer.first_attempt.time_since_epoch().count() == 0) {
+        peer.first_attempt = attempt_now;
+    }
+    peer.last_attempt = attempt_now;
     if (!ResolvePeerEndpoint(member_it->second, peer)) {
-        LOG_WARNING(Lib_NpMatching2, "Matching2 signaling: unresolved endpoint room={} member={}",
-                    room_id, member_id);
+        LOG_DEBUG(Lib_NpMatching2,
+                  "Matching2 signaling: unresolved endpoint room={} member={} attempts={}", room_id,
+                  member_id, peer.resolve_failures);
         return false;
     }
 
@@ -179,19 +252,64 @@ bool SendMatching2Handshake(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
     pkt.mapped_port = Net::GetP2PConfiguredPort() != 0
                           ? Libraries::Net::sceNetHtons(Net::GetP2PConfiguredPort())
                           : 0;
+    pkt.bandwidth_bps = NpUtility::GetLastMeasuredUploadBps();
     pkt.nonce = nonce;
 
     const int rc = Net::P2PMatching2SendTo(&pkt, sizeof(pkt), peer.addr, peer.port);
-    const auto now = std::chrono::steady_clock::now();
-    peer.last_send = now;
+    peer.last_send = attempt_now;
+    ++peer.handshake_sent;
     if (kind == Matching2HandshakeKind::Check) {
-        peer.last_check_send = now;
+        peer.last_check_send = attempt_now;
+    }
+    if (rc < 0) {
+        LOG_WARNING(Lib_NpMatching2,
+                    "Matching2 handshake send failed kind={} ctx={} room={} {}->{} "
+                    "dst={:#010x}:{} path={}",
+                    static_cast<u8>(kind), ctx.ctx_id, room_id, ctx.my_member_id, member_id,
+                    Libraries::Net::sceNetNtohl(peer.addr), Libraries::Net::sceNetNtohs(peer.port),
+                    peer.relay_active ? "relay" : "direct");
+        return false;
     }
     LOG_DEBUG(Lib_NpMatching2,
-              "Matching2 handshake send kind={} ctx={} room={} {}->{} dst={:#x}:{} rc={}",
-              static_cast<u8>(kind), ctx.ctx_id, room_id, ctx.my_member_id, member_id, peer.addr,
-              Libraries::Net::sceNetNtohs(peer.port), rc);
-    return rc >= 0;
+              "Matching2 handshake send kind={} ctx={} room={} {}->{} dst={:#010x}:{} path={}",
+              static_cast<u8>(kind), ctx.ctx_id, room_id, ctx.my_member_id, member_id,
+              Libraries::Net::sceNetNtohl(peer.addr), Libraries::Net::sceNetNtohs(peer.port),
+              peer.relay_active ? "relay" : "direct");
+    return true;
+}
+
+// Connection quality is reported per resolved ping: a pong answers its ping, and a ping still
+// unanswered when the next one falls due is a lost packet. The counters halve once the window is
+// full so the rate follows the current link instead of the whole session.
+void UpdateMatching2PacketLoss(PeerInfo& peer, bool lost) {
+    ++peer.pings_resolved;
+    if (lost) {
+        ++peer.pings_lost;
+    }
+    peer.packet_loss_pct = (peer.pings_lost * 100) / peer.pings_resolved;
+    if (peer.pings_resolved >= kMatching2LossWindow) {
+        peer.pings_resolved /= 2;
+        peer.pings_lost /= 2;
+    }
+}
+
+// The handshake only ever produces one RTT sample, but titles poll GetConnectionInfo for as long
+// as the connection lives and show the link quality from it, so an established peer keeps being
+// measured.
+void MaybeSendMatching2Ping(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
+                            OrbisNpMatching2RoomMemberId member_id, PeerInfo& peer,
+                            std::chrono::steady_clock::time_point now) {
+    if (peer.last_ping_send.time_since_epoch().count() != 0 &&
+        now - peer.last_ping_send < kMatching2PingInterval) {
+        return;
+    }
+    if (peer.ping_pending) {
+        UpdateMatching2PacketLoss(peer, true);
+    }
+    ++peer.ping_seq;
+    peer.ping_pending = true;
+    peer.last_ping_send = now;
+    SendMatching2Handshake(ctx, room_id, member_id, Matching2HandshakeKind::Ping, peer.ping_seq);
 }
 
 ContextObject* FindContextForMatching2Packet(const Matching2HandshakePacket& pkt) {
@@ -209,7 +327,7 @@ ContextObject* FindContextForMatching2Packet(const Matching2HandshakePacket& pkt
     return nullptr;
 }
 
-void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port,
+void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port, bool relayed,
                                     const Matching2HandshakePacket& pkt) {
     if (!HasMatching2Magic(pkt)) {
         return;
@@ -232,14 +350,36 @@ void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port,
 
     PeerInfo& peer = ctx->peers[member_id];
     peer.member_id = member_id;
-    peer.addr = pkt.mapped_addr != 0 ? pkt.mapped_addr : from_addr;
-    peer.port = pkt.mapped_port != 0 ? pkt.mapped_port : from_port;
+    ++peer.handshake_recv;
+    // Answer the observed source: it is the path this packet already travelled. The sender's
+    // mapped address is its own interface address, which a wildcard or NATed bind cannot be
+    // reached on from the peer.
+    if ((peer.addr != from_addr || peer.port != from_port) && peer.relay_active && peer.addr != 0 &&
+        peer.port != 0) {
+        // The relay marking is keyed on the endpoint, so it has to move with it.
+        Net::SetP2PPeerRelayed(peer.addr, peer.port, false);
+        peer.relay_active = false;
+    }
+    peer.addr = from_addr;
+    peer.port = from_port;
+    if (relayed && !peer.relay_active) {
+        // The peer had to give up on the direct path; answering it directly would go nowhere, so
+        // this side follows it onto the relay instead of waiting out its own timer.
+        peer.relay_active = true;
+        Net::SetP2PPeerRelayed(peer.addr, peer.port, true);
+        LOG_WARNING(Lib_NpMatching2,
+                    "Matching2 peer {} reached us through the relay; switching this direction to "
+                    "the relay as well",
+                    member_id);
+    }
     peer.status =
         peer.status == kMatching2ConnActive ? kMatching2ConnActive : kMatching2ConnPending;
     peer.handshake_started = true;
     SetNpOnlineId(peer.online_id,
                   std::string_view(reinterpret_cast<const char*>(pkt.online_id_from),
                                    ORBIS_NP_ONLINEID_MAX_LENGTH));
+
+    peer.bandwidth_bps = pkt.bandwidth_bps;
 
     const auto kind = static_cast<Matching2HandshakeKind>(pkt.kind);
     switch (kind) {
@@ -268,25 +408,115 @@ void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port,
             MarkMatching2PeerActive(*ctx, room_id, member_id, peer.addr, peer.port);
         }
         break;
+    case Matching2HandshakeKind::Ping:
+        SendMatching2Handshake(*ctx, room_id, member_id, Matching2HandshakeKind::Pong, pkt.nonce);
+        break;
+    case Matching2HandshakeKind::Pong:
+        if (peer.ping_pending && pkt.nonce == peer.ping_seq) {
+            const auto rtt = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - peer.last_ping_send);
+            const u32 sample = static_cast<u32>(std::min<u64>(
+                static_cast<u64>(std::max<s64>(0, rtt.count())), std::numeric_limits<u32>::max()));
+            // A single sample carries the scheduling jitter of both ends; smooth it the way a
+            // signaling stack does so the reported value is stable between frames.
+            peer.ping_us = peer.ping_us == 0 ? sample : (peer.ping_us * 3 + sample) / 4;
+            peer.ping_pending = false;
+            UpdateMatching2PacketLoss(peer, false);
+        }
+        break;
     default:
         break;
     }
 }
 
+// Escalates one stalled peer onto the server relay. Direct punching has had its chance by the
+// time this runs, so the alternative is not connecting at all.
+void MaybeEscalateToRelay(OrbisNpMatching2RoomMemberId member_id, PeerInfo& peer,
+                          std::chrono::steady_clock::time_point now) {
+    if (peer.relay_active || peer.addr == 0 || peer.port == 0) {
+        return;
+    }
+    if (peer.first_attempt.time_since_epoch().count() == 0 ||
+        now - peer.first_attempt < kMatching2RelayAfter) {
+        return;
+    }
+    if (!IsSignalingRelayEnabled()) {
+        if (!peer.relay_warned) {
+            peer.relay_warned = true;
+            LOG_WARNING(Lib_NpMatching2,
+                        "Matching2 peer {} has not answered a direct punch and this server offers "
+                        "no relay; the connection will time out",
+                        member_id);
+        }
+        return;
+    }
+    peer.relay_active = true;
+    Net::SetP2PPeerRelayed(peer.addr, peer.port, true);
+    LOG_WARNING(Lib_NpMatching2,
+                "Matching2 peer {} did not answer a direct punch in {} s; retrying through the "
+                "server relay at {:#010x}:{}",
+                member_id, kMatching2RelayAfter.count(), Libraries::Net::sceNetNtohl(peer.addr),
+                Libraries::Net::sceNetNtohs(peer.port));
+}
+
+void LogMatching2PeerStatus(const ContextObject& ctx) {
+    if (ctx.peers.empty()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const Libraries::Net::P2PPortStats stats = Net::GetP2PTransportStats();
+    LOG_INFO(Lib_NpMatching2,
+             "Matching2 status: ctx={} room={} self={} peers={} port={} advertised={:#010x} "
+             "tx(direct={} relay={} failed={}) rx(socket={} relay={} rejected={})",
+             ctx.ctx_id, ctx.room_id, ctx.my_member_id, ctx.peers.size(),
+             Net::GetP2PConfiguredPort(), Libraries::Net::sceNetNtohl(Net::GetP2PAdvertisedAddr()),
+             stats.sent_direct, stats.sent_relayed, stats.send_failed, stats.recv_socket,
+             stats.recv_relayed, stats.recv_relay_rejected);
+    for (const auto& [member_id, peer] : ctx.peers) {
+        const auto age_ms =
+            peer.first_attempt.time_since_epoch().count() == 0
+                ? 0
+                : std::chrono::duration_cast<std::chrono::milliseconds>(now - peer.first_attempt)
+                      .count();
+        LOG_INFO(Lib_NpMatching2,
+                 "  peer {} '{}' state={} path={} endpoint={:#010x}:{} sent={} recv={} "
+                 "unresolved={} age={}ms rtt={}us loss={}%",
+                 member_id, OnlineIdToString(peer.online_id), Matching2ConnStateName(peer.status),
+                 peer.relay_active ? "relay" : "direct", Libraries::Net::sceNetNtohl(peer.addr),
+                 Libraries::Net::sceNetNtohs(peer.port), peer.handshake_sent, peer.handshake_recv,
+                 peer.resolve_failures, age_ms, peer.ping_us, peer.packet_loss_pct);
+    }
+}
+
 void Matching2HandshakeThreadMain() {
     auto last_stun_ping = std::chrono::steady_clock::time_point{};
+    auto last_status_log = std::chrono::steady_clock::time_point{};
     while (!g_matching2_stop.load(std::memory_order_relaxed)) {
-        Matching2HandshakePacket pkt{};
-        u32 from_addr = 0;
-        u16 from_port = 0;
-        const int rc = Net::P2PMatching2RecvFrom(&pkt, sizeof(pkt), &from_addr, &from_port);
-        if (rc == sizeof(pkt)) {
-            HandleMatching2HandshakePacket(from_addr, from_port, pkt);
+        for (u32 drained = 0; drained < kMatching2MaxDrainPerTick; ++drained) {
+            Matching2HandshakePacket pkt{};
+            u32 from_addr = 0;
+            u16 from_port = 0;
+            bool relayed = false;
+            const int rc =
+                Net::P2PMatching2RecvFrom(&pkt, sizeof(pkt), &from_addr, &from_port, &relayed);
+            if (rc != sizeof(pkt)) {
+                break;
+            }
+            HandleMatching2HandshakePacket(from_addr, from_port, relayed, pkt);
         }
 
         const auto now = std::chrono::steady_clock::now();
         const bool should_stun_ping = last_stun_ping.time_since_epoch().count() == 0 ||
                                       now - last_stun_ping >= kMatching2StunPingInterval;
+        const bool should_log_status = last_status_log.time_since_epoch().count() == 0 ||
+                                       now - last_status_log >= kMatching2StatusInterval;
+        if (should_stun_ping) {
+            // The relay lives on the matching server's STUN endpoint; keeping this in step with
+            // the ping means it is set as soon as the server address is known and cleared again
+            // when the client disconnects.
+            Net::SetP2PRelayEndpoint(NpSignaling::Stubs::MmServerAddr(),
+                                     NpSignaling::Stubs::MmServerUdpPort());
+        }
         for (u32 id = 1; id <= ContextManager::kMaxContexts; ++id) {
             ContextObject* ctx =
                 ContextManager::Instance().Get(static_cast<OrbisNpMatching2ContextId>(id));
@@ -303,20 +533,41 @@ void Matching2HandshakeThreadMain() {
             if (room_it == ctx->room_cache.end()) {
                 continue;
             }
+            if (should_log_status) {
+                LogMatching2PeerStatus(*ctx);
+            }
             for (auto& [member_id, peer] : ctx->peers) {
+                if (peer.status == kMatching2ConnActive) {
+                    MaybeSendMatching2Ping(*ctx, ctx->room_id, member_id, peer, now);
+                    continue;
+                }
                 if (peer.status != kMatching2ConnPending || !peer.handshake_started) {
                     continue;
                 }
-                if (peer.last_send.time_since_epoch().count() != 0 &&
-                    now - peer.last_send > kMatching2HandshakeTimeout) {
+                const bool started = peer.first_attempt.time_since_epoch().count() != 0;
+                if (started && now - peer.first_attempt > kMatching2HandshakeTimeout) {
                     peer.status = kMatching2ConnInactive;
+                    if (peer.relay_active && peer.addr != 0 && peer.port != 0) {
+                        Net::SetP2PPeerRelayed(peer.addr, peer.port, false);
+                        peer.relay_active = false;
+                    }
+                    LOG_ERROR(Lib_NpMatching2,
+                              "Matching2 peer {} gave up after {} s: endpoint={:#010x}:{} sent={} "
+                              "recv={} unresolvedAttempts={}. {}",
+                              member_id, kMatching2HandshakeTimeout.count(),
+                              Libraries::Net::sceNetNtohl(peer.addr),
+                              Libraries::Net::sceNetNtohs(peer.port), peer.handshake_sent,
+                              peer.handshake_recv, peer.resolve_failures,
+                              peer.addr == 0 ? "The server never reported an endpoint for it - its "
+                                               "UDP path to the STUN port is probably blocked."
+                                             : "Its endpoint was known but never answered.");
                     QueueMatching2SignalingEvent(*ctx, ctx->room_id, member_id,
                                                  ORBIS_NP_MATCHING2_SIGNALING_EVENT_DEAD,
                                                  ORBIS_NP_MATCHING2_SIGNALING_ERROR_TIMEOUT);
                     continue;
                 }
-                if (peer.last_send.time_since_epoch().count() == 0 ||
-                    now - peer.last_send >= kMatching2HandshakeRetry) {
+                MaybeEscalateToRelay(member_id, peer, now);
+                if (!started || now - peer.last_attempt >= kMatching2HandshakeRetry) {
                     SendMatching2Handshake(*ctx, ctx->room_id, member_id,
                                            peer.sent_check ? Matching2HandshakeKind::Check
                                                            : Matching2HandshakeKind::Offer,
@@ -326,6 +577,9 @@ void Matching2HandshakeThreadMain() {
         }
         if (should_stun_ping) {
             last_stun_ping = now;
+        }
+        if (should_log_status) {
+            last_status_log = now;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -352,7 +606,7 @@ bool SendMatching2StunPing(const ContextObject& ctx) {
     }
 
     Matching2StunPing ping{};
-    ping.cmd = 0x01;
+    ping.cmd = kMatching2StunPingCmd;
     std::memcpy(ping.online_id, ctx.online_id.data, ORBIS_NP_ONLINEID_MAX_LENGTH);
     ping.local_ip = NpSignaling::Stubs::AdvertisedAddr();
 
@@ -362,6 +616,16 @@ bool SendMatching2StunPing(const ContextObject& ctx) {
               "Matching2 STUN ping: ctx={} online_id='{}' server={:#x}:{} local_ip={:#x} rc={}",
               ctx.ctx_id, OnlineIdToString(ctx.online_id), server_addr,
               Libraries::Net::sceNetNtohs(server_udp), ping.local_ip, rc);
+
+    // Same socket, second destination. Comparing the two mappings the server reports is the only
+    // way to tell a NAT a punch can get through from one that picks a fresh mapping per peer, and
+    // these titles never open an NpSignaling context, so this cannot be left to that path.
+    const u16 alt_port = GetStunAltPort();
+    if (alt_port != 0) {
+        ping.cmd = kMatching2StunAltPingCmd;
+        NpSignaling::Stubs::SignalingSendTo(&ping, sizeof(ping), server_addr,
+                                            Libraries::Net::sceNetHtons(alt_port));
+    }
     return rc >= 0;
 }
 
@@ -402,6 +666,9 @@ void StartMatching2PeerHandshake(ContextObject& ctx, OrbisNpMatching2RoomId room
     peer.status = kMatching2ConnPending;
     peer.handshake_started = true;
     peer.sent_check = false;
+    if (peer.first_attempt.time_since_epoch().count() == 0) {
+        peer.first_attempt = std::chrono::steady_clock::now();
+    }
     if (peer.nonce == 0) {
         peer.nonce = static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count() ^
                                       (static_cast<u64>(ctx.ctx_id) << 48) ^
@@ -434,9 +701,16 @@ void QueueMatching2DeadForRoomPeers(ContextObject& ctx, OrbisNpMatching2RoomId r
 
         auto peer_it = ctx.peers.find(member_id);
         if (peer_it != ctx.peers.end()) {
-            peer_it->second.status = kMatching2ConnInactive;
-            peer_it->second.handshake_started = false;
-            peer_it->second.sent_check = false;
+            PeerInfo& peer = peer_it->second;
+            if (peer.relay_active && peer.addr != 0 && peer.port != 0) {
+                Net::SetP2PPeerRelayed(peer.addr, peer.port, false);
+            }
+            peer.relay_active = false;
+            peer.status = kMatching2ConnInactive;
+            peer.handshake_started = false;
+            peer.sent_check = false;
+            peer.first_attempt = {};
+            peer.last_attempt = {};
         }
 
         QueueMatching2SignalingEvent(ctx, room_id, member_id,
@@ -463,6 +737,7 @@ void StopMatching2HandshakeThread() {
     if (g_matching2_thread.joinable()) {
         g_matching2_thread.join();
     }
+    Net::SetP2PRelayEndpoint(0, 0);
 }
 
 u32 GetRoomPingUs(const ContextObject& ctx, OrbisNpMatching2RoomId roomId) {
@@ -545,7 +820,7 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
             out->rtt = peer ? peer->ping_us : 0;
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_BANDWIDTH:
-            out->bandwidth = 0;
+            out->bandwidth = peer ? peer->bandwidth_bps : 0;
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PEER_ADDR:
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_MAPPED_ADDR:
@@ -558,7 +833,7 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
             }
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PACKET_LOSS:
-            out->packetLoss = 0;
+            out->packetLoss = peer ? peer->packet_loss_pct : 0;
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PEER_ADDRESS_A:
             if (member) {
@@ -578,7 +853,7 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
             out->rtt = peer ? peer->ping_us : 0;
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_BANDWIDTH:
-            out->bandwidth = 0;
+            out->bandwidth = peer ? peer->bandwidth_bps : 0;
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PEER_NP_ID:
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PEER_NPID:
@@ -597,7 +872,7 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
             }
             break;
         case ORBIS_NP_MATCHING2_SIGNALING_CONN_INFO_PACKET_LOSS:
-            out->packetLoss = 0;
+            out->packetLoss = peer ? peer->packet_loss_pct : 0;
             break;
         default:
             LOG_WARNING(Lib_NpMatching2, "unsupported connection info type={}", infoType);
@@ -605,9 +880,9 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
         }
     }
 
-    LOG_INFO(Lib_NpMatching2, "connection info{}: ctx={} room={} member={} type={} rtt={}",
-             a_variant ? "A" : "", ctx.ctx_id, roomId, memberId, infoType,
-             peer ? peer->ping_us : 0);
+    LOG_INFO(Lib_NpMatching2, "connection info{}: ctx={} room={} member={} type={} rtt={} loss={}",
+             a_variant ? "A" : "", ctx.ctx_id, roomId, memberId, infoType, peer ? peer->ping_us : 0,
+             peer ? peer->packet_loss_pct : 0);
     return ORBIS_OK;
 }
 

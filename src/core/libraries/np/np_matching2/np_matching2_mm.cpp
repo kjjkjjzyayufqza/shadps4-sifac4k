@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <map>
@@ -19,6 +18,7 @@
 #include "core/libraries/np/np_matching2/np_matching2_internal.h"
 #include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/libraries/np/np_matching2/np_matching2_signaling.h"
+#include "core/libraries/np/np_request_timeout.h"
 #include "core/libraries/np/np_signaling/np_signaling_stubs.h"
 #include "shadnet.pb.h"
 #include "shadnet/client.h"
@@ -34,6 +34,26 @@ struct PendingRequest {
     bool a_variant = false;
     OrbisNpMatching2RequestCallback request_cb = nullptr;
     void* request_cb_arg = nullptr;
+    // When the expiry sweep gives up on this request and completes it with a timeout.
+    std::chrono::steady_clock::time_point deadline{};
+};
+
+// A STUN-derived endpoint stays usable for this long; past it the peer may sit behind a new
+// NAT binding and the cached value would send the handshake into a black hole.
+constexpr auto kSignalingInfoTtl = std::chrono::seconds(60);
+// Older than this and the entry is refreshed in the background while still being served, so a
+// long-lived room never falls off the cliff above.
+constexpr auto kSignalingInfoRefresh = std::chrono::seconds(15);
+// One query per target per interval. Without it an unresolved peer turns the handshake retry
+// loop into a request flood against the matching server.
+constexpr auto kSignalingInfoQueryInterval = std::chrono::milliseconds(1000);
+
+// Endpoint the matching server last reported for one online id.
+struct SignalingInfo {
+    u32 addr = 0; // network byte order
+    u16 port = 0; // network byte order
+    u32 nat_type = 0;
+    std::chrono::steady_clock::time_point resolved_at{};
 };
 
 struct MmClientState {
@@ -42,13 +62,23 @@ struct MmClientState {
     u32 server_addr = 0;
     u16 server_udp_port = 0;
     bool matching2_enabled = false;
+    bool relay_enabled = false;
+    u16 stun_alt_port = 0;
 
     std::mutex pending_mutex;
     std::map<u64, PendingRequest> pending;
 
+    // Signaling-endpoint lookups are resolved asynchronously: the reply arrives on the ShadNet
+    // reader thread, which is also the thread that runs the room callbacks asking for an
+    // endpoint. A blocking query there would wait on a packet only it can deliver.
     std::mutex sig_mutex;
-    std::condition_variable sig_cv;
-    std::map<u64, std::pair<ShadNet::ErrorType, std::vector<u8>>> sig_replies;
+    std::map<std::string, SignalingInfo> sig_cache;
+    std::map<std::string, std::chrono::steady_clock::time_point> sig_last_request;
+    struct SignalingQuery {
+        std::string target;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::map<u64, SignalingQuery> sig_inflight;
 };
 
 MmClientState g_mm;
@@ -104,6 +134,41 @@ void AppendIntAttr(shadnet::MatchingIntAttr* dst, const OrbisNpMatching2IntAttr&
     dst->set_attr_value(src.num);
 }
 
+// The room password has to travel with the request: the server compares the joiner's bytes with
+// the owner's, and a request that only says "a password was given" leaves the room open.
+template <typename Request>
+void SetRoomPassword(Request& req, const OrbisNpMatching2SessionPassword* password) {
+    req.set_room_password_present(password != nullptr);
+    if (password != nullptr) {
+        req.set_room_password(password->data, ORBIS_NP_MATCHING2_SESSION_PASSWORD_SIZE);
+    }
+}
+
+// Room searches only match rooms created in the same world with matching searchable
+// attributes, so both sides of a failed match have to be visible in the log.
+void LogCreateRoomRequest(const shadnet::CreateRoomRequest& req) {
+    LOG_DEBUG(Lib_NpMatching2,
+              "createJoinRoom world={} lobby={} maxSlot={} flags={:#x} groups={} intAttrN={} "
+              "binAttrN={} extBinN={} memberBinN={}",
+              req.world_id(), req.lobby_id(), req.max_slots(), req.flags(),
+              req.group_config_count(), req.external_search_int_attrs_size(),
+              req.external_search_bin_attrs_size(), req.external_bin_attrs_size(),
+              req.member_bin_attrs_size());
+    for (const auto& attr : req.external_search_int_attrs()) {
+        LOG_DEBUG(Lib_NpMatching2, "  searchIntAttr id={:#x} num={}", attr.attr_id(),
+                  attr.attr_value());
+    }
+    for (const auto& attr : req.external_search_bin_attrs()) {
+        LOG_DEBUG(Lib_NpMatching2, "  searchBinAttr id={:#x} size={}", attr.attr_id(),
+                  attr.data().size());
+    }
+}
+
+void LogJoinRoomRequest(const shadnet::JoinRoomRequest& req) {
+    LOG_DEBUG(Lib_NpMatching2, "joinRoom room={} team={} flags={:#x} memberBinN={}", req.room_id(),
+              req.team_id(), req.join_flags(), req.member_bin_attrs_size());
+}
+
 void AppendRoomGroupConfig(shadnet::MatchingRoomGroupConfig* dst,
                            const OrbisNpMatching2RoomGroupConfig& src) {
     dst->set_slot_count(src.slots);
@@ -150,6 +215,33 @@ std::string ExtractProtoBytes(const std::vector<u8>& payload, size_t offset = 0)
         return {};
     }
     return std::string(reinterpret_cast<const char*>(payload.data() + offset + 4), len);
+}
+
+// A request whose reply never arrives must still complete: the title is waiting on this
+// callback and has no other way to learn the request is dead. Reported as a request timeout,
+// which is what the library raises when the matching service stops answering.
+void DispatchRequestTimeout(const PendingRequest& pr) {
+    if (ContextManager::Instance().Get(pr.ctx_id) == nullptr) {
+        return;
+    }
+
+    PendingEvent ev{};
+    ev.ctx_id = pr.ctx_id;
+    ev.fire_at = std::chrono::steady_clock::now();
+    ev.error_code = ORBIS_NP_MATCHING2_ERROR_REQUEST_TIMEOUT;
+    if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED ||
+        pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED) {
+        ev.type = PendingEvent::CONTEXT_CB;
+        ev.ctx_event = pr.req_event;
+        ev.ctx_event_cause = ORBIS_NP_MATCHING2_EVENT_CAUSE_CONTEXT_ACTION;
+    } else {
+        ev.type = PendingEvent::REQUEST_CB;
+        ev.req_id = pr.req_id;
+        ev.req_event = pr.req_event;
+        ev.request_cb = pr.request_cb;
+        ev.request_cb_arg = pr.request_cb_arg;
+    }
+    ScheduleEvent(std::move(ev));
 }
 
 void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
@@ -207,6 +299,11 @@ void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
             shadnet::GetWorldInfoListReply reply;
             if (reply.ParseFromString(proto)) {
                 request_data = BuildGetWorldInfoListPayload(*ctx, reply);
+            }
+        } else if (pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_INFO_LIST) {
+            shadnet::GetLobbyInfoListReply reply;
+            if (reply.ParseFromString(proto)) {
+                request_data = BuildGetLobbyInfoListPayload(*ctx, reply);
             }
         } else if (pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM ||
                    pr.req_event == ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM_A) {
@@ -624,14 +721,68 @@ void HandleRoomMessage(const ShadNet::NotifyRoomMessage& n) {
     ScheduleEvent(std::move(ev));
 }
 
+// Runs on the ShadNet reader thread. It only fills the cache; whoever asked for the endpoint
+// picks it up on its next attempt, so nothing ever waits here.
+void HandleSignalingInfosReply(u64 pkt_id, ShadNet::ErrorType error, const std::vector<u8>& body) {
+    std::string target;
+    {
+        std::lock_guard lock(g_mm.sig_mutex);
+        const auto it = g_mm.sig_inflight.find(pkt_id);
+        if (it == g_mm.sig_inflight.end()) {
+            LOG_WARNING(Lib_NpMatching2, "signaling info reply pkt_id={} has no pending query",
+                        pkt_id);
+            return;
+        }
+        target = it->second.target;
+        g_mm.sig_inflight.erase(it);
+    }
+
+    if (error != ShadNet::ErrorType::NoError) {
+        LOG_WARNING(Lib_NpMatching2,
+                    "signaling info '{}' refused by server: error={} (peer has not registered a "
+                    "STUN endpoint yet, or its UDP path to the server is blocked)",
+                    target, static_cast<int>(error));
+        return;
+    }
+
+    shadnet::RequestSignalingInfosReply rep;
+    const std::string proto = ExtractProtoBytes(body);
+    if (proto.empty() || !rep.ParseFromString(proto)) {
+        LOG_ERROR(Lib_NpMatching2, "signaling info '{}' reply is not parseable ({} bytes)", target,
+                  body.size());
+        return;
+    }
+
+    const std::string addr_str = rep.target_ip();
+    const u16 port_host = static_cast<u16>(rep.target_port());
+    u32 addr_nbo = 0;
+    if (addr_str.empty() || port_host == 0 ||
+        Libraries::Net::sceNetInetPton(Net::ORBIS_NET_AF_INET, addr_str.c_str(), &addr_nbo) <= 0) {
+        LOG_WARNING(Lib_NpMatching2,
+                    "signaling info '{}' is unusable: ip='{}' port={} - the server has no STUN "
+                    "record for this peer",
+                    target, addr_str, port_host);
+        return;
+    }
+
+    {
+        std::lock_guard lock(g_mm.sig_mutex);
+        SignalingInfo& info = g_mm.sig_cache[target];
+        info.addr = addr_nbo;
+        info.port = Libraries::Net::sceNetHtons(port_host);
+        info.nat_type = rep.target_nat_type();
+        info.resolved_at = std::chrono::steady_clock::now();
+    }
+    LOG_INFO(Lib_NpMatching2, "signaling info '{}' -> {}:{} memberId={} natType={}", target,
+             addr_str, port_host, rep.target_member_id(), rep.target_nat_type());
+}
+
 } // namespace
 
 void OnMatchingReply(ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                      const std::vector<u8>& body) {
     if (cmd == ShadNet::CommandType::RequestSignalingInfos) {
-        std::lock_guard lock(g_mm.sig_mutex);
-        g_mm.sig_replies[pkt_id] = {error, body};
-        g_mm.sig_cv.notify_all();
+        HandleSignalingInfosReply(pkt_id, error, body);
         return;
     }
 
@@ -652,16 +803,61 @@ void OnMatchingReply(ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType er
     DispatchRequestComplete(pr, error, body);
 }
 
+void ExpireMatchingRequests() {
+    const auto now = std::chrono::steady_clock::now();
+
+    std::vector<PendingRequest> expired;
+    {
+        std::lock_guard lock(g_mm.pending_mutex);
+        for (auto it = g_mm.pending.begin(); it != g_mm.pending.end();) {
+            if (now < it->second.deadline) {
+                ++it;
+                continue;
+            }
+            LOG_ERROR(Lib_NpMatching2,
+                      "request pkt_id={} ctx={} reqId={} event={:#x} had no reply after {}s; "
+                      "completing it as timed out",
+                      it->first, it->second.ctx_id, it->second.req_id,
+                      static_cast<u16>(it->second.req_event), kNpRequestTimeout.count());
+            expired.push_back(it->second);
+            it = g_mm.pending.erase(it);
+        }
+    }
+    // Dispatched outside the lock: scheduling an event takes the event queue's own lock.
+    for (const PendingRequest& pr : expired) {
+        DispatchRequestTimeout(pr);
+    }
+
+    // Signaling queries only populate a cache, so a lost reply needs no completion - but the
+    // entry must still go, or the map grows for the rest of the session.
+    std::lock_guard lock(g_mm.sig_mutex);
+    for (auto it = g_mm.sig_inflight.begin(); it != g_mm.sig_inflight.end();) {
+        if (now < it->second.deadline) {
+            ++it;
+            continue;
+        }
+        LOG_WARNING(Lib_NpMatching2, "signaling info query pkt_id={} target='{}' got no reply",
+                    it->first, it->second.target);
+        it = g_mm.sig_inflight.erase(it);
+    }
+}
+
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
                         std::string_view server_host, u16 tcp_port) {
     u32 server_addr = 0;
     u16 server_udp_port = 0;
     bool matching2_enabled = false;
+    bool relay_enabled = false;
+    u16 stun_alt_port = 0;
     {
         std::lock_guard lock(g_mm.mutex);
         g_mm.client = client;
         g_mm.matching2_enabled = client ? client->IsMatching2Enabled() : false;
+        g_mm.relay_enabled = client ? client->IsSignalingRelayEnabled() : false;
+        g_mm.stun_alt_port = client ? client->GetStunAltPort() : 0;
         matching2_enabled = g_mm.matching2_enabled;
+        relay_enabled = g_mm.relay_enabled;
+        stun_alt_port = g_mm.stun_alt_port;
         g_mm.server_addr = client ? client->GetAddrServer() : 0;
         if (g_mm.server_addr == 0) {
             g_mm.server_addr = IpStringToAddr(server_host);
@@ -671,8 +867,20 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
         server_addr = g_mm.server_addr;
         server_udp_port = g_mm.server_udp_port;
     }
-    LOG_INFO(Lib_NpMatching2, "ShadNet features: matching2_enabled={}", matching2_enabled);
+    // One place to read the whole online setup from when a session will not connect: what the
+    // server offers, which UDP endpoints this client will use, and what it will advertise.
+    LOG_INFO(Lib_NpMatching2,
+             "ShadNet online setup: server={}:{} matching2={} relay={} stunPort={} stunAltPort={}",
+             server_host, tcp_port, matching2_enabled, relay_enabled,
+             Libraries::Net::sceNetNtohs(server_udp_port), stun_alt_port);
     Net::UPnPClient::Instance().SetP2PFeaturesEnabled(matching2_enabled);
+    if (matching2_enabled && Net::EnsureP2PTransport()) {
+        LOG_INFO(Lib_NpMatching2,
+                 "P2P transport: port={} advertising={:#010x}. Peers reach this console on that "
+                 "UDP port; forward it or keep UPnP enabled when behind a strict NAT.",
+                 Net::GetP2PConfiguredPort(),
+                 Libraries::Net::sceNetNtohl(Net::GetP2PAdvertisedAddr()));
+    }
 
     if (!client) {
         NpSignaling::Stubs::SetTransportHooks({});
@@ -693,7 +901,7 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
         .advertised_addr = Net::GetP2PAdvertisedAddr,
         .ensure_transport = Net::EnsureP2PTransport,
     });
-    NpSignaling::Stubs::SetPeerResolver(matching2_enabled ? RequestSignalingInfos : nullptr);
+    NpSignaling::Stubs::SetPeerResolver(matching2_enabled ? ResolveSignalingInfo : nullptr);
     NpSignaling::Stubs::SetMatching2Enabled(matching2_enabled);
     NpSignaling::Stubs::SetMmServerEndpoint(server_addr, server_udp_port);
     if (matching2_enabled) {
@@ -713,6 +921,8 @@ void ClearMmShadNetClient() {
         g_mm.server_addr = 0;
         g_mm.server_udp_port = 0;
         g_mm.matching2_enabled = false;
+        g_mm.relay_enabled = false;
+        g_mm.stun_alt_port = 0;
     }
     Net::UPnPClient::Instance().SetP2PFeaturesEnabled(false);
     if (old_client) {
@@ -724,11 +934,18 @@ void ClearMmShadNetClient() {
     NpSignaling::Stubs::SetMatching2Enabled(false);
     NpSignaling::Stubs::SetMmServerEndpoint(0, 0);
     StopMatching2HandshakeThread();
+    Net::ClearP2PRelayedPeers();
+    Net::ReleaseP2PPortMapping();
     {
         std::lock_guard lock(g_mm.pending_mutex);
         g_mm.pending.clear();
     }
-    g_mm.sig_cv.notify_all();
+    {
+        std::lock_guard lock(g_mm.sig_mutex);
+        g_mm.sig_cache.clear();
+        g_mm.sig_last_request.clear();
+        g_mm.sig_inflight.clear();
+    }
 }
 
 bool IsMmClientRunning() {
@@ -821,12 +1038,14 @@ s32 MmSubmitRequest(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId 
              ctx_id, req_id, static_cast<u16>(req_event), static_cast<u16>(cmd), a_variant,
              reinterpret_cast<std::uintptr_t>(request_cb.callback), fmt::ptr(request_cb.arg));
 
-    const u64 pkt_id = client->SubmitRequest(static_cast<ShadNet::CommandType>(cmd), payload);
-    {
-        std::lock_guard lock(g_mm.pending_mutex);
-        g_mm.pending[pkt_id] = {ctx_id,        req_id, req_event, a_variant, request_cb.callback,
-                                request_cb.arg};
-    }
+    PendingRequest pending{ctx_id,        req_id, req_event, a_variant, request_cb.callback,
+                           request_cb.arg};
+    pending.deadline = std::chrono::steady_clock::now() + kNpRequestTimeout;
+    const u64 pkt_id =
+        client->SubmitRequest(static_cast<ShadNet::CommandType>(cmd), payload, [&pending](u64 id) {
+            std::lock_guard lock(g_mm.pending_mutex);
+            g_mm.pending[id] = pending;
+        });
     LOG_DEBUG(Lib_NpMatching2, "submit cmd={} pkt_id={} ctx={} reqId={}", static_cast<u16>(cmd),
               pkt_id, ctx_id, req_id);
     return ORBIS_OK;
@@ -874,12 +1093,13 @@ s32 MmCreateJoinRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId
         AppendBinAttr(req.add_member_bin_attrs(), request.memberInternalBinAttr[i]);
     }
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
-    req.set_room_password_present(request.roomPasswd != nullptr);
+    SetRoomPassword(req, request.roomPasswd);
     if (request.signalingParam) {
         req.set_sig_type(request.signalingParam->type);
         req.set_sig_flag(request.signalingParam->flag);
         req.set_sig_main_member(request.signalingParam->memberId);
     }
+    LogCreateRoomRequest(req);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM,
                            MmCommand::CreateRoom, MakeProtoPayload(req));
 }
@@ -926,12 +1146,13 @@ s32 MmCreateJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestI
         AppendBinAttr(req.add_member_bin_attrs(), request.memberInternalBinAttr[i]);
     }
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
-    req.set_room_password_present(request.roomPasswd != nullptr);
+    SetRoomPassword(req, request.roomPasswd);
     if (request.signalingParam) {
         req.set_sig_type(request.signalingParam->type);
         req.set_sig_flag(request.signalingParam->flag);
         req.set_sig_main_member(request.signalingParam->memberId);
     }
+    LogCreateRoomRequest(req);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_CREATE_JOIN_ROOM_A,
                            MmCommand::CreateRoom, MakeProtoPayload(req), true);
 }
@@ -953,8 +1174,9 @@ s32 MmJoinRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_i
     for (u64 i = 0; i < request.roomMemberBinInternalAttrNum; ++i) {
         AppendBinAttr(req.add_member_bin_attrs(), request.roomMemberBinInternalAttr[i]);
     }
-    req.set_room_password_present(request.roomPasswd != nullptr);
+    SetRoomPassword(req, request.roomPasswd);
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
+    LogJoinRoomRequest(req);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM,
                            MmCommand::JoinRoom, MakeProtoPayload(req));
 }
@@ -976,8 +1198,9 @@ s32 MmJoinRoomA(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_
     for (u64 i = 0; i < request.roomMemberBinInternalAttrNum; ++i) {
         AppendBinAttr(req.add_member_bin_attrs(), request.roomMemberBinInternalAttr[i]);
     }
-    req.set_room_password_present(request.roomPasswd != nullptr);
+    SetRoomPassword(req, request.roomPasswd);
     req.set_join_group_label_present(request.joinGroupLabel != nullptr);
+    LogJoinRoomRequest(req);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_ROOM_A,
                            MmCommand::JoinRoom, MakeProtoPayload(req), true);
 }
@@ -997,6 +1220,16 @@ s32 MmGetWorldInfoList(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2Request
     req.set_server_id(request.serverId);
     return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_WORLD_INFO_LIST,
                            MmCommand::GetWorldInfoList, MakeProtoPayload(req));
+}
+
+s32 MmGetLobbyInfoList(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                       const OrbisNpMatching2GetLobbyInfoListRequest& request) {
+    shadnet::GetLobbyInfoListRequest req;
+    req.set_world_id(request.worldId);
+    req.set_range_filter_start(request.rangeFilter.start);
+    req.set_range_filter_max(request.rangeFilter.max);
+    return MmSubmitRequest(ctx_id, req_id, ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_LOBBY_INFO_LIST,
+                           MmCommand::GetLobbyInfoList, MakeProtoPayload(req));
 }
 
 s32 MmSearchRoom(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
@@ -1182,11 +1415,8 @@ u16 GetMmServerUdpPort() {
     return g_mm.server_udp_port;
 }
 
-bool RequestSignalingInfos(std::string_view target_online_id, u32* out_addr, u16* out_port) {
-    if (!out_addr || !out_port) {
-        return false;
-    }
-    if (IsMatching2BackendDisabled()) {
+bool RequestSignalingInfoAsync(std::string_view target_online_id) {
+    if (target_online_id.empty() || IsMatching2BackendDisabled()) {
         return false;
     }
     std::shared_ptr<ShadNet::ShadNetClient> client;
@@ -1198,45 +1428,77 @@ bool RequestSignalingInfos(std::string_view target_online_id, u32* out_addr, u16
         return false;
     }
 
-    shadnet::RequestSignalingInfosRequest req;
-    req.set_target_npid(std::string(target_online_id));
-    const u64 pkt_id =
-        client->SubmitRequest(ShadNet::CommandType::RequestSignalingInfos, MakeProtoPayload(req));
-
-    std::pair<ShadNet::ErrorType, std::vector<u8>> reply;
+    const std::string target(target_online_id);
+    const auto now = std::chrono::steady_clock::now();
     {
-        std::unique_lock lock(g_mm.sig_mutex);
-        if (!g_mm.sig_cv.wait_for(lock, std::chrono::seconds(5),
-                                  [&] { return g_mm.sig_replies.count(pkt_id) > 0; })) {
-            LOG_WARNING(Lib_NpMatching2, "timed out for '{}'", target_online_id);
+        std::lock_guard lock(g_mm.sig_mutex);
+        const auto it = g_mm.sig_last_request.find(target);
+        if (it != g_mm.sig_last_request.end() && now - it->second < kSignalingInfoQueryInterval) {
             return false;
         }
-        reply = std::move(g_mm.sig_replies[pkt_id]);
-        g_mm.sig_replies.erase(pkt_id);
-    }
-    if (reply.first != ShadNet::ErrorType::NoError) {
-        return false;
+        g_mm.sig_last_request[target] = now;
     }
 
-    shadnet::RequestSignalingInfosReply rep;
-    const std::string proto = ExtractProtoBytes(reply.second);
-    if (proto.empty() || !rep.ParseFromString(proto)) {
-        return false;
-    }
-    const std::string addr_str = rep.target_ip();
-    const u16 port_host = static_cast<u16>(rep.target_port());
-    if (addr_str.empty() || port_host == 0) {
-        return false;
-    }
-
-    u32 addr_nbo = 0;
-    if (Libraries::Net::sceNetInetPton(Net::ORBIS_NET_AF_INET, addr_str.c_str(), &addr_nbo) <= 0) {
-        return false;
-    }
-    *out_addr = addr_nbo;
-    *out_port = Libraries::Net::sceNetHtons(port_host);
-    LOG_DEBUG(Lib_NpMatching2, "'{}' -> {}:{}", target_online_id, addr_str, port_host);
+    shadnet::RequestSignalingInfosRequest req;
+    req.set_target_npid(target);
+    const u64 pkt_id = client->SubmitRequest(
+        ShadNet::CommandType::RequestSignalingInfos, MakeProtoPayload(req), [&target](u64 id) {
+            std::lock_guard lock(g_mm.sig_mutex);
+            g_mm.sig_inflight[id] = {std::string(target),
+                                     std::chrono::steady_clock::now() + kNpRequestTimeout};
+        });
+    LOG_DEBUG(Lib_NpMatching2, "signaling info query pkt_id={} target='{}'", pkt_id, target);
     return true;
+}
+
+bool LookupSignalingInfo(std::string_view target_online_id, u32* out_addr, u16* out_port,
+                         u32* out_nat_type) {
+    if (target_online_id.empty() || !out_addr || !out_port) {
+        return false;
+    }
+    const std::string target(target_online_id);
+    const auto now = std::chrono::steady_clock::now();
+
+    std::lock_guard lock(g_mm.sig_mutex);
+    const auto it = g_mm.sig_cache.find(target);
+    if (it == g_mm.sig_cache.end() || now - it->second.resolved_at > kSignalingInfoTtl) {
+        return false;
+    }
+    *out_addr = it->second.addr;
+    *out_port = it->second.port;
+    if (out_nat_type) {
+        *out_nat_type = it->second.nat_type;
+    }
+    return it->second.addr != 0 && it->second.port != 0;
+}
+
+bool ResolveSignalingInfo(std::string_view target_online_id, u32* out_addr, u16* out_port) {
+    if (LookupSignalingInfo(target_online_id, out_addr, out_port, nullptr)) {
+        bool stale = false;
+        {
+            std::lock_guard lock(g_mm.sig_mutex);
+            const auto it = g_mm.sig_cache.find(std::string(target_online_id));
+            stale =
+                it != g_mm.sig_cache.end() &&
+                std::chrono::steady_clock::now() - it->second.resolved_at > kSignalingInfoRefresh;
+        }
+        if (stale) {
+            RequestSignalingInfoAsync(target_online_id);
+        }
+        return true;
+    }
+    RequestSignalingInfoAsync(target_online_id);
+    return false;
+}
+
+bool IsSignalingRelayEnabled() {
+    std::lock_guard lock(g_mm.mutex);
+    return g_mm.relay_enabled;
+}
+
+u16 GetStunAltPort() {
+    std::lock_guard lock(g_mm.mutex);
+    return g_mm.stun_alt_port;
 }
 
 } // namespace Libraries::Np::NpMatching2

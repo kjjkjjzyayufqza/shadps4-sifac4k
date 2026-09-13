@@ -368,7 +368,49 @@ void* BuildGetWorldInfoListPayload(ContextObject& ctx, const shadnet::GetWorldIn
     p.world_info_response->world = p.world_list.empty() ? nullptr : p.world_list.data();
     p.world_info_response->worldNum = p.world_list.size();
 
+    // Logged in full: titles index this list against their own fixed world layout, so a server
+    // whose worlds.cfg does not describe the title hands back a shape the title rejects - and it
+    // rejects it inside its own callback, where the emulator can see nothing but the crash.
+    LOG_INFO(Lib_NpMatching2, "GetWorldInfoList payload: worldNum={}", p.world_list.size());
+    for (const auto& w : p.world_list) {
+        LOG_INFO(Lib_NpMatching2,
+                 "  worldId={} lobbiesNum={} maxLobbyMembers={} lobbyMembers={} rooms={} "
+                 "roomMembers={}",
+                 w.worldId, w.lobbiesNum, w.maxLobbyMembersNum, w.lobbyMembersNum, w.roomsNum,
+                 w.roomMembersNum);
+    }
+
     p.request_data = p.world_info_response.get();
+    return p.request_data;
+}
+
+void* BuildGetLobbyInfoListPayload(ContextObject& ctx, const shadnet::GetLobbyInfoListReply& resp) {
+    CallbackPayload& p = RequestPayload(ctx);
+    p.Reset();
+
+    p.lobby_list.resize(resp.lobbies_size());
+    for (int i = 0; i < resp.lobbies_size(); ++i) {
+        const auto& l = resp.lobbies(i);
+        auto& dst = p.lobby_list[i];
+        dst = OrbisNpMatching2LobbyDataExternal{};
+        dst.serverId = static_cast<OrbisNpMatching2ServerId>(l.server_id());
+        dst.worldId = static_cast<OrbisNpMatching2WorldId>(l.world_id());
+        dst.lobbyId = l.lobby_id();
+        dst.maxSlot = l.max_slot();
+        dst.curMemberNum = l.cur_member_num();
+        dst.flagAttr = l.flag_attr();
+    }
+    for (size_t i = 0; i + 1 < p.lobby_list.size(); ++i) {
+        p.lobby_list[i].next = &p.lobby_list[i + 1];
+    }
+
+    p.lobby_info_response = std::make_unique<OrbisNpMatching2GetLobbyInfoListResponse>();
+    p.lobby_info_response->range.start = resp.range_start();
+    p.lobby_info_response->range.total = resp.range_total();
+    p.lobby_info_response->range.results = static_cast<u32>(p.lobby_list.size());
+    p.lobby_info_response->lobbyDataExternal = p.lobby_list.empty() ? nullptr : p.lobby_list.data();
+
+    p.request_data = p.lobby_info_response.get();
     return p.request_data;
 }
 

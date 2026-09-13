@@ -1,19 +1,37 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <cstring>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 #include <common/assert.h>
 #include "common/error.h"
+#include "common/singleton.h"
+#include "common/thread.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/file_system.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/libraries/network/net_upnp.h"
+#include "core/libraries/network/net_util.h"
 #include "net.h"
 #include "net_error.h"
 #include "p2p_port.h"
 #include "sockets.h"
 
 namespace Libraries::Net {
+
+// The NP signaling transport lives on the standard NP P2P host port, the same one titles bind
+// their P2P sockets to, so a STUN ping teaches the matching server the endpoint peers must use.
+constexpr u16 kNpP2PHostPort = 3658;
+
+// Defined with the transport below. A guest binding the NP host port has to resolve to the same
+// configured value the transport used.
+static bool TransportHostPort(u16& port);
 
 P2PSocket::P2PSocket(int domain, int type, int protocol)
     : Socket(domain, type, protocol), inbox(kInvalidNetSocket) {
@@ -123,7 +141,25 @@ int P2PSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
         return -1;
     }
 
-    auto host_port = P2PPort::Acquire(in->sin_addr, in->sin_port);
+    // Titles bind the fixed NP host port. When this instance was moved to another one so two
+    // emulators can share a machine, the guest socket has to move with it: the peer and the
+    // matching server only ever learn the transport's port, so a guest socket left behind on 3658
+    // would never see the datagrams addressed to its vport.
+    u16 requested_port = in->sin_port;
+    if (ntohs(requested_port) == kNpP2PHostPort) {
+        u16 configured = 0;
+        if (!TransportHostPort(configured)) {
+            *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
+            return -1;
+        }
+        if (configured != kNpP2PHostPort) {
+            LOG_INFO(Lib_Net, "P2P socket: NP host port {} redirected to the configured port {}",
+                     kNpP2PHostPort, configured);
+        }
+        requested_port = htons(configured);
+    }
+
+    auto host_port = P2PPort::Acquire(in->sin_addr, requested_port);
     if (!host_port) {
         return ConvertReturnErrorCode(-1);
     }
@@ -359,44 +395,248 @@ int P2PSocket::fstat(Libraries::Kernel::OrbisKernelStat* stat) {
     return 0;
 }
 
+// Long enough for a router to answer an SSDP discovery, short enough that a console with no
+// IGD is not held up noticeably on its first send.
+constexpr int kUPnPDiscoveryWaitMs = 3000;
+
+static std::mutex g_transport_mutex;
+static std::shared_ptr<P2PPort> g_transport;
+
+// network_interface_address selects the address each emulator instance binds, which is what lets
+// two instances on one machine (127.0.0.2 / 127.0.0.3) each own port 3658.
+static bool TransportBindAddress(u32& addr) {
+    const std::string configured = EmulatorSettings.GetNetworkInterfaceAddress();
+    if (configured.empty()) {
+        addr = htonl(INADDR_ANY);
+        return true;
+    }
+    in_addr parsed{};
+    if (inet_pton(AF_INET, configured.c_str(), &parsed) != 1) {
+        LOG_ERROR(Lib_Net, "P2P transport: invalid network_interface_address '{}'", configured);
+        return false;
+    }
+    addr = parsed.s_addr;
+    return true;
+}
+
+// Refuses an out-of-range port rather than quietly falling back, matching how
+// TransportBindAddress treats an unparseable address.
+static bool TransportHostPort(u16& port) {
+    const int configured = EmulatorSettings.GetP2PPort();
+    if (configured <= 0 || configured > 65535) {
+        LOG_ERROR(Lib_Net, "P2P transport: invalid p2p_port {}", configured);
+        return false;
+    }
+    port = static_cast<u16>(configured);
+    return true;
+}
+
+// Tracks the port handed to the IGD so it can be withdrawn again on shutdown.
+static std::atomic<u16> g_mapped_port{0};
+static std::once_flag g_mapping_once;
+
+// A router that forwards the P2P port turns this console into an endpoint any peer can reach,
+// which is the difference between playable and unplayable behind a strict NAT. Discovery talks to
+// the router and can take seconds, and the first send comes from the title's own thread, so the
+// whole request runs detached.
+static void RequestPortMappingAsync(u16 host_port) {
+    std::call_once(g_mapping_once, [host_port] {
+        if (!EmulatorSettings.IsUPnPEnabled()) {
+            LOG_INFO(Lib_Net, "P2P transport: UPnP disabled, UDP {} is not forwarded automatically",
+                     host_port);
+            return;
+        }
+        std::thread([host_port] {
+            Common::SetCurrentThreadName("shadPS4:P2PUPnP");
+            auto& upnp = UPnPClient::Instance();
+            upnp.Start();
+            if (!upnp.WaitReady(kUPnPDiscoveryWaitMs)) {
+                LOG_WARNING(Lib_Net,
+                            "P2P transport: no UPnP gateway answered in {} ms; UDP {} has to be "
+                            "forwarded manually for peers behind a strict NAT",
+                            kUPnPDiscoveryWaitMs, host_port);
+                return;
+            }
+            upnp.AddMapping(host_port);
+            g_mapped_port.store(host_port);
+            LOG_INFO(Lib_Net, "P2P transport: external address {} with UDP {} forwarded",
+                     upnp.GetExternalIpString(), host_port);
+        }).detach();
+    });
+}
+
+static std::shared_ptr<P2PPort> AcquireTransport() {
+    // Nothing inside the lock may call back into the transport accessors: they take this same
+    // mutex, it is not recursive, and re-locking it throws std::system_error rather than
+    // deadlocking. The bind result is copied out and everything else runs after the unlock.
+    u16 map_port = 0;
+    u32 bound_addr = 0;
+    bool first_bind = false;
+    std::shared_ptr<P2PPort> transport;
+    {
+        std::scoped_lock lock{g_transport_mutex};
+        if (!g_transport) {
+            u32 addr = 0;
+            if (!TransportBindAddress(addr)) {
+                return nullptr;
+            }
+            u16 host_port = 0;
+            if (!TransportHostPort(host_port)) {
+                return nullptr;
+            }
+            g_transport = P2PPort::Acquire(addr, htons(host_port));
+            if (!g_transport) {
+                LOG_ERROR(Lib_Net, "P2P transport: cannot bind host port {}: {}", host_port,
+                          Common::GetLastErrorMsg());
+                return nullptr;
+            }
+            map_port = ntohs(g_transport->BoundPort());
+            bound_addr = g_transport->BoundAddr();
+            first_bind = true;
+        }
+        transport = g_transport;
+    }
+    if (first_bind) {
+        LOG_INFO(Lib_Net,
+                 "P2P transport ready: bound {:#010x}:{}, advertising {:#010x}. Peers must be "
+                 "able to reach UDP {} on this host.",
+                 ntohl(bound_addr), map_port, ntohl(GetP2PAdvertisedAddr()), map_port);
+        RequestPortMappingAsync(map_port);
+    }
+    return transport;
+}
+
+static std::shared_ptr<P2PPort> CurrentTransport() {
+    std::scoped_lock lock{g_transport_mutex};
+    return g_transport;
+}
+
+static int TransportSend(P2PInternalChannel channel, const void* data, u32 len, u32 dest_addr,
+                         u16 dest_port) {
+    if (data == nullptr && len != 0) {
+        return -1;
+    }
+    const auto transport = AcquireTransport();
+    if (!transport) {
+        return -1;
+    }
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = dest_addr;
+    dst.sin_port = dest_port;
+    const int sent = transport->SendInternal(channel, data, len, dst);
+    if (sent < 0) {
+        LOG_WARNING(Lib_Net, "P2P transport: send on channel {:#x} to {:#010x}:{} failed: {}",
+                    static_cast<u16>(channel), ntohl(dest_addr), ntohs(dest_port),
+                    Common::GetLastErrorMsg());
+    }
+    return sent;
+}
+
+static int TransportReceive(P2PInternalChannel channel, void* buf, u32 len, u32* from_addr,
+                            u16* from_port, bool* relayed = nullptr) {
+    const auto transport = CurrentTransport();
+    if (!transport) {
+        return -1;
+    }
+    return transport->ReceiveInternal(channel, buf, len, from_addr, from_port, relayed);
+}
+
 u16 GetP2PConfiguredPort() {
-    return 0;
+    const auto transport = CurrentTransport();
+    return transport ? ntohs(transport->BoundPort()) : 0;
 }
 
 u32 GetP2PAdvertisedAddr() {
-    return 0;
+    const auto transport = CurrentTransport();
+    if (transport && transport->BoundAddr() != htonl(INADDR_ANY)) {
+        return transport->BoundAddr();
+    }
+    // A wildcard bind is reachable on the interface NetCtl reports as the console address.
+    auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
+    if (!netinfo->RetrieveIp()) {
+        LOG_ERROR(Lib_Net, "P2P transport: no local IPv4 address to advertise");
+        return 0;
+    }
+    in_addr parsed{};
+    if (inet_pton(AF_INET, netinfo->GetIp().c_str(), &parsed) != 1) {
+        LOG_ERROR(Lib_Net, "P2P transport: invalid local address '{}'", netinfo->GetIp());
+        return 0;
+    }
+    return parsed.s_addr;
 }
 
 bool EnsureP2PTransport() {
-    return false;
+    return AcquireTransport() != nullptr;
 }
 
 bool P2PTransportIsReady() {
-    return false;
+    return CurrentTransport() != nullptr;
+}
+
+void SetP2PRelayEndpoint(u32 addr, u16 port) {
+    const auto transport = port != 0 ? AcquireTransport() : CurrentTransport();
+    if (!transport) {
+        return;
+    }
+    transport->SetRelayEndpoint(addr, port);
+}
+
+void SetP2PPeerRelayed(u32 addr, u16 port, bool relayed) {
+    const auto transport = CurrentTransport();
+    if (!transport) {
+        return;
+    }
+    transport->SetPeerRelayed(addr, port, relayed);
+}
+
+bool IsP2PPeerRelayed(u32 addr, u16 port) {
+    const auto transport = CurrentTransport();
+    return transport && transport->IsPeerRelayed(addr, port);
+}
+
+void ClearP2PRelayedPeers() {
+    const auto transport = CurrentTransport();
+    if (transport) {
+        transport->ClearRelayedPeers();
+    }
+}
+
+P2PPortStats GetP2PTransportStats() {
+    const auto transport = CurrentTransport();
+    return transport ? transport->Stats() : P2PPortStats{};
+}
+
+void ReleaseP2PPortMapping() {
+    const u16 port = g_mapped_port.exchange(0);
+    if (port == 0) {
+        return;
+    }
+    UPnPClient::Instance().RemoveMapping(port);
 }
 
 int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
-    return -1;
+    return TransportSend(P2PInternalChannel::Signaling, data, len, dest_addr, dest_port);
 }
 
 int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
-    return -1;
+    return TransportReceive(P2PInternalChannel::Signaling, buf, len, from_addr, from_port);
 }
 
 int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
-    return -1;
+    return TransportSend(P2PInternalChannel::Control, data, len, dest_addr, dest_port);
 }
 
 int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
-    return -1;
+    return TransportReceive(P2PInternalChannel::Control, buf, len, from_addr, from_port);
 }
 
 int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
-    return -1;
+    return TransportSend(P2PInternalChannel::Matching2, data, len, dest_addr, dest_port);
 }
 
-int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
-    return -1;
+int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port, bool* relayed) {
+    return TransportReceive(P2PInternalChannel::Matching2, buf, len, from_addr, from_port, relayed);
 }
 
 } // namespace Libraries::Net

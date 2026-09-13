@@ -38,6 +38,11 @@ constexpr u32 ORBIS_HTTPS_FLAG_SDK_DEFAULT = ORBIS_HTTPS_FLAG_SERVER_VERIFY |
                                              ORBIS_HTTPS_FLAG_CN_CHECK |
                                              ORBIS_HTTPS_FLAG_KNOWN_CA_CHECK | ORBIS_HTTPS_FLAG_SNI;
 
+// Maps a cpp-httplib transport error (the integer value of httplib::Error) to the ORBIS_HTTP_ERROR
+// code sceHttp reports for the same failure, so other HLE modules issuing their own HTTP requests
+// report failures consistently.
+s32 TranslateHttpClientError(int httplib_error);
+
 // Validation masks consumed by sceHttpsEnableOption / sceHttpsDisableOption
 constexpr u32 ORBIS_HTTPS_FLAG_PUBLIC_VALID = 0x000020ff;
 constexpr u32 ORBIS_HTTPS_FLAG_PRIVATE_VALID = 0x00002dff;

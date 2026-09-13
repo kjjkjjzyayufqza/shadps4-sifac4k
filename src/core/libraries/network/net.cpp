@@ -1669,7 +1669,7 @@ int PS4_SYSV_ABI sceNetResolverStartNtoa(OrbisNetId resolverid, const char* host
     }
 
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
-    auto ret = netinfo->ResolveHostname(hostname, addr);
+    auto ret = netinfo->ResolveHostname(hostname, addr, timeout, retry);
 
     if (ret != 0) {
         *sceNetErrnoLoc() = ret;

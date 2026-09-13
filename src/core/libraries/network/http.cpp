@@ -585,6 +585,12 @@ static void LogSendRequestSettings(const HttpRequest& req, int reqId, u64 body_s
 #endif
 
 #ifdef ORBIS_HTTP_WITH_HTTPLIB
+static s32 TranslateHttplibError(httplib::Error err);
+
+s32 TranslateHttpClientError(int httplib_error) {
+    return TranslateHttplibError(static_cast<httplib::Error>(httplib_error));
+}
+
 static s32 TranslateHttplibError(httplib::Error err) {
     using E = httplib::Error;
     switch (err) {

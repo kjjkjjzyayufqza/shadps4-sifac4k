@@ -14,6 +14,7 @@
 #include "core/libraries/network/net_util.h"
 #include "core/libraries/np/np_common.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_matching2/np_matching2_mm.h"
 #include "core/libraries/np/np_signaling/np_signaling_helpers.h"
 #include "core/libraries/np/np_signaling/np_signaling_state.h"
 #include "core/libraries/np/np_signaling/np_signaling_stubs.h"
@@ -208,23 +209,38 @@ static bool g_receive_stop = false;
 static Kernel::PthreadT g_ping_thread{};
 static bool g_ping_stop = false;
 
+// Both STUN endpoints land here. The primary one also publishes the endpoint the contexts hand
+// to peers; the alternate one only contributes the second observation the NAT classifier needs.
+static void RecordStunMapping(u32 ext_ip, u16 ext_port_nbo, bool alternate) {
+    auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
+    netinfo->UpdateStunMapping(ext_ip, sceNetNtohs(ext_port_nbo), alternate,
+                               Stubs::ConfiguredPort());
+}
+
+// `ctx_id` of 0 means no NpSignaling context is open. Titles that drive matchmaking purely
+// through Matching2 never open one, so the mapping is recorded either way and only the context
+// bookkeeping is conditional.
 static void HandleStunEcho(s32 ctx_id, const StunEcho& echo) {
-    SignalingMutexGuard lock;
-    const auto it = g_contexts.find(ctx_id);
-    if (it == g_contexts.end() || !it->second.active) {
-        return;
+    if (ctx_id != 0) {
+        SignalingMutexGuard lock;
+        const auto it = g_contexts.find(ctx_id);
+        if (it != g_contexts.end() && it->second.active) {
+            NpSignalingContext& ctx = it->second;
+            ctx.ext_addr.store(echo.ext_ip);
+            ctx.ext_port.store(echo.ext_port);
+            ctx.stun_cv.notify_all();
+        }
     }
-    NpSignalingContext& ctx = it->second;
-    ctx.ext_addr.store(echo.ext_ip);
-    ctx.ext_port.store(echo.ext_port);
 
     LOG_DEBUG(Lib_NpSignaling, "STUN echo: ctxId={} ext_addr={:#x} ext_port={}", ctx_id,
               echo.ext_ip, sceNetNtohs(echo.ext_port));
+    RecordStunMapping(echo.ext_ip, echo.ext_port, false);
+}
 
-    auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
-    netinfo->SetExternalIp(echo.ext_ip);
-
-    ctx.stun_cv.notify_all();
+static void HandleStunAltEcho(const StunAltEcho& echo) {
+    LOG_DEBUG(Lib_NpSignaling, "STUN alt echo: ext_addr={:#x} ext_port={}", echo.ext_ip,
+              sceNetNtohs(echo.ext_port));
+    RecordStunMapping(echo.ext_ip, echo.ext_port, true);
 }
 
 static bool HasSignalingMagic(const u8* buf, size_t nbytes) {
@@ -271,6 +287,13 @@ static void ReceiveThreadMain() {
 
         const auto nbytes = static_cast<size_t>(rc);
 
+        if (nbytes == sizeof(StunAltEcho) && buf[0] == kStunAltEchoCmd) {
+            StunAltEcho alt{};
+            std::memcpy(&alt, buf, sizeof(alt));
+            HandleStunAltEcho(alt);
+            continue;
+        }
+
         if (nbytes != sizeof(StunEcho)) {
             LOG_DEBUG(
                 Lib_NpSignaling,
@@ -289,9 +312,6 @@ static void ReceiveThreadMain() {
                         break;
                     }
                 }
-            }
-            if (ctx_id == 0) {
-                continue;
             }
             StunEcho echo{};
             std::memcpy(&echo, buf, sizeof(echo));
@@ -404,6 +424,15 @@ static void PingThreadMain() {
                 ping.local_ip = Stubs::AdvertisedAddr();
 
                 Stubs::SignalingSendTo(&ping, sizeof(ping), server_addr, server_port);
+
+                // Same socket, second destination: the mapping the alternate endpoint reports is
+                // what tells a punchable NAT from a symmetric one.
+                const u16 alt_port = NpMatching2::GetStunAltPort();
+                if (alt_port != 0) {
+                    ping.cmd = kStunAltPingCmd;
+                    Stubs::SignalingSendTo(&ping, sizeof(ping), server_addr,
+                                           Libraries::Net::sceNetHtons(alt_port));
+                }
             }
         }
 

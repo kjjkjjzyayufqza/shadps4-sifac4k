@@ -343,6 +343,7 @@ private:
 
     void WorkerThread();
     // Transparent reconnect after a network drop
+    void ScheduleConnect(s32 user_id);
     void MarkForReconnect(s32 user_id);
     void TryReconnect();
     void FireStateCallback(s32 user_id, NpManager::OrbisNpState state);
@@ -384,6 +385,8 @@ private:
         std::shared_ptr<NpScore::ScoreRequestCtx> req;
         ShadNet::CommandType cmd;
         s32 user_id = -1; // submitting user, for flushing on disconnect
+        // When the worker gives up on this request and fails it. Set by the submit helper.
+        std::chrono::steady_clock::time_point deadline{};
         std::vector<std::string> requestedNpIds;
         NpScore::OrbisNpScorePlayerRankData* rankArray = nullptr;
         NpScore::OrbisNpScoreRankData* plainRankArray = nullptr;
@@ -404,14 +407,22 @@ private:
     std::map<u64, PendingScoreRequest> m_pending_score;
 
     // Callbacks awaiting a SyncTrophies reply, keyed by packet id.
+    struct PendingTrophyRequest {
+        s32 user_id = -1; // submitting user, for flushing on disconnect
+        // When the worker gives up on this request and drops it. Set at submit time.
+        std::chrono::steady_clock::time_point deadline{};
+        std::function<void(const std::vector<std::pair<s32, u64>>&)> on_merged;
+    };
     std::mutex m_mutex_pending_trophy;
-    std::map<u64, std::function<void(const std::vector<std::pair<s32, u64>>&)>> m_pending_trophy;
+    std::map<u64, PendingTrophyRequest> m_pending_trophy;
     void OnTrophyReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id, ShadNet::ErrorType error,
                        const std::vector<u8>& body);
 
     // Callbacks awaiting a LookupOnlineId reply, keyed by packet id.
     struct PendingLookupRequest {
         s32 user_id = -1; // submitting user, for flushing on disconnect
+        // When the worker gives up on this request and fails it. Set by the submit helper.
+        std::chrono::steady_clock::time_point deadline{};
         std::function<void(s32 result, u64 account_id, const std::string& canonical_online_id)>
             on_result;
     };
@@ -425,6 +436,8 @@ private:
         std::shared_ptr<NpTus::TusRequestCtx> req;
         ShadNet::CommandType cmd;
         s32 user_id = -1; // submitting user, for flushing on disconnect
+        // When the worker gives up on this request and fails it. Set by the submit helper.
+        std::chrono::steady_clock::time_point deadline{};
         // Only the fields relevant to `cmd` are set.
         NpTus::OrbisNpTusVariable* variableArray = nullptr;   // variable gets / add
         NpTus::OrbisNpTusVariableA* variableArrayA = nullptr; // account-variant variable gets
@@ -444,6 +457,22 @@ private:
     mutable std::mutex m_mutex_pending_tus;
     std::map<u64, PendingTusRequest> m_pending_tus;
 
+    // Register `pending` and submit `payload` as `cmd`, returning the packet id.
+    //
+    // These are the only supported way to issue a tracked request. They stamp the deadline the
+    // worker's expiry sweep needs, and register the pending entry from inside SubmitRequest, i.e.
+    // before the packet reaches the writer. Registering after the submit call returns would race
+    // the reply: a reply that finds no pending entry is dropped, and the guest call waiting on
+    // that request would never be woken.
+    u64 SubmitScoreRequest(ShadNet::ShadNetClient& client, ShadNet::CommandType cmd,
+                           const std::vector<u8>& payload, PendingScoreRequest pending);
+    u64 SubmitTusRequest(ShadNet::ShadNetClient& client, ShadNet::CommandType cmd,
+                         const std::vector<u8>& payload, PendingTusRequest pending);
+
+    // Fails every tracked request whose deadline has passed, waking the guest threads blocked on
+    // them. Runs on the worker thread.
+    void ExpirePendingRequests();
+
     // Worker thread
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_worker_running{false};
@@ -453,6 +482,9 @@ private:
     struct ReconnectState {
         std::chrono::steady_clock::time_point next_attempt{};
         std::chrono::milliseconds backoff{0};
+        // Consecutive failed attempts. Past a limit the worker stops trying and shadNet drops to
+        // the offline path for this run, instead of retrying for the rest of the session.
+        u32 attempts = 0;
     };
     std::unordered_map<s32, ReconnectState> m_reconnect;
 

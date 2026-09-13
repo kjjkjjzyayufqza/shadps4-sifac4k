@@ -10,6 +10,7 @@
 #include <poll.h>
 #endif
 
+#include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/thread.h"
 #include "core/emulator_settings.h"
@@ -143,10 +144,22 @@ std::shared_ptr<P2PPort> P2PPort::Acquire(u32 addr, u16 port) {
 
     std::scoped_lock lock{g_ports_mutex};
     if (port != 0) {
-        if (const auto it = g_ports.find(PortKey(bind_addr, port)); it != g_ports.end()) {
-            if (auto existing = it->second.lock()) {
+        // One host port serves the signaling transport and every guest socket bound on it. A
+        // wildcard bind and a specific-address bind of the same port must share the socket, or the
+        // second bind would shadow the first on the host stack and steal its datagrams.
+        for (auto it = g_ports.begin(); it != g_ports.end();) {
+            auto existing = it->second.lock();
+            if (!existing) {
+                it = g_ports.erase(it);
+                continue;
+            }
+            const u32 existing_addr = existing->BoundAddr();
+            if (existing->BoundPort() == port &&
+                (existing_addr == bind_addr || existing_addr == htonl(INADDR_ANY) ||
+                 bind_addr == htonl(INADDR_ANY))) {
                 return existing;
             }
+            ++it;
         }
     }
 
@@ -244,6 +257,111 @@ void P2PPort::Release(const void* owner) {
     std::erase_if(endpoints, [owner](const Endpoint& e) { return e.owner == owner; });
 }
 
+static u64 EndpointKey(u32 addr, u16 port) {
+    return (static_cast<u64>(addr) << 16) | port;
+}
+
+void P2PPort::SetRelayEndpoint(u32 addr, u16 port) {
+    std::scoped_lock lock{relay_mutex};
+    if (relay_addr == addr && relay_port == port) {
+        return;
+    }
+    relay_addr = addr;
+    relay_port = port;
+    if (port == 0) {
+        relayed_peers.clear();
+    }
+    LOG_INFO(Lib_Net, "P2P relay endpoint set to {:#010x}:{}", ntohl(addr), ntohs(port));
+}
+
+void P2PPort::SetPeerRelayed(u32 addr, u16 port, bool relayed) {
+    if (addr == 0 || port == 0) {
+        return;
+    }
+    std::scoped_lock lock{relay_mutex};
+    if (relayed && relay_port == 0) {
+        LOG_WARNING(Lib_Net, "P2P relay requested for {:#010x}:{} but no relay endpoint is set",
+                    ntohl(addr), ntohs(port));
+        return;
+    }
+    const u64 key = EndpointKey(addr, port);
+    const bool changed = relayed ? relayed_peers.insert(key).second : relayed_peers.erase(key) != 0;
+    if (changed) {
+        LOG_INFO(Lib_Net, "P2P peer {:#010x}:{} now on the {} path", ntohl(addr), ntohs(port),
+                 relayed ? "relayed" : "direct");
+    }
+}
+
+bool P2PPort::IsPeerRelayed(u32 addr, u16 port) const {
+    std::scoped_lock lock{relay_mutex};
+    return relayed_peers.count(EndpointKey(addr, port)) != 0;
+}
+
+void P2PPort::ClearRelayedPeers() {
+    std::scoped_lock lock{relay_mutex};
+    relayed_peers.clear();
+}
+
+P2PPortStats P2PPort::Stats() const {
+    return {stat_sent_direct.load(),  stat_sent_relayed.load(),        stat_recv_socket.load(),
+            stat_recv_relayed.load(), stat_recv_relay_rejected.load(), stat_send_failed.load()};
+}
+
+int P2PPort::SendFramed(const u8* frame, u32 frame_len, const sockaddr_in& dst) {
+    u32 via_addr = 0;
+    u16 via_port = 0;
+    {
+        std::scoped_lock lock{relay_mutex};
+        if (relay_port != 0 &&
+            relayed_peers.count(EndpointKey(dst.sin_addr.s_addr, dst.sin_port)) != 0) {
+            via_addr = relay_addr;
+            via_port = relay_port;
+        }
+    }
+
+    if (via_port == 0) {
+        const int sent =
+            sendto(sock, reinterpret_cast<const char*>(frame), static_cast<int>(frame_len), 0,
+                   reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
+        if (sent < 0) {
+            stat_send_failed.fetch_add(1, std::memory_order_relaxed);
+            return -1;
+        }
+        stat_sent_direct.fetch_add(1, std::memory_order_relaxed);
+        return sent;
+    }
+
+    if (frame_len > kP2PMaxDatagram - kP2PRelayOverhead) {
+        RestoreSocketError(kSocketErrorMsgSize);
+        stat_send_failed.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+    thread_local std::vector<u8> relay_buffer;
+    relay_buffer.resize(kP2PRelayOverhead + frame_len);
+    const u16 internal_header[2] = {htons(kP2PInternalMarker),
+                                    htons(static_cast<u16>(P2PInternalChannel::Relay))};
+    std::memcpy(relay_buffer.data(), internal_header, kP2PInternalHeaderSize);
+    u8* body = relay_buffer.data() + kP2PInternalHeaderSize;
+    body[0] = kP2PRelayForward;
+    std::memcpy(body + 1, &dst.sin_addr.s_addr, sizeof(u32));
+    std::memcpy(body + 5, &dst.sin_port, sizeof(u16));
+    std::memcpy(body + kP2PRelayHeaderSize, frame, frame_len);
+
+    sockaddr_in relay_dst{};
+    relay_dst.sin_family = AF_INET;
+    relay_dst.sin_addr.s_addr = via_addr;
+    relay_dst.sin_port = via_port;
+    const int sent = sendto(sock, reinterpret_cast<const char*>(relay_buffer.data()),
+                            static_cast<int>(relay_buffer.size()), 0,
+                            reinterpret_cast<const sockaddr*>(&relay_dst), sizeof(relay_dst));
+    if (sent < 0) {
+        stat_send_failed.fetch_add(1, std::memory_order_relaxed);
+        return -1;
+    }
+    stat_sent_relayed.fetch_add(1, std::memory_order_relaxed);
+    return static_cast<int>(frame_len);
+}
+
 int P2PPort::Send(const void* data, u32 len, u16 src_vport, u16 dst_vport, const sockaddr_in& dst,
                   u16 flags) {
     if (len > kP2PMaxDatagram - kP2PHeaderSize) {
@@ -261,21 +379,192 @@ int P2PPort::Send(const void* data, u32 len, u16 src_vport, u16 dst_vport, const
     if (len != 0) {
         std::memcpy(buffer.data() + kP2PHeaderSize, data, len);
     }
-    const int sent =
-        sendto(sock, reinterpret_cast<const char*>(buffer.data()), static_cast<int>(buffer.size()),
-               0, reinterpret_cast<const sockaddr*>(&dst), sizeof(dst));
-    if (sent < 0) {
+    if (SendFramed(buffer.data(), static_cast<u32>(buffer.size()), dst) < 0) {
         return -1;
     }
     // The guest counts payload bytes, not what encapsulation added.
     return static_cast<int>(len);
 }
 
+static bool IsInternalChannel(u16 channel) {
+    return channel == static_cast<u16>(P2PInternalChannel::Signaling) ||
+           channel == static_cast<u16>(P2PInternalChannel::Control) ||
+           channel == static_cast<u16>(P2PInternalChannel::Matching2);
+}
+
+static size_t InternalQueueIndex(P2PInternalChannel channel) {
+    switch (channel) {
+    case P2PInternalChannel::Signaling:
+        return 0;
+    case P2PInternalChannel::Control:
+        return 1;
+    case P2PInternalChannel::Matching2:
+        return 2;
+    case P2PInternalChannel::Relay:
+        // Relay frames are unwrapped in the receive path and never reach a queue.
+        break;
+    }
+    UNREACHABLE_MSG("Unknown P2P internal channel {:#x}", static_cast<u16>(channel));
+}
+
+int P2PPort::SendInternal(P2PInternalChannel channel, const void* data, u32 len,
+                          const sockaddr_in& dst) {
+    if (len > kP2PMaxDatagram - kP2PInternalHeaderSize) {
+        RestoreSocketError(kSocketErrorMsgSize);
+        return -1;
+    }
+    thread_local std::vector<u8> buffer;
+    buffer.resize(kP2PInternalHeaderSize + len);
+    const u16 header[2] = {htons(kP2PInternalMarker), htons(static_cast<u16>(channel))};
+    std::memcpy(buffer.data(), header, kP2PInternalHeaderSize);
+    if (len != 0) {
+        std::memcpy(buffer.data() + kP2PInternalHeaderSize, data, len);
+    }
+    if (SendFramed(buffer.data(), static_cast<u32>(buffer.size()), dst) < 0) {
+        return -1;
+    }
+    return static_cast<int>(len);
+}
+
+int P2PPort::ReceiveInternal(P2PInternalChannel channel, void* buf, u32 len, u32* from_addr,
+                             u16* from_port, bool* relayed) {
+    std::scoped_lock lock{internal_mutex};
+    auto& queue = internal_queues[InternalQueueIndex(channel)];
+    if (queue.empty()) {
+        return -1;
+    }
+    InternalDatagram datagram = std::move(queue.front());
+    queue.pop_front();
+    const u32 copy_len = std::min<u32>(len, static_cast<u32>(datagram.payload.size()));
+    if (buf != nullptr && copy_len != 0) {
+        std::memcpy(buf, datagram.payload.data(), copy_len);
+    }
+    if (from_addr != nullptr) {
+        *from_addr = datagram.from_addr;
+    }
+    if (from_port != nullptr) {
+        *from_port = datagram.from_port;
+    }
+    if (relayed != nullptr) {
+        *relayed = datagram.relayed;
+    }
+    return static_cast<int>(copy_len);
+}
+
+void P2PPort::QueueInternal(P2PInternalChannel channel, const sockaddr_in& from, const u8* data,
+                            u32 len, bool relayed) {
+    std::scoped_lock lock{internal_mutex};
+    auto& queue = internal_queues[InternalQueueIndex(channel)];
+    if (queue.size() >= kP2PInternalQueueLimit) {
+        LOG_DEBUG(Lib_Net, "P2P: internal channel {:#x} queue full, oldest datagram dropped",
+                  static_cast<u16>(channel));
+        queue.pop_front();
+    }
+    queue.push_back(
+        {from.sin_addr.s_addr, from.sin_port, relayed, std::vector<u8>(data, data + len)});
+}
+
+void P2PPort::ProcessDatagram(const sockaddr_in& from, const u8* data, u32 len, bool relayed) {
+    if (len >= kP2PInternalHeaderSize) {
+        u16 internal_header[2];
+        std::memcpy(internal_header, data, kP2PInternalHeaderSize);
+        const u16 channel = ntohs(internal_header[1]);
+        if (ntohs(internal_header[0]) == kP2PInternalMarker) {
+            if (channel == static_cast<u16>(P2PInternalChannel::Relay)) {
+                HandleRelayDatagram(from, data + kP2PInternalHeaderSize,
+                                    len - kP2PInternalHeaderSize, relayed);
+                return;
+            }
+            if (IsInternalChannel(channel)) {
+                QueueInternal(static_cast<P2PInternalChannel>(channel), from,
+                              data + kP2PInternalHeaderSize, len - kP2PInternalHeaderSize, relayed);
+                return;
+            }
+        }
+    }
+    if (len < kP2PHeaderSize) {
+        // Our own wake-up, or a stray datagram from something that is not a P2P peer.
+        return;
+    }
+    u16 header[3];
+    std::memcpy(header, data, kP2PHeaderSize);
+    const u16 dst_vport = header[0];
+    const u16 src_vport = header[1];
+    const u32 payload_len = len - kP2PHeaderSize;
+
+    // Reused across datagrams: this runs once per received packet on the receive thread, and a
+    // fresh allocation per datagram would show up under load.
+    thread_local std::vector<Endpoint> targets;
+    targets.clear();
+    {
+        std::scoped_lock lock{mutex};
+        for (const auto& endpoint : endpoints) {
+            if (endpoint.vport == dst_vport) {
+                targets.push_back(endpoint);
+            }
+        }
+    }
+    if (targets.empty()) {
+        LOG_DEBUG(Lib_Net, "P2P: datagram for unbound vport {} dropped, len = {}, from {:#010x}:{}",
+                  ntohs(dst_vport), payload_len, ntohl(from.sin_addr.s_addr), ntohs(from.sin_port));
+        return;
+    }
+
+    thread_local std::vector<u8> forward;
+    forward.resize(sizeof(P2PInboxHeader) + payload_len);
+    const P2PInboxHeader inbox_header{from.sin_addr.s_addr, from.sin_port, src_vport};
+    std::memcpy(forward.data(), &inbox_header, sizeof(inbox_header));
+    if (payload_len != 0) {
+        std::memcpy(forward.data() + sizeof(inbox_header), data + kP2PHeaderSize, payload_len);
+    }
+    const int forward_len = static_cast<int>(sizeof(inbox_header) + payload_len);
+    for (const auto& target : targets) {
+        // Delivery is a loopback hop into the endpoint's own socket, which is what makes the
+        // guest fd readable; if the inbox is full the datagram is dropped, as a real stack does.
+        sendto(sock, reinterpret_cast<const char*>(forward.data()), forward_len, 0,
+               reinterpret_cast<const sockaddr*>(&target.inbox), sizeof(target.inbox));
+    }
+    // Trace, not debug: the guest-visible receive already logs one line per datagram, and this
+    // one only adds the routing detail - worth having while bringing the transport up, not worth
+    // doubling the log of every session that runs with Lib.Net at debug level.
+    LOG_TRACE(Lib_Net, "P2P: datagram routed, vport = {}, len = {}, endpoints = {}, relayed = {}",
+              ntohs(dst_vport), payload_len, targets.size(), relayed);
+}
+
+// A relayed frame is only trusted when it actually comes from the configured relay, and it may
+// not itself carry another relay envelope: otherwise any peer could make its datagrams appear to
+// come from a third party by wrapping them.
+void P2PPort::HandleRelayDatagram(const sockaddr_in& from, const u8* body, u32 len, bool relayed) {
+    u32 expect_addr = 0;
+    u16 expect_port = 0;
+    {
+        std::scoped_lock lock{relay_mutex};
+        expect_addr = relay_addr;
+        expect_port = relay_port;
+    }
+    const bool from_relay =
+        expect_port != 0 && from.sin_port == expect_port && from.sin_addr.s_addr == expect_addr;
+    if (relayed || !from_relay || len < kP2PRelayHeaderSize || body[0] != kP2PRelayDeliver) {
+        stat_recv_relay_rejected.fetch_add(1, std::memory_order_relaxed);
+        LOG_WARNING(Lib_Net,
+                    "P2P relay: rejected datagram from {:#010x}:{} (nested={}, from_relay={}, "
+                    "len={}, cmd={:#x})",
+                    ntohl(from.sin_addr.s_addr), ntohs(from.sin_port), relayed, from_relay, len,
+                    len != 0 ? body[0] : 0);
+        return;
+    }
+
+    sockaddr_in origin{};
+    origin.sin_family = AF_INET;
+    std::memcpy(&origin.sin_addr.s_addr, body + 1, sizeof(u32));
+    std::memcpy(&origin.sin_port, body + 5, sizeof(u16));
+    stat_recv_relayed.fetch_add(1, std::memory_order_relaxed);
+    ProcessDatagram(origin, body + kP2PRelayHeaderSize, len - kP2PRelayHeaderSize, true);
+}
+
 void P2PPort::ReceiveLoop() {
     Common::SetCurrentThreadName("shadPS4:P2PPort");
     std::vector<u8> datagram(kP2PMaxDatagram);
-    std::vector<u8> forward(sizeof(P2PInboxHeader) + kP2PMaxDatagram);
-    std::vector<Endpoint> targets;
 
     while (!stop.load()) {
         if (!WaitP2PSocketReadable(sock, kReceivePollTimeoutUs)) {
@@ -286,50 +575,11 @@ void P2PPort::ReceiveLoop() {
         const int received = recvfrom(sock, reinterpret_cast<char*>(datagram.data()),
                                       static_cast<int>(datagram.size()), 0,
                                       reinterpret_cast<sockaddr*>(&from), &from_len);
-        if (received < static_cast<int>(kP2PHeaderSize)) {
-            // Our own wake-up, or a stray datagram from something that is not a P2P peer.
+        if (received <= 0) {
             continue;
         }
-        u16 header[3];
-        std::memcpy(header, datagram.data(), kP2PHeaderSize);
-        const u16 dst_vport = header[0];
-        const u16 src_vport = header[1];
-        const u32 payload_len = static_cast<u32>(received) - kP2PHeaderSize;
-
-        targets.clear();
-        {
-            std::scoped_lock lock{mutex};
-            for (const auto& endpoint : endpoints) {
-                if (endpoint.vport == dst_vport) {
-                    targets.push_back(endpoint);
-                }
-            }
-        }
-        if (targets.empty()) {
-            LOG_DEBUG(Lib_Net, "P2P: datagram for unbound vport {} dropped, len = {}",
-                      ntohs(dst_vport), payload_len);
-            continue;
-        }
-
-        const P2PInboxHeader inbox_header{from.sin_addr.s_addr, from.sin_port, src_vport};
-        std::memcpy(forward.data(), &inbox_header, sizeof(inbox_header));
-        if (payload_len != 0) {
-            std::memcpy(forward.data() + sizeof(inbox_header), datagram.data() + kP2PHeaderSize,
-                        payload_len);
-        }
-        const int forward_len = static_cast<int>(sizeof(inbox_header) + payload_len);
-        for (const auto& target : targets) {
-            // Delivery is a loopback hop into the endpoint's own socket, which is what makes the
-            // guest fd readable; if the inbox is full the datagram is dropped, as a real stack
-            // does.
-            sendto(sock, reinterpret_cast<const char*>(forward.data()), forward_len, 0,
-                   reinterpret_cast<const sockaddr*>(&target.inbox), sizeof(target.inbox));
-        }
-        // Trace, not debug: the guest-visible receive already logs one line per datagram, and this
-        // one only adds the routing detail — worth having while bringing the transport up, not
-        // worth doubling the log of every session that runs with Lib.Net at debug level.
-        LOG_TRACE(Lib_Net, "P2P: datagram routed, vport = {}, len = {}, endpoints = {}",
-                  ntohs(dst_vport), payload_len, targets.size());
+        stat_recv_socket.fetch_add(1, std::memory_order_relaxed);
+        ProcessDatagram(from, datagram.data(), static_cast<u32>(received), false);
     }
 }
 

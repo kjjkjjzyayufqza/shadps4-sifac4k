@@ -31,9 +31,12 @@ typedef int net_socket;
 #include <sstream>
 #endif
 
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 #include <string.h>
 #include "common/assert.h"
@@ -381,6 +384,54 @@ u32 NetUtilInternal::GetNatType() const {
     return nat_type;
 }
 
+u16 NetUtilInternal::GetExternalPort() const {
+    return external_port;
+}
+
+// PS4 NAT types: 1 the console is directly reachable, 2 a NAT that keeps one mapping per socket
+// regardless of destination (a hole punched with one peer works for the next), 3 a NAT that picks
+// a fresh mapping per destination, which no amount of punching can work around.
+void NetUtilInternal::ClassifyNatLocked(u16 local_port) {
+    if (external_port == 0 || external_port_alt == 0) {
+        nat_type = 0;
+        return;
+    }
+    const bool same_mapping = external_port == external_port_alt;
+    u32 local_addr = 0;
+    if (!ip.empty()) {
+        inet_pton(AF_INET, ip.c_str(), &local_addr);
+    }
+    const bool unmapped =
+        same_mapping && local_port != 0 && external_port == local_port && external_ip == local_addr;
+    const u32 previous = nat_type;
+    nat_type = unmapped ? 1 : (same_mapping ? 2 : 3);
+    if (nat_type != previous) {
+        LOG_INFO(Lib_Net,
+                 "NAT type {} determined: mapped port {} on the primary STUN endpoint and {} on "
+                 "the alternate, local port {}",
+                 nat_type, external_port, external_port_alt, local_port);
+        if (nat_type == 3) {
+            LOG_WARNING(Lib_Net,
+                        "This NAT assigns a different mapping per destination, so a direct P2P "
+                        "punch cannot succeed. Forward the P2P UDP port or use a server relay.");
+        }
+    }
+}
+
+void NetUtilInternal::UpdateStunMapping(u32 mapped_addr, u16 mapped_port, bool alternate,
+                                        u16 local_port) {
+    std::scoped_lock lock{m_mutex};
+    if (mapped_addr != 0) {
+        external_ip = mapped_addr;
+    }
+    if (alternate) {
+        external_port_alt = mapped_port;
+    } else {
+        external_port = mapped_port;
+    }
+    ClassifyNatLocked(local_port);
+}
+
 bool NetUtilInternal::RetrieveIp() {
     std::scoped_lock lock{m_mutex};
     if (!EmulatorSettings.GetNetworkInterfaceAddress().empty()) {
@@ -425,30 +476,79 @@ bool NetUtilInternal::RetrieveIp() {
     return true;
 }
 
-int NetUtilInternal::ResolveHostname(const char* hostname, Libraries::Net::OrbisNetInAddr* addr) {
-    const addrinfo hints = {
-        .ai_flags = AI_V4MAPPED | AI_ADDRCONFIG,
-        .ai_family = AF_INET,
-    };
+namespace {
 
-    addrinfo* info = nullptr;
-    auto gai_result = getaddrinfo(hostname, nullptr, &hints, &info);
+// Budget used when the title passes 0, i.e. asks for the library default.
+constexpr auto kDefaultResolveTimeout = std::chrono::seconds(10);
 
-    auto ret = ORBIS_OK;
-    if (gai_result != 0) {
-        // handle more errors
-        LOG_ERROR(Lib_Net, "address resolution for {} failed: {}", hostname, gai_result);
-        ret = ORBIS_NET_ERETURN;
-    } else {
-        ASSERT(info && info->ai_addr);
-        in_addr resolved_addr = ((sockaddr_in*)info->ai_addr)->sin_addr;
-        LOG_DEBUG(Lib_Net, "resolved address for {}: {}", hostname, inet_ntoa(resolved_addr));
-        addr->inaddr_addr = resolved_addr.s_addr;
+// Shared with an abandoned lookup thread, so it stays alive while that thread still writes to it.
+struct ResolveTask {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    u32 addr = 0;
+};
+
+// Runs one getaddrinfo on its own thread and reports the outcome through `task`.
+void RunLookup(const std::shared_ptr<ResolveTask>& task, std::string hostname) {
+    std::thread([task, hostname = std::move(hostname)] {
+        const addrinfo hints = {
+            .ai_flags = AI_V4MAPPED | AI_ADDRCONFIG,
+            .ai_family = AF_INET,
+        };
+        addrinfo* info = nullptr;
+        const int gai_result = getaddrinfo(hostname.c_str(), nullptr, &hints, &info);
+        {
+            std::lock_guard lock(task->mutex);
+            if (gai_result != 0) {
+                LOG_ERROR(Lib_Net, "address resolution for {} failed: {}", hostname, gai_result);
+            } else if (info == nullptr || info->ai_addr == nullptr) {
+                LOG_ERROR(Lib_Net, "address resolution for {} returned no address", hostname);
+            } else {
+                const in_addr resolved = ((sockaddr_in*)info->ai_addr)->sin_addr;
+                LOG_DEBUG(Lib_Net, "resolved address for {}: {}", hostname, inet_ntoa(resolved));
+                task->addr = resolved.s_addr;
+                task->ok = true;
+            }
+            task->done = true;
+        }
+        if (info != nullptr) {
+            freeaddrinfo(info);
+        }
+        task->cv.notify_all();
+    }).detach();
+}
+
+} // namespace
+
+int NetUtilInternal::ResolveHostname(const char* hostname, Libraries::Net::OrbisNetInAddr* addr,
+                                     int timeout_us, int retry) {
+    const auto budget =
+        timeout_us > 0
+            ? std::chrono::microseconds(timeout_us)
+            : std::chrono::duration_cast<std::chrono::microseconds>(kDefaultResolveTimeout);
+    const int attempts = (retry > 0 ? retry : 0) + 1;
+
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        const auto task = std::make_shared<ResolveTask>();
+        RunLookup(task, hostname);
+
+        std::unique_lock lock(task->mutex);
+        if (!task->cv.wait_for(lock, budget, [&task] { return task->done; })) {
+            // The lookup is still running and owns `task`; leave it to finish into that and die.
+            LOG_ERROR(Lib_Net, "address resolution for {} timed out after {} us (attempt {}/{})",
+                      hostname, budget.count(), attempt + 1, attempts);
+            continue;
+        }
+        if (task->ok) {
+            addr->inaddr_addr = task->addr;
+            return ORBIS_OK;
+        }
+        return ORBIS_NET_ERETURN;
     }
 
-    freeaddrinfo(info);
-
-    return ret;
+    return ORBIS_NET_RESOLVER_ETIMEDOUT;
 }
 
 } // namespace NetUtil

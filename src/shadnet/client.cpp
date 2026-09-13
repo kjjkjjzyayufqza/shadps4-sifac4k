@@ -103,7 +103,16 @@ ShadNetState ShadNetClient::WaitForConnection() {
         if (m_connected)
             return ShadNetState::Ok;
     }
-    m_sem_connected.acquire();
+    // Bounded by ConnectThread's own budget plus grace. An unbounded acquire here would hang the
+    // caller for the rest of the session if that thread ever failed to report an outcome.
+    constexpr auto kBudget =
+        std::chrono::milliseconds(SHAD_CONNECT_TOTAL_BUDGET_MS + SHAD_WAIT_GRACE_MS);
+    if (!m_sem_connected.try_acquire_for(kBudget)) {
+        LOG_ERROR(ShadNet, "ShadNet: connect to {}:{} gave no outcome within {} ms; giving up",
+                  m_host, m_port, kBudget.count());
+        m_state = ShadNetState::FailureTimeout;
+        return ShadNetState::FailureTimeout;
+    }
     return m_connected ? ShadNetState::Ok : m_state.load();
 }
 
@@ -113,7 +122,17 @@ ShadNetState ShadNetClient::WaitForAuthenticated() {
         if (m_authenticated)
             return ShadNetState::Ok;
     }
-    m_sem_authenticated.acquire();
+    // The reader runs without a socket timeout, so a server that accepts the connection and then
+    // never answers the login would never release this. Bound it.
+    constexpr auto kBudget = std::chrono::milliseconds(SHAD_AUTH_TIMEOUT_MS);
+    if (!m_sem_authenticated.try_acquire_for(kBudget)) {
+        LOG_ERROR(ShadNet,
+                  "ShadNet: {}:{} accepted the connection but never answered the login "
+                  "within {} ms; giving up",
+                  m_host, m_port, kBudget.count());
+        m_state = ShadNetState::FailureTimeout;
+        return ShadNetState::FailureTimeout;
+    }
     return m_authenticated ? ShadNetState::Ok : m_state.load();
 }
 
@@ -143,6 +162,12 @@ u32 ShadNetClient::GetAddrServer() const {
 }
 bool ShadNetClient::IsMatching2Enabled() const {
     return m_matching2_enabled.load();
+}
+bool ShadNetClient::IsSignalingRelayEnabled() const {
+    return m_signaling_relay_enabled.load();
+}
+u16 ShadNetClient::GetStunAltPort() const {
+    return m_stun_alt_port.load();
 }
 
 u32 ShadNetClient::GetNumFriends() const {
@@ -211,6 +236,9 @@ void ShadNetClient::ConnectThread() {
     if (!SendAll(BuildPacket(CommandType::Login, id, MakeProtoPayload(req)))) {
         LOG_ERROR(ShadNet, "ShadNet: Failed to send Login packet");
         m_state = ShadNetState::FailureOther;
+        // The login will never be answered, so release the waiter here instead of leaving it to
+        // the reader, which is parked in a recv that has no timeout.
+        m_sem_authenticated.release();
         return;
     }
     LOG_INFO(ShadNet, "Login packet sent for '{}'", m_npid);
@@ -484,9 +512,15 @@ std::vector<u8> ShadNetClient::BuildPacket(CommandType cmd, u64 id,
     return out;
 }
 
-u64 ShadNetClient::SubmitRequest(CommandType cmd, const std::vector<u8>& payload) {
+u64 ShadNetClient::SubmitRequest(CommandType cmd, const std::vector<u8>& payload,
+                                 const std::function<void(u64 pkt_id)>& on_packet_id) {
     const u64 pkt_id = m_pkt_counter.fetch_add(1);
     auto pkt = BuildPacket(cmd, pkt_id, payload);
+    // Register the request before the writer can send it: once queued, the reply may be handled
+    // by the reader thread at any moment, and a reply with no pending entry is dropped.
+    if (on_packet_id) {
+        on_packet_id(pkt_id);
+    }
     {
         std::lock_guard lock(m_mutex_send_queue);
         m_send_queue.push_back(std::move(pkt));
@@ -528,10 +562,11 @@ u64 ShadNetClient::SetAppearOffline(bool enable) {
     return SubmitRequest(CommandType::SetAppearOffline, MakeProtoPayload(req));
 }
 
-u64 ShadNetClient::LookupOnlineId(const std::string& npid) {
+u64 ShadNetClient::LookupOnlineId(const std::string& npid,
+                                  const std::function<void(u64 pkt_id)>& on_packet_id) {
     shadnet::LookupOnlineIdRequest req;
     req.set_npid(npid);
-    return SubmitRequest(CommandType::LookupOnlineId, MakeProtoPayload(req));
+    return SubmitRequest(CommandType::LookupOnlineId, MakeProtoPayload(req), on_packet_id);
 }
 
 static std::vector<u8> MakeComIdPayload(const std::string& com_id, const std::string& proto_bytes) {
@@ -588,7 +623,8 @@ u64 ShadNetClient::UnlockTrophy(const std::string& com_id, s32 trophy_id, u64 ti
 }
 
 u64 ShadNetClient::SyncTrophies(const std::string& com_id,
-                                const std::vector<std::pair<s32, u64>>& local_trophies) {
+                                const std::vector<std::pair<s32, u64>>& local_trophies,
+                                const std::function<void(u64 pkt_id)>& on_packet_id) {
     shadnet::SyncTrophiesRequest req;
     for (const auto& [id, ts] : local_trophies) {
         auto* entry = req.add_trophies();
@@ -596,7 +632,7 @@ u64 ShadNetClient::SyncTrophies(const std::string& com_id,
         entry->set_timestamp(ts);
     }
     return SubmitRequest(CommandType::SyncTrophies,
-                         MakeComIdPayload(com_id, req.SerializeAsString()));
+                         MakeComIdPayload(com_id, req.SerializeAsString()), on_packet_id);
 }
 
 bool ShadNetClient::IsTrophiesEnabled() const {
@@ -778,6 +814,8 @@ void ShadNetClient::HandleGetTokenReply(const std::vector<u8>& payload) {
 void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
     bool matching2_enabled = false;
     bool trophies_enabled = false;
+    bool relay_enabled = false;
+    u16 stun_alt_port = 0;
     bool parsed = false;
 
     if (!payload.empty()) {
@@ -788,6 +826,8 @@ void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
             if (!blob.empty() && pb.ParseFromString(blob)) {
                 matching2_enabled = pb.matching2_enabled();
                 trophies_enabled = pb.trophies_enabled();
+                relay_enabled = pb.signaling_relay_enabled();
+                stun_alt_port = static_cast<u16>(pb.stun_alt_port());
                 parsed = true;
             }
         } else {
@@ -799,11 +839,15 @@ void ShadNetClient::HandleServerFeaturesReply(const std::vector<u8>& payload) {
 
     m_matching2_enabled.store(matching2_enabled);
     m_trophies_enabled.store(trophies_enabled);
+    m_signaling_relay_enabled.store(relay_enabled);
+    m_stun_alt_port.store(stun_alt_port);
     m_server_features_received.store(parsed);
     ReportClientVersion();
-    LOG_INFO(ShadNet, "Server features: matching2_enabled={} trophies_enabled={}{}",
+    LOG_INFO(ShadNet,
+             "Server features: matching2_enabled={} trophies_enabled={} signaling_relay={} "
+             "stun_alt_port={}{}",
              matching2_enabled ? "true" : "false", trophies_enabled ? "true" : "false",
-             parsed ? "" : " (defaulted)");
+             relay_enabled ? "true" : "false", stun_alt_port, parsed ? "" : " (defaulted)");
     m_sem_authenticated.release();
 }
 

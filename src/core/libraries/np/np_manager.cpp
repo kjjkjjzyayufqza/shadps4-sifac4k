@@ -6,6 +6,7 @@
 #include <deque>
 #include <map>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include <core/user_settings.h>
@@ -23,7 +24,12 @@
 
 namespace Libraries::Np::NpManager {
 
-static bool g_shadnet_enabled = false;
+// The session flag is only settled once NpHandler::Initialize() has probed the server, and a
+// connected server can still be dropped later when it turns out to be incompatible, so this is
+// read live. Snapshotting it at registration time captured the value from before the probe.
+static bool ShadNetEnabled() {
+    return EmulatorSettings.IsShadNetEnabled();
+}
 static s32 g_firmware_version = -1;
 static s32 g_active_requests = 0;
 static std::mutex g_request_mutex;
@@ -219,7 +225,7 @@ s32 PS4_SYSV_ABI sceNpCheckNpAvailabilityA(s32 req_id,
     NpRequest* req = GetRequest(req_id, &err);
     if (!req)
         return err;
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
@@ -236,11 +242,41 @@ s32 PS4_SYSV_ABI sceNpCheckNpReachability(s32 req_id,
     NpRequest* req = GetRequest(req_id, &err);
     if (!req)
         return err;
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
     return CompleteRequest(*req, ORBIS_OK);
+}
+
+s32 PS4_SYSV_ABI sceNpNotifyPlusFeature(const OrbisNpNotifyPlusFeatureParameter* param) {
+    if (param == nullptr) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    if (param->size != sizeof(OrbisNpNotifyPlusFeatureParameter)) {
+        return ORBIS_NP_ERROR_INVALID_SIZE;
+    }
+    if (param->user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    // Titles built with an SDK older than 3.50 may report features 1-3; newer ones only feature 1.
+    s32 sdk_version = 0;
+    const bool legacy_sdk = Libraries::Kernel::sceKernelGetCompiledSdkVersion(&sdk_version) >= 0 &&
+                            static_cast<u32>(sdk_version) < 0x3500000;
+    const bool valid_features =
+        legacy_sdk ? param->features >= 1 && param->features <= 3 : param->features == 1;
+    if (!valid_features) {
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+    for (u8 b : param->reserved) {
+        if (b != 0) {
+            return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+        }
+    }
+    // The library forwards a valid notification to the system's PS Plus usage tracking. shadNet
+    // has no such service, so a validated notification needs no further action.
+    LOG_DEBUG(Lib_NpManager, "user_id={} features={:#x}", param->user_id, param->features);
+    return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* param,
@@ -270,7 +306,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
     NpRequest* req = GetRequest(req_id, &err);
     if (!req)
         return err;
-    if (!g_shadnet_enabled ||
+    if (!ShadNetEnabled() ||
         !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(param->user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
@@ -304,7 +340,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id,
     NpRequest* req = GetRequest(req_id, &err);
     if (!req)
         return err;
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
@@ -336,7 +372,7 @@ sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServic
     NpRequest* req = GetRequest(req_id, &err);
     if (!req)
         return err;
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, user_id = {}", req_id, user_id);
@@ -477,7 +513,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountCountry(OrbisNpOnlineId* online_id,
     if (user_id == -1) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     FillCountryCodeFromProfile(user_id, country_code);
@@ -493,7 +529,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountCountryA(Libraries::UserService::OrbisUserServic
     if (UserManagement.GetUserByID(user_id) == nullptr) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     FillCountryCodeFromProfile(user_id, country_code);
@@ -509,7 +545,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirth(OrbisNpOnlineId* online_id,
     if (user_id == -1) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     FillDateOfBirthFromProfile(user_id, date_of_birth);
@@ -525,7 +561,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountDateOfBirthA(Libraries::UserService::OrbisUserSe
     if (UserManagement.GetUserByID(user_id) == nullptr) {
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
     FillDateOfBirthFromProfile(user_id, date_of_birth);
@@ -538,7 +574,7 @@ s32 PS4_SYSV_ABI sceNpGetGamePresenceStatus(OrbisNpOnlineId* online_id,
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     const s32 user_id = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
-    *game_status = (g_shadnet_enabled && user_id != -1 &&
+    *game_status = (ShadNetEnabled() && user_id != -1 &&
                     Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id))
                        ? OrbisNpGamePresenseStatus::Online
                        : OrbisNpGamePresenseStatus::Offline;
@@ -552,7 +588,7 @@ s32 PS4_SYSV_ABI sceNpGetGamePresenceStatusA(Libraries::UserService::OrbisUserSe
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     *game_status =
-        (g_shadnet_enabled && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id))
+        (ShadNetEnabled() && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id))
             ? OrbisNpGamePresenseStatus::Online
             : OrbisNpGamePresenseStatus::Offline;
     return ORBIS_OK;
@@ -568,7 +604,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountId(OrbisNpOnlineId* online_id, u64* account_id) 
         *account_id = 0;
         return ORBIS_NP_ERROR_USER_NOT_FOUND;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
@@ -583,7 +619,7 @@ s32 PS4_SYSV_ABI sceNpGetAccountIdA(Libraries::UserService::OrbisUserServiceUser
         user_id == Libraries::UserService::ORBIS_USER_SERVICE_USER_ID_INVALID) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         *account_id = 0;
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
@@ -602,10 +638,10 @@ s32 PS4_SYSV_ABI sceNpGetNpId(Libraries::UserService::OrbisUserServiceUserId use
     if (np_id == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         LOG_WARNING(Lib_NpManager,
                     "sceNpGetNpId: SIGNED_OUT (user_id={} shadnet_enabled={} signed_in={})",
-                    user_id, g_shadnet_enabled,
+                    user_id, ShadNetEnabled(),
                     Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id));
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
@@ -627,10 +663,10 @@ s32 PS4_SYSV_ABI sceNpGetOnlineId(Libraries::UserService::OrbisUserServiceUserId
         LOG_ERROR(Lib_NpManager, "invalid argument: online_id is null");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
+    if (!ShadNetEnabled() || !Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id)) {
         LOG_INFO(Lib_NpManager,
                  "sceNpGetOnlineId: SIGNED_OUT (user_id={} shadnet_enabled={} signed_in={})",
-                 user_id, g_shadnet_enabled,
+                 user_id, ShadNetEnabled(),
                  Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id));
         return ORBIS_NP_ERROR_SIGNED_OUT;
     }
@@ -648,7 +684,7 @@ s32 PS4_SYSV_ABI sceNpGetNpReachabilityState(Libraries::UserService::OrbisUserSe
             return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
     }
-    *state = (g_shadnet_enabled && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id))
+    *state = (ShadNetEnabled() && Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user_id))
                  ? OrbisNpReachabilityState::Reachable
                  : OrbisNpReachabilityState::Unavailable;
     return ORBIS_OK;
@@ -664,7 +700,7 @@ s32 PS4_SYSV_ABI sceNpGetState(Libraries::UserService::OrbisUserServiceUserId us
             return ORBIS_NP_ERROR_INVALID_ARGUMENT;
         }
     }
-    if (!g_shadnet_enabled) {
+    if (!ShadNetEnabled()) {
         *state = OrbisNpState::SignedOut;
         LOG_DEBUG(Lib_NpManager, "shadNet disabled,SignedOut");
         return ORBIS_OK;
@@ -683,7 +719,7 @@ sceNpGetUserIdByAccountId(u64 account_id, Libraries::UserService::OrbisUserServi
         LOG_ERROR(Lib_NpManager, "invalid argument: account_id={}", account_id);
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled)
+    if (!ShadNetEnabled())
         return ORBIS_NP_ERROR_SIGNED_OUT;
 
     const s32 found = Libraries::Np::NpHandler::GetInstance().GetUserIdByAccountId(account_id);
@@ -706,7 +742,7 @@ s32 PS4_SYSV_ABI sceNpGetUserIdByOnlineId(const OrbisNpOnlineId* online_id,
         LOG_ERROR(Lib_NpManager, "invalid argument");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    if (!g_shadnet_enabled)
+    if (!ShadNetEnabled())
         return ORBIS_NP_ERROR_SIGNED_OUT;
 
     const s32 found = Libraries::Np::NpHandler::GetInstance().GetUserIdByOnlineId(*online_id);
@@ -806,6 +842,13 @@ NpReachabilityStateCallback NpReachabilityCb;
 static std::map<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>
     g_np_reachability_last;
 
+// Current per-user states captured when the reachability callback is registered. A user that
+// signed in before the registration produced no transition the callback could observe, so these
+// are delivered on the next check. Guarded by g_np_state_callbacks_mutex.
+static std::vector<
+    std::pair<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>>
+    g_np_reachability_resync;
+
 struct PendingNpStateEvent {
     Libraries::UserService::OrbisUserServiceUserId user_id;
     OrbisNpState state;
@@ -814,6 +857,37 @@ struct PendingNpStateEvent {
 };
 
 static std::deque<PendingNpStateEvent> g_np_state_events;
+
+// Current per-user states captured when a state callback is registered. libSceNpManager asks the
+// NP daemon for the current state as the last step of every sceNpRegisterStateCallback* entry
+// point, so a freshly registered callback always receives one notification describing the state at
+// registration time. Without it a title that registers and waits for its first notification never
+// gets one. Both are guarded by g_np_state_callbacks_mutex.
+static std::vector<PendingNpStateEvent> g_np_toolkit_resync;
+static std::vector<PendingNpStateEvent> g_np_state_resync;
+
+// The state every logged-in local user is actually in right now. A user is signed in only while
+// shadNet is up and the handler has authenticated them; otherwise the honest answer is SignedOut,
+// which is what an offline console reports.
+static std::vector<PendingNpStateEvent> CurrentNpStates() {
+    std::vector<PendingNpStateEvent> states;
+    for (const User* user : UserManagement.GetLoggedInUsers()) {
+        if (user == nullptr) {
+            continue;
+        }
+        const bool signed_in = ShadNetEnabled() &&
+                               Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user->user_id);
+        PendingNpStateEvent event{};
+        event.user_id = user->user_id;
+        event.state = signed_in ? OrbisNpState::SignedIn : OrbisNpState::SignedOut;
+        event.has_np_id = signed_in;
+        if (signed_in) {
+            event.np_id = Libraries::Np::NpHandler::GetInstance().GetNpId(user->user_id);
+        }
+        states.push_back(event);
+    }
+    return states;
+}
 
 static void QueueNpStateEvent(Libraries::UserService::OrbisUserServiceUserId user_id,
                               OrbisNpState state) {
@@ -834,7 +908,7 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
                                        Libraries::UserService::OrbisUserServiceUserId user_id) {
     switch (event_type) {
     case Libraries::UserService::OrbisUserServiceEventType::Login:
-        if (g_shadnet_enabled) {
+        if (ShadNetEnabled()) {
             // Handler connects the user and fires SignedIn via the bridge on success.
             Libraries::Np::NpHandler::GetInstance().OnUserLoggedIn(user_id);
         } else {
@@ -842,7 +916,7 @@ void NotifyNpStateFromUserServiceEvent(Libraries::UserService::OrbisUserServiceE
         }
         break;
     case Libraries::UserService::OrbisUserServiceEventType::Logout:
-        if (g_shadnet_enabled) {
+        if (ShadNetEnabled()) {
             // Handler disconnects the user and fires SignedOut via the bridge.
             Libraries::Np::NpHandler::GetInstance().OnUserLoggedOut(user_id);
         } else {
@@ -858,6 +932,9 @@ static s32 RegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata
     if (callback == nullptr) {
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
+
+    // Snapshot before taking the callback lock: IsPsnSignedIn locks the handler's client map.
+    std::vector<PendingNpStateEvent> current_states = CurrentNpStates();
 
     std::scoped_lock lk{g_np_state_callbacks_mutex};
 
@@ -878,6 +955,7 @@ static s32 RegisterStateCallbackA(OrbisNpStateCallbackA callback, void* userdata
         entry.func = callback;
         entry.userdata = userdata;
         entry.in_use = true;
+        g_np_state_resync = current_states;
         return static_cast<s32>(i + 1);
     }
 
@@ -905,30 +983,72 @@ static void DispatchPendingNpStateCallbacks() {
     LegacyNpStateCallback legacy_callback{};
     NpStateCallbackForNpToolkit toolkit_callback{};
     NpReachabilityStateCallback reachability_callback{};
+    std::vector<PendingNpStateEvent> toolkit_resync;
+    std::vector<PendingNpStateEvent> state_resync;
     std::array<NpStateCallbackAEntry, ORBIS_NP_STATE_CALLBACK_MAX> callbacks;
     std::vector<std::pair<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>>
         reachability_changes;
     {
         std::scoped_lock lk{g_np_state_events_mutex, g_np_state_callbacks_mutex};
-        if (g_np_state_events.empty()) {
+        if (g_np_state_events.empty() && g_np_reachability_resync.empty() &&
+            g_np_toolkit_resync.empty() && g_np_state_resync.empty()) {
             return;
         }
         pending_events.swap(g_np_state_events);
+        const auto resync = std::exchange(g_np_reachability_resync, {});
+        toolkit_resync = std::exchange(g_np_toolkit_resync, {});
+        state_resync = std::exchange(g_np_state_resync, {});
         legacy_callback = LegacyNpStateCb;
         callbacks = g_np_state_callbacks;
         toolkit_callback = NpStateCbForNp;
         reachability_callback = NpReachabilityCb;
 
         if (reachability_callback.func != nullptr) {
-            for (const auto& event : pending_events) {
-                const OrbisNpReachabilityState reach = event.state == OrbisNpState::SignedIn
-                                                           ? OrbisNpReachabilityState::Reachable
-                                                           : OrbisNpReachabilityState::Unavailable;
-                auto it = g_np_reachability_last.find(event.user_id);
+            const auto record_change = [&](Libraries::UserService::OrbisUserServiceUserId user_id,
+                                           OrbisNpReachabilityState reach) {
+                auto it = g_np_reachability_last.find(user_id);
                 if (it == g_np_reachability_last.end() || it->second != reach) {
-                    g_np_reachability_last[event.user_id] = reach;
-                    reachability_changes.emplace_back(event.user_id, reach);
+                    g_np_reachability_last[user_id] = reach;
+                    reachability_changes.emplace_back(user_id, reach);
                 }
+            };
+            // Registration-time states come first; queued events are newer transitions.
+            for (const auto& [user_id, reach] : resync) {
+                record_change(user_id, reach);
+            }
+            for (const auto& event : state_resync) {
+                record_change(event.user_id, event.state == OrbisNpState::SignedIn
+                                                 ? OrbisNpReachabilityState::Reachable
+                                                 : OrbisNpReachabilityState::Unavailable);
+            }
+            for (const auto& event : pending_events) {
+                record_change(event.user_id, event.state == OrbisNpState::SignedIn
+                                                 ? OrbisNpReachabilityState::Reachable
+                                                 : OrbisNpReachabilityState::Unavailable);
+            }
+        }
+    }
+
+    // Registration-time states come first; queued events are newer transitions.
+    if (toolkit_callback.func != nullptr) {
+        for (const auto& event : toolkit_resync) {
+            LOG_INFO(Lib_NpManager, "toolkit state callback: user_id={} state={}", event.user_id,
+                     static_cast<int>(event.state));
+            toolkit_callback.func(event.user_id, event.state, toolkit_callback.userdata);
+        }
+    }
+
+    for (auto& event : state_resync) {
+        LOG_INFO(Lib_NpManager, "state callback: user_id={} state={}", event.user_id,
+                 static_cast<int>(event.state));
+        if (legacy_callback.func != nullptr) {
+            legacy_callback.func(event.user_id, event.state,
+                                 event.has_np_id ? &event.np_id : nullptr,
+                                 legacy_callback.userdata);
+        }
+        for (const auto& entry : callbacks) {
+            if (entry.in_use && entry.func != nullptr) {
+                entry.func(event.user_id, event.state, entry.userdata);
             }
         }
     }
@@ -957,6 +1077,8 @@ static void DispatchPendingNpStateCallbacks() {
 
     // Reachability callback fires only on a change, after the state callbacks.
     for (const auto& [user_id, reach] : reachability_changes) {
+        LOG_INFO(Lib_NpManager, "reachability callback: user_id={} state={}", user_id,
+                 static_cast<int>(reach));
         reachability_callback.func(user_id, reach, reachability_callback.userdata);
     }
 }
@@ -983,6 +1105,9 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
 
+    // Snapshot before taking the callback lock: IsPsnSignedIn locks the handler's client map.
+    std::vector<PendingNpStateEvent> current_states = CurrentNpStates();
+
     std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (LegacyNpStateCb.func != nullptr) {
         return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
@@ -991,6 +1116,7 @@ s32 PS4_SYSV_ABI sceNpRegisterStateCallback(OrbisNpStateCallback callback, void*
     LOG_INFO(Lib_NpManager, "called, userdata = {}", userdata);
     LegacyNpStateCb.func = callback;
     LegacyNpStateCb.userdata = userdata;
+    g_np_state_resync = current_states;
     return ORBIS_OK;
 }
 
@@ -1021,16 +1147,32 @@ s32 PS4_SYSV_ABI sceNpRegisterNpReachabilityStateCallback(OrbisNpReachabilitySta
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
 
+    // The toolkit's notification thread may already have drained the SignedIn event before the
+    // game registers, so capture the current state for delivery on the next check. Snapshot before
+    // taking the callback lock: IsPsnSignedIn locks the handler's client map.
+    std::vector<std::pair<Libraries::UserService::OrbisUserServiceUserId, OrbisNpReachabilityState>>
+        current_states;
+    if (ShadNetEnabled()) {
+        for (const User* user : UserManagement.GetLoggedInUsers()) {
+            if (user != nullptr &&
+                Libraries::Np::NpHandler::GetInstance().IsPsnSignedIn(user->user_id)) {
+                current_states.emplace_back(user->user_id, OrbisNpReachabilityState::Reachable);
+            }
+        }
+    }
+
     std::scoped_lock lk{g_np_state_callbacks_mutex};
     if (NpReachabilityCb.func != nullptr) {
         LOG_ERROR(Lib_NpManager, "callback already registered, cannot register multiple");
         return ORBIS_NP_ERROR_CALLBACK_ALREADY_REGISTERED;
     }
-    LOG_INFO(Lib_NpManager, "called");
+    LOG_INFO(Lib_NpManager, "called, queued current state for {} signed-in user(s)",
+             current_states.size());
     NpReachabilityCb.func = callback;
     NpReachabilityCb.userdata = userdata;
-    // Reset the per-user cache so the next state transition reports fresh.
+    // Reset the per-user cache so the queued states and later transitions report fresh.
     g_np_reachability_last.clear();
+    g_np_reachability_resync = std::move(current_states);
     return ORBIS_OK;
 }
 
@@ -1043,15 +1185,26 @@ s32 PS4_SYSV_ABI sceNpUnregisterNpReachabilityStateCallback() {
     NpReachabilityCb.func = nullptr;
     NpReachabilityCb.userdata = nullptr;
     g_np_reachability_last.clear();
+    g_np_reachability_resync.clear();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpRegisterStateCallbackForToolkit(OrbisNpStateCallbackForNpToolkit callback,
                                                       void* userdata) {
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called");
+    if (callback == nullptr) {
+        LOG_ERROR(Lib_NpManager, "callback is nullptr");
+        return ORBIS_NP_ERROR_INVALID_ARGUMENT;
+    }
+
+    // Snapshot before taking the callback lock: IsPsnSignedIn locks the handler's client map.
+    std::vector<PendingNpStateEvent> current_states = CurrentNpStates();
+
     std::scoped_lock lk{g_np_state_callbacks_mutex};
+    LOG_INFO(Lib_NpManager, "called, queued current state for {} signed-in user(s)",
+             current_states.size());
     NpStateCbForNp.func = callback;
     NpStateCbForNp.userdata = userdata;
+    g_np_toolkit_resync = std::move(current_states);
     return ORBIS_OK;
 }
 
@@ -1062,6 +1215,7 @@ s32 PS4_SYSV_ABI sceNpUnregisterStateCallbackForToolkit() {
     }
     NpStateCbForNp.func = nullptr;
     NpStateCbForNp.userdata = nullptr;
+    g_np_toolkit_resync.clear();
     return ORBIS_OK;
 }
 
@@ -1205,7 +1359,6 @@ void DeregisterNpCallback(std::string key) {
 void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     ASSERT_MSG(Libraries::Kernel::sceKernelGetCompiledSdkVersion(&g_firmware_version) == ORBIS_OK,
                "Failed to get compiled SDK version.");
-    g_shadnet_enabled = EmulatorSettings.IsShadNetEnabled();
 
     // Route live NP state changes from NpHandler into the dispatch queue so they are
     // delivered on the game's thread during sceNpCheckCallback (single delivery path).
@@ -1223,6 +1376,7 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("8Z2Jc5GvGDI", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpAvailabilityA);
     LIB_FUNCTION("KfGZg2y73oM", "libSceNpManager", 1, "libSceNpManager", sceNpCheckNpReachability);
     LIB_FUNCTION("r6MyYJkryz8", "libSceNpManager", 1, "libSceNpManager", sceNpCheckPlus);
+    LIB_FUNCTION("Gaxrp3EWY-M", "libSceNpManager", 1, "libSceNpManager", sceNpNotifyPlusFeature);
     LIB_FUNCTION("KZ1Mj9yEGYc", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguage);
     LIB_FUNCTION("TPMbgIxvog0", "libSceNpManager", 1, "libSceNpManager", sceNpGetAccountLanguageA);
     LIB_FUNCTION("ilwLM4zOmu4", "libSceNpManager", 1, "libSceNpManager",

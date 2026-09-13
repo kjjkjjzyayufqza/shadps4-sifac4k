@@ -929,8 +929,14 @@ void ProcessPendingActivations() {
                               peer_addr != 0 && peer_port != 0;
 
         if (!resolved) {
-            LOG_WARNING(Lib_NpSignaling, "peer '{}' endpoint unresolved; connection {} 30s timeout",
-                        act.peer_online_id, act.conn_id);
+            // The resolver is non-blocking: a miss means the lookup was scheduled, not that the
+            // peer is unreachable. Re-queue so the next dispatch tick picks up the answer, and let
+            // the connection's own timeout decide when to give up.
+            LOG_DEBUG(Lib_NpSignaling,
+                      "peer '{}' endpoint not resolved yet; connection {} will retry",
+                      act.peer_online_id, act.conn_id);
+            SignalingMutexGuard lock;
+            QueueActivationLocked(act.conn_id, act.peer_online_id, act.start_handshake);
             continue;
         }
 
@@ -990,11 +996,16 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
                 return;
             }
             ConnectionInfo& ci = g_connections[conn_id];
+            // Answer the address this packet actually came from. The peer's self-reported
+            // mapped_addr is its own interface address, which is a private address behind any
+            // NAT and unreachable from here; it is kept only for diagnostics.
             ci.addr = from_addr;
             ci.port = from_port;
             ci.peer_activated = true;
-            if (pkt.mapped_addr != 0) {
-                ci.addr = pkt.mapped_addr;
+            if (pkt.mapped_addr != 0 && pkt.mapped_addr != from_addr) {
+                LOG_DEBUG(Lib_NpSignaling,
+                          "connection {} peer advertises {:#x} but was reached at {:#x}:{}",
+                          conn_id, pkt.mapped_addr, from_addr, sceNetNtohs(from_port));
             }
             if (ci.state != ConnState::Established) {
                 SetConnStateLocked(ci, ConnState::SendingAccept);
@@ -1011,12 +1022,8 @@ void HandleHandshakePacket(u32 from_addr, u16 from_port, const SignalingHandshak
         } else if (kind == HandshakeKind::Accept) {
             ConnectionInfo& ci = g_connections[conn_id];
             ci.peer_activated = true;
-            if (pkt.mapped_addr != 0) {
-                ci.addr = pkt.mapped_addr;
-            } else {
-                ci.addr = from_addr;
-                ci.port = from_port;
-            }
+            ci.addr = from_addr;
+            ci.port = from_port;
             if (ci.state == ConnState::SendingOffer || ci.state == ConnState::WaitAccept ||
                 ci.state == ConnState::SendingAccept || ci.state == ConnState::WaitOffer) {
                 SetConnStateLocked(ci, ConnState::ConnCheck);
@@ -1241,7 +1248,7 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
             }
             ConnectionInfo& ci = g_connections[conn_id];
             ci.peer_activated = true;
-            ci.addr = pkt.mapped_addr != 0 ? pkt.mapped_addr : from_addr;
+            ci.addr = from_addr;
             ci.port = from_port;
             if (ci.state == ConnState::Inactive) {
                 if (!ci.timeout_callout_armed) {
@@ -1261,9 +1268,8 @@ void HandleControlPacket(u32 from_addr, u16 from_port, const SignalingControl& p
         } else if (kind == ControlKind::ActivationAck) {
             ConnectionInfo& ci = g_connections[conn_id];
             ci.peer_activated = true;
-            if (pkt.mapped_addr != 0) {
-                ci.addr = pkt.mapped_addr;
-            }
+            ci.addr = from_addr;
+            ci.port = from_port;
         } else if (kind == ControlKind::Established) {
             ConnectionInfo& ci = g_connections[conn_id];
             ci.peer_established = true;

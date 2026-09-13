@@ -129,7 +129,14 @@ public:
     std::optional<vk::BufferMemoryBarrier2> GetBarrier(vk::AccessFlags2 dst_acess_mask,
                                                        vk::PipelineStageFlagBits2 dst_stage,
                                                        u64 offset = 0) {
-        if (dst_acess_mask == access_mask && stage == dst_stage) {
+        // An identical access may only be skipped when the previous one did not write. Guest
+        // cache flushes between dispatches are not translated, so this barrier is the only
+        // thing ordering back-to-back read-modify-write passes over the same buffer.
+        constexpr vk::AccessFlags2 write_mask = vk::AccessFlagBits2::eShaderWrite |
+                                                vk::AccessFlagBits2::eTransferWrite |
+                                                vk::AccessFlagBits2::eMemoryWrite;
+        const bool was_written = static_cast<bool>(access_mask & write_mask);
+        if (dst_acess_mask == access_mask && stage == dst_stage && !was_written) {
             return {};
         }
 
