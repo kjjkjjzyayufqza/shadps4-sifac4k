@@ -312,7 +312,8 @@ void GameControllers::TryOpenSDLControllers() {
 
         for (int i = 0; i < 4; i++) {
             if (!slot_taken[i]) {
-                auto u = UserManagement.GetUserByPlayerIndex(i + 1);
+                User* u = (i == 0) ? UserManagement.GetPrimaryUser()
+                                   : UserManagement.GetUserByPlayerIndex(i + 1);
                 if (!u) {
                     LOG_INFO(Input, "User {} not found", i + 1);
                     continue; // for now, if you don't specify who Player N is in the config,
@@ -349,11 +350,14 @@ void GameControllers::TryOpenSDLControllers() {
     }
     if (is_first_check) [[unlikely]] {
         is_first_check = false;
-        if (controller_count == 0) {
-            auto u = UserManagement.GetUserByPlayerIndex(1);
-            controllers[0]->user_id = u->user_id;
-            controllers[0]->ConnectController(nullptr);
-            UserManagement.LoginUser(u, 1);
+        if (controllers[0]->user_id < 0) {
+            if (User* u = UserManagement.GetPrimaryUser()) {
+                controllers[0]->user_id = u->user_id;
+                if (controller_count == 0) {
+                    controllers[0]->ConnectController(nullptr);
+                }
+                UserManagement.LoginUser(u, 1);
+            }
         }
     }
     SDL_free(new_joysticks);

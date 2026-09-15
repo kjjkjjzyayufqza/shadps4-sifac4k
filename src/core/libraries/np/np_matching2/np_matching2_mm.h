@@ -40,7 +40,10 @@ enum class MmCommand : u16 {
 
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
                         std::string_view server_host, u16 tcp_port);
-void ClearMmShadNetClient();
+// Tears the matching backend down once its last client is gone. Requests still waiting for a
+// reply are completed with `error_code`, and started contexts are reported stopped with `cause`:
+// the server session they belonged to no longer exists.
+void ClearMmShadNetClient(OrbisNpMatching2EventCause cause, s32 error_code);
 bool IsMmClientRunning();
 
 // Completes any tracked matching request whose reply never arrived, so the title's callback

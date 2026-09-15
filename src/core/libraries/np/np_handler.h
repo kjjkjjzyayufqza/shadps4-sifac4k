@@ -335,8 +335,13 @@ private:
     // Start the health-monitor worker thread if not already running (idempotent).
     void StartWorker();
 
+    // Why a user's client is torn down; decides how matching2 reports the contexts it loses.
+    enum class DisconnectReason {
+        ConnectionLost, // the link to the server died while the user stayed logged in
+        SignedOut,      // the user logged out, or the emulator is shutting down
+    };
     // Disconnect and remove one user's client.
-    void DisconnectUser(s32 user_id);
+    void DisconnectUser(s32 user_id, DisconnectReason reason);
     // Fail every pending score/TUS request submitted by this user so pollers
     // and blocked WaitAsync callers wake up instead of hanging forever.
     void FailPendingRequests(s32 user_id, s32 error_code);

@@ -93,6 +93,12 @@ int main(int argc, char* argv[]) {
     app.add_flag("--config-clean", configClean);
     app.add_flag("--config-global", configGlobal);
     app.add_flag("--log-append", Common::Log::g_should_append);
+    // Diagnostic builds compile a filter in through SHADPS4_BUILTIN_LOG_FILTER; an explicit
+    // --log-filter replaces it.
+    Common::Log::g_forced_filter = SHADPS4_BUILTIN_LOG_FILTER;
+    app.add_option("--log-filter", Common::Log::g_forced_filter,
+                   "Log filter entries, e.g. \"Kernel.Fs:debug\" (levels are lowercase). "
+                   "Overrides the configured filter for the classes it names");
 
     app.add_option("--add-game-folder", addGameFolder)->check(CLI::ExistingDirectory);
     app.add_option("--set-addon-folder", setAddonFolder)->check(CLI::ExistingDirectory);

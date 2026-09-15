@@ -20,6 +20,7 @@
 #include "core/libraries/network/net_util.h"
 #include "net.h"
 #include "net_error.h"
+#include "p2p_addr_choice.h"
 #include "p2p_port.h"
 #include "sockets.h"
 
@@ -406,17 +407,11 @@ static std::shared_ptr<P2PPort> g_transport;
 // two instances on one machine (127.0.0.2 / 127.0.0.3) each own port 3658.
 static bool TransportBindAddress(u32& addr) {
     const std::string configured = EmulatorSettings.GetNetworkInterfaceAddress();
-    if (configured.empty()) {
-        addr = htonl(INADDR_ANY);
+    if (P2PBindAddressFromConfig(configured, addr)) {
         return true;
     }
-    in_addr parsed{};
-    if (inet_pton(AF_INET, configured.c_str(), &parsed) != 1) {
-        LOG_ERROR(Lib_Net, "P2P transport: invalid network_interface_address '{}'", configured);
-        return false;
-    }
-    addr = parsed.s_addr;
-    return true;
+    LOG_ERROR(Lib_Net, "P2P transport: invalid network_interface_address '{}'", configured);
+    return false;
 }
 
 // Refuses an out-of-range port rather than quietly falling back, matching how
@@ -547,15 +542,15 @@ u16 GetP2PConfiguredPort() {
     return transport ? ntohs(transport->BoundPort()) : 0;
 }
 
-u32 GetP2PAdvertisedAddr() {
+static u32 BoundAddrOrAny() {
     const auto transport = CurrentTransport();
-    if (transport && transport->BoundAddr() != htonl(INADDR_ANY)) {
-        return transport->BoundAddr();
-    }
-    // A wildcard bind is reachable on the interface NetCtl reports as the console address.
+    return transport ? transport->BoundAddr() : htonl(INADDR_ANY);
+}
+
+static u32 LocalNicAddr() {
     auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
     if (!netinfo->RetrieveIp()) {
-        LOG_ERROR(Lib_Net, "P2P transport: no local IPv4 address to advertise");
+        LOG_ERROR(Lib_Net, "P2P transport: no local IPv4 address");
         return 0;
     }
     in_addr parsed{};
@@ -564,6 +559,16 @@ u32 GetP2PAdvertisedAddr() {
         return 0;
     }
     return parsed.s_addr;
+}
+
+u32 GetP2PLocalAddr() {
+    return ChooseP2PAddresses(0, LocalNicAddr(), BoundAddrOrAny()).local;
+}
+
+u32 GetP2PAdvertisedAddr() {
+    auto* netinfo = Common::Singleton<NetUtil::NetUtilInternal>::Instance();
+    return ChooseP2PAddresses(netinfo->GetExternalIp(), LocalNicAddr(), BoundAddrOrAny())
+        .advertised;
 }
 
 bool EnsureP2PTransport() {

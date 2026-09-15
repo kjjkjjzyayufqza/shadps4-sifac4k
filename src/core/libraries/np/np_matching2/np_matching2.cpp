@@ -1102,13 +1102,13 @@ sceNpMatching2SignalingGetLocalNetInfo(NpSignaling::OrbisNpSignalingNetInfo* net
         LOG_ERROR(Lib_NpMatching2, "invalid netInfo");
         return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     }
-    // Titles bind their P2P sockets to the reported local address, so it must be the address the
-    // shared P2P transport port is bound to.
+    // Titles bind their P2P sockets to localAddr. That must stay a real local NIC (or the
+    // explicit bind), never the STUN-mapped address advertised to peers.
     if (!Net::EnsureP2PTransport()) {
         LOG_ERROR(Lib_NpMatching2, "P2P transport unavailable");
         return ORBIS_NP_MATCHING2_SIGNALING_ERROR_NETINFO_NOT_AVAILABLE;
     }
-    netInfo->localAddr = Net::GetP2PAdvertisedAddr();
+    netInfo->localAddr = Net::GetP2PLocalAddr();
 
     NetCtl::OrbisNetCtlNatInfo nat_info{};
     nat_info.size = sizeof(nat_info);

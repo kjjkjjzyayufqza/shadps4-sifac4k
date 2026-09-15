@@ -4,6 +4,7 @@
 #pragma once
 
 #include <iostream>
+#include <string>
 #include <unordered_map>
 #include <vector>
 #include <spdlog/details/fmt_helper.h>
@@ -25,6 +26,9 @@ using spdlog_stdout = spdlog::sinks::stdout_color_sink_mt;
 
 namespace Common::Log {
 extern bool g_should_append;
+/// Log filter passed on the command line. It is appended to the configured filter, so it wins
+/// over both the global and the game specific setting regardless of when those are loaded.
+extern std::string g_forced_filter;
 extern std::unordered_map<std::string_view, std::shared_ptr<spdlog::logger>> ALL_LOGGERS;
 
 void Setup(std::string_view shadps4_filename);

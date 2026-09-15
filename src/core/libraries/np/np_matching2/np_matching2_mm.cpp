@@ -217,20 +217,39 @@ std::string ExtractProtoBytes(const std::vector<u8>& payload, size_t offset = 0)
     return std::string(reinterpret_cast<const char*>(payload.data() + offset + 4), len);
 }
 
-// A request whose reply never arrives must still complete: the title is waiting on this
-// callback and has no other way to learn the request is dead. Reported as a request timeout,
-// which is what the library raises when the matching service stops answering.
-void DispatchRequestTimeout(const PendingRequest& pr) {
+// A start the matching service could not complete returns the context to stopped and tells the
+// title to start it over, which is how the library reports a failed start. Leaving the context
+// marked started would make every retry fail with CONTEXT_ALREADY_STARTED.
+void FailContextStart(OrbisNpMatching2ContextId ctx_id, s32 error_code) {
+    if (!ContextManager::Instance().AbortStart(ctx_id)) {
+        return;
+    }
+    PendingEvent ev{};
+    ev.type = PendingEvent::CONTEXT_CB;
+    ev.ctx_id = ctx_id;
+    ev.fire_at = std::chrono::steady_clock::now();
+    ev.ctx_event = ORBIS_NP_MATCHING2_CONTEXT_EVENT_START_OVER;
+    ev.ctx_event_cause = ORBIS_NP_MATCHING2_EVENT_CAUSE_CONTEXT_ERROR;
+    ev.error_code = error_code;
+    ScheduleEvent(std::move(ev));
+}
+
+// A request whose reply can no longer arrive must still complete: the title is waiting on this
+// callback and has no other way to learn the request is dead.
+void DispatchRequestFailure(const PendingRequest& pr, s32 error_code) {
     if (ContextManager::Instance().Get(pr.ctx_id) == nullptr) {
+        return;
+    }
+    if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED) {
+        FailContextStart(pr.ctx_id, error_code);
         return;
     }
 
     PendingEvent ev{};
     ev.ctx_id = pr.ctx_id;
     ev.fire_at = std::chrono::steady_clock::now();
-    ev.error_code = ORBIS_NP_MATCHING2_ERROR_REQUEST_TIMEOUT;
-    if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED ||
-        pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED) {
+    ev.error_code = error_code;
+    if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED) {
         ev.type = PendingEvent::CONTEXT_CB;
         ev.ctx_event = pr.req_event;
         ev.ctx_event_cause = ORBIS_NP_MATCHING2_EVENT_CAUSE_CONTEXT_ACTION;
@@ -253,6 +272,10 @@ void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
 
     const s32 error_code = (error == ShadNet::ErrorType::NoError) ? 0 : static_cast<s32>(error);
 
+    if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED && error_code != 0) {
+        FailContextStart(pr.ctx_id, error_code);
+        return;
+    }
     if (pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED ||
         pr.req_event == ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED) {
         PendingEvent ev{};
@@ -825,7 +848,7 @@ void ExpireMatchingRequests() {
     }
     // Dispatched outside the lock: scheduling an event takes the event queue's own lock.
     for (const PendingRequest& pr : expired) {
-        DispatchRequestTimeout(pr);
+        DispatchRequestFailure(pr, ORBIS_NP_MATCHING2_ERROR_REQUEST_TIMEOUT);
     }
 
     // Signaling queries only populate a cache, so a lost reply needs no completion - but the
@@ -913,7 +936,7 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
     client->onRoomMessage = [](const ShadNet::NotifyRoomMessage& n) { HandleRoomMessage(n); };
 }
 
-void ClearMmShadNetClient() {
+void ClearMmShadNetClient(OrbisNpMatching2EventCause cause, s32 error_code) {
     std::shared_ptr<ShadNet::ShadNetClient> old_client;
     {
         std::lock_guard lock(g_mm.mutex);
@@ -936,8 +959,13 @@ void ClearMmShadNetClient() {
     StopMatching2HandshakeThread();
     Net::ClearP2PRelayedPeers();
     Net::ReleaseP2PPortMapping();
+    std::vector<PendingRequest> orphaned;
     {
         std::lock_guard lock(g_mm.pending_mutex);
+        orphaned.reserve(g_mm.pending.size());
+        for (const auto& entry : g_mm.pending) {
+            orphaned.push_back(entry.second);
+        }
         g_mm.pending.clear();
     }
     {
@@ -945,6 +973,33 @@ void ClearMmShadNetClient() {
         g_mm.sig_cache.clear();
         g_mm.sig_last_request.clear();
         g_mm.sig_inflight.clear();
+    }
+
+    // The replies these requests were waiting for can no longer arrive, and the server session the
+    // started contexts belonged to is gone. Dropping them left the title waiting on callbacks that
+    // nothing would ever deliver. Requests go first, so a context whose start was still in flight
+    // is reported as a failed start rather than as stopped.
+    for (const PendingRequest& pr : orphaned) {
+        DispatchRequestFailure(pr, error_code);
+    }
+    const std::vector<OrbisNpMatching2ContextId> stopped =
+        ContextManager::Instance().StopAllStarted();
+    for (const OrbisNpMatching2ContextId ctx_id : stopped) {
+        PendingEvent ev{};
+        ev.type = PendingEvent::CONTEXT_CB;
+        ev.ctx_id = ctx_id;
+        ev.fire_at = std::chrono::steady_clock::now();
+        ev.ctx_event = ORBIS_NP_MATCHING2_CONTEXT_EVENT_STOPPED;
+        ev.ctx_event_cause = cause;
+        ev.error_code = error_code;
+        ScheduleEvent(std::move(ev));
+    }
+    if (!orphaned.empty() || !stopped.empty()) {
+        LOG_INFO(Lib_NpMatching2,
+                 "matching backend torn down: failed {} pending request(s), stopped {} "
+                 "context(s) (cause={}, error={:#x})",
+                 orphaned.size(), stopped.size(), static_cast<u8>(cause),
+                 static_cast<u32>(error_code));
     }
 }
 
@@ -956,8 +1011,14 @@ bool IsMmClientRunning() {
 void MmContextStart(OrbisNpMatching2ContextId ctx_id) {
     shadnet::ContextStartRequest req;
     req.set_ctx_id(ctx_id);
-    MmSubmitRequest(ctx_id, 0, ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED, MmCommand::ContextStart,
-                    MakeProtoPayload(req));
+    if (MmSubmitRequest(ctx_id, 0, ORBIS_NP_MATCHING2_CONTEXT_EVENT_STARTED,
+                        MmCommand::ContextStart, MakeProtoPayload(req)) != ORBIS_OK) {
+        // sceNpMatching2ContextStart has already returned success, so the context callback is the
+        // only way left to report the failure; without it the title waits for a STARTED event
+        // that nothing will deliver.
+        FailContextStart(ctx_id, ORBIS_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+        return;
+    }
     if (ContextObject* ctx = ContextManager::Instance().Get(ctx_id)) {
         SendMatching2StunPing(*ctx);
     }

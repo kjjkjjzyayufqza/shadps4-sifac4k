@@ -66,6 +66,21 @@ static constexpr u32 SHAD_WAIT_GRACE_MS = 2000;
 // otherwise strand the caller forever.
 static constexpr u32 SHAD_AUTH_TIMEOUT_MS = 15000;
 
+// Liveness of the established push connection. A link that dies without a FIN or RST (a NAT or
+// firewall dropping the flow's state, a path that starts discarding packets) is otherwise never
+// noticed: the reader stays parked in recv, the user stays signed in and every request waits out
+// its full deadline. Keepalive probes an idle link and the unacknowledged-data bound covers one
+// that dies with a request in flight; either failure ends the reader's recv with an error, which
+// the NP handler treats as a dropped connection. The idle probe also keeps NAT mappings that
+// expire idle TCP flows from silently cutting the connection.
+static constexpr u32 SHAD_KEEPALIVE_IDLE_SEC = 20;
+static constexpr u32 SHAD_KEEPALIVE_INTERVAL_SEC = 5;
+static constexpr u32 SHAD_KEEPALIVE_PROBES = 4;
+// Sent data that stays unacknowledged this long ends the connection. Matches the time keepalive
+// needs to give up on an idle link, so both kinds of dead link are detected equally fast.
+static constexpr u32 SHAD_UNACKED_DATA_TIMEOUT_SEC =
+    SHAD_KEEPALIVE_IDLE_SEC + SHAD_KEEPALIVE_INTERVAL_SEC * SHAD_KEEPALIVE_PROBES;
+
 static constexpr u32 SHAD_PROTOCOL_VERSION = 1;
 static constexpr u32 SHAD_MAX_PACKET_SIZE = 0x800000; // 8 MiB
 

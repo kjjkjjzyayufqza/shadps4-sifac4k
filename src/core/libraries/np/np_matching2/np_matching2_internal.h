@@ -351,6 +351,12 @@ public:
 
     s32 Start(OrbisNpMatching2ContextId ctx_id);
     s32 Stop(OrbisNpMatching2ContextId ctx_id);
+    // Returns a started context to stopped without a stop request, for a start the matching
+    // service could not complete. False when the context is gone or was not started.
+    bool AbortStart(OrbisNpMatching2ContextId ctx_id);
+    // Marks every started context stopped (stop pending) and returns their ids, for when the
+    // server session those contexts belonged to no longer exists.
+    std::vector<OrbisNpMatching2ContextId> StopAllStarted();
 
     void ApplyContextCallback(OrbisNpMatching2ContextCallback callback, void* arg);
 

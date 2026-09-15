@@ -236,6 +236,9 @@ struct P2PPortStats {
 };
 
 u16 GetP2PConfiguredPort();
+/// Address the title should bind P2P sockets to (local NIC / explicit bind, never STUN mapped).
+u32 GetP2PLocalAddr();
+/// Address remote peers should send to (STUN-mapped when recorded).
 u32 GetP2PAdvertisedAddr();
 bool EnsureP2PTransport();
 bool P2PTransportIsReady();

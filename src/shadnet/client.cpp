@@ -11,6 +11,7 @@
 #include "common/logging/log.h"
 #include "common/scm_rev.h"
 #include "common/thread.h"
+#include "link_liveness.h"
 #include "shadnet.pb.h"
 
 #ifdef _WIN32
@@ -397,6 +398,13 @@ bool ShadNetClient::DoConnect() {
         m_addr_server.store(peer.sin_addr.s_addr);
 
     LOG_INFO(ShadNet, "TCP connected to {}:{}", m_host, m_port);
+
+    for (const std::string_view option : ApplyLinkLiveness(m_sock)) {
+        LOG_WARNING(ShadNet,
+                    "{} was refused on the connection to {}:{}; a connection that goes silent "
+                    "will take longer to be detected",
+                    option, m_host, m_port);
+    }
 
     // Apply receive timeout for the ServerInfo handshake.
     // Cleared after success so ReaderThread's RecvN blocks indefinitely as intended.

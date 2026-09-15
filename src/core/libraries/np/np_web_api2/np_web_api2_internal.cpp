@@ -6,6 +6,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http2.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_context.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_internal.h"
@@ -663,7 +664,8 @@ s32 sendRequest(s64 request_id, s32 part_index, void* data, u64 data_size,
         return result;
     }
 
-    if (!EmulatorSettings.IsShadNetEnabled()) {
+    if (!EmulatorSettings.IsShadNetEnabled() ||
+        !NpHandler::GetInstance().IsPsnSignedIn(user_ctx->GetUserId())) {
         LOG_INFO(Lib_NpWebApi2, "Cannot send request, you are not signed in to shadNet");
         request->RemoveUser();
         user_ctx->RemoveUser();

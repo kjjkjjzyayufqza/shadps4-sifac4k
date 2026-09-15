@@ -8,6 +8,7 @@
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler.h"
 #include "core/libraries/system/userservice.h"
 
 namespace Libraries::Np::NpAuth {
@@ -17,6 +18,11 @@ namespace Libraries::Np::NpAuth {
 // read live. Snapshotting it at registration time captured the value from before the probe.
 static bool ShadNetEnabled() {
     return EmulatorSettings.IsShadNetEnabled();
+}
+// The library resolves every authorization against the NP sign-in state of the requesting user,
+// so a user who is not signed in to shadNet is refused even while shadNet itself is enabled.
+static bool IsUserSignedIn(s32 user_id) {
+    return ShadNetEnabled() && NpHandler::GetInstance().IsPsnSignedIn(user_id);
 }
 static s32 g_active_auth_requests = 0;
 static std::mutex g_auth_request_mutex;
@@ -115,7 +121,7 @@ s32 GetAuthorizationCode(s32 req_id, const OrbisNpAuthGetAuthorizationCodeParame
     }
 
     request.state = NpAuthRequestState::Complete;
-    if (!ShadNetEnabled()) {
+    if (!IsUserSignedIn(param->user_id)) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
         // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {
@@ -216,7 +222,7 @@ s32 GetIdToken(s32 req_id, const OrbisNpAuthGetIdTokenParameterA* param, s32 fla
     }
 
     request.state = NpAuthRequestState::Complete;
-    if (!ShadNetEnabled()) {
+    if (!IsUserSignedIn(param->user_id)) {
         request.result = ORBIS_NP_ERROR_SIGNED_OUT;
         // If the request is processed in some form, and it's an async request, then it returns OK.
         if (request.async) {

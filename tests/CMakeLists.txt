@@ -410,6 +410,7 @@ set(P2P_TEST_SOURCES
 
     # Tests
     network/test_p2p_port.cpp
+    network/test_p2p_addr_choice.cpp
 )
 
 add_executable(shadps4_p2p_test ${P2P_TEST_SOURCES})
@@ -461,6 +462,39 @@ if (WIN32)
 endif()
 
 gtest_discover_tests(shadps4_p2p_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    DISCOVERY_TIMEOUT 60
+)
+
+# ===========================================================================
+# shadNet link liveness (keepalive and unacknowledged-data bound on a real TCP socket)
+# ===========================================================================
+
+add_executable(shadps4_shadnet_link_test
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/shadnet/link_liveness.cpp
+
+    # Tests
+    network/test_shadnet_link_liveness.cpp
+)
+
+list(APPEND TEST_TARGETS shadps4_shadnet_link_test)
+
+target_include_directories(shadps4_shadnet_link_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_shadnet_link_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_shadnet_link_test PRIVATE GTest::gtest_main)
+
+if (WIN32)
+    target_link_libraries(shadps4_shadnet_link_test PRIVATE ws2_32)
+    target_compile_definitions(shadps4_shadnet_link_test PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        _WIN32_WINNT=0x0A00
+        WINVER=0x0A00
+    )
+endif()
+
+gtest_discover_tests(shadps4_shadnet_link_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DISCOVERY_TIMEOUT 60
 )

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
 #include <map>
 #include <ranges>
 #include <magic_enum/magic_enum.hpp>
@@ -76,6 +77,54 @@ static std::map<std::string, FactoryDevice> available_device = {
 };
 
 namespace Libraries::Kernel {
+
+namespace {
+
+// Guest file I/O is the only visibility we have into what an LLE module such as
+// libSceAvPlayer.sprx does with a file, so every traced operation carries the time the host
+// needed for it. That tells a wrong return value apart from host I/O that was merely slow.
+using FileClock = std::chrono::steady_clock;
+
+// A single guest file operation that takes longer than this is reported even when tracing is
+// off, because it points at the host (busy drive, anti-virus scan) rather than at the guest.
+constexpr s64 SlowFileOperationMicros = 100'000;
+
+s64 ElapsedMicros(FileClock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::microseconds>(FileClock::now() - start).count();
+}
+
+bool IsFileTraceEnabled() {
+    const auto& logger = Common::Log::ALL_LOGGERS[Common::Log::Class::Kernel_Fs];
+    return logger != nullptr && logger->should_log(spdlog::level::debug);
+}
+
+void LogFileOperation(std::string_view operation, s32 fd, s64 result, s64 elapsed_us,
+                      std::string_view arguments) {
+    auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
+    const auto* file = handles->GetFile(fd);
+    const std::string_view path =
+        file != nullptr ? std::string_view{file->m_guest_name} : std::string_view{"<closed>"};
+    if (elapsed_us >= SlowFileOperationMicros) {
+        LOG_WARNING(Kernel_Fs, "slow {}: fd = {}, path = {}, {}, result = {}, took {} us",
+                    operation, fd, path, arguments, result, elapsed_us);
+    } else {
+        LOG_DEBUG(Kernel_Fs, "{}: fd = {}, path = {}, {}, result = {}, took {} us", operation, fd,
+                  path, arguments, result, elapsed_us);
+    }
+}
+
+template <typename... Args>
+void TraceFileOperation(std::string_view operation, s32 fd, s64 result, FileClock::time_point start,
+                        fmt::format_string<Args...> format, Args&&... args) {
+    const s64 elapsed_us = ElapsedMicros(start);
+    if (elapsed_us < SlowFileOperationMicros && !IsFileTraceEnabled()) {
+        return;
+    }
+    LogFileOperation(operation, fd, result, elapsed_us,
+                     fmt::format(format, std::forward<Args>(args)...));
+}
+
+} // namespace
 
 s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     LOG_INFO(Kernel_Fs, "path = {} flags = {:#x} mode = {:#o}", raw_path, flags, mode);
@@ -252,6 +301,8 @@ s32 PS4_SYSV_ABI open(const char* raw_path, s32 flags, u16 mode) {
     }
 
     file->is_opened = true;
+    LOG_INFO(Kernel_Fs, "opened {} as fd = {}, host path = {}, size = {}", raw_path, handle,
+             fmt::UTF(file->m_host_name.u8string()), file->GetSize());
     return handle;
 }
 
@@ -284,7 +335,7 @@ s32 PS4_SYSV_ABI close(s32 fd) {
         file->socket->Close();
     }
     file->is_opened = false;
-    LOG_INFO(Kernel_Fs, "Closing {}", file->m_guest_name);
+    LOG_INFO(Kernel_Fs, "Closing fd = {}, path = {}", fd, file->m_guest_name);
     // FIXME: Lock file mutex before deleting it?
     h->DeleteHandle(fd);
     return ORBIS_OK;
@@ -361,7 +412,7 @@ s64 ReadFile(Core::FileSys::File* file, void* buf, u64 nbytes) {
     return bytes;
 }
 
-s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
+static s64 ReadvImpl(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* file = h->GetFile(fd);
     if (file == nullptr) {
@@ -396,6 +447,13 @@ s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
         total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
     }
     return total_read;
+}
+
+s64 PS4_SYSV_ABI readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
+    const auto start = FileClock::now();
+    const s64 result = ReadvImpl(fd, iov, iovcnt);
+    TraceFileOperation("readv", fd, result, start, "iovcnt = {}", iovcnt);
+    return result;
 }
 
 s64 PS4_SYSV_ABI posix_readv(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt) {
@@ -453,7 +511,7 @@ s64 PS4_SYSV_ABI sceKernelWritev(s32 fd, const OrbisKernelIovec* iov, s32 iovcnt
     return result;
 }
 
-s64 PS4_SYSV_ABI posix_lseek(s32 fd, s64 offset, s32 whence) {
+static s64 LseekImpl(s32 fd, s64 offset, s32 whence) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* file = h->GetFile(fd);
     if (file == nullptr) {
@@ -514,6 +572,13 @@ s64 PS4_SYSV_ABI posix_lseek(s32 fd, s64 offset, s32 whence) {
     return result;
 }
 
+s64 PS4_SYSV_ABI posix_lseek(s32 fd, s64 offset, s32 whence) {
+    const auto start = FileClock::now();
+    const s64 result = LseekImpl(fd, offset, whence);
+    TraceFileOperation("lseek", fd, result, start, "offset = {}, whence = {}", offset, whence);
+    return result;
+}
+
 s64 PS4_SYSV_ABI sceKernelLseek(s32 fd, s64 offset, s32 whence) {
     s64 result = posix_lseek(fd, offset, whence);
     if (result < 0) {
@@ -523,7 +588,7 @@ s64 PS4_SYSV_ABI sceKernelLseek(s32 fd, s64 offset, s32 whence) {
     return result;
 }
 
-s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
+static s64 ReadImpl(s32 fd, void* buf, u64 nbytes) {
     auto* h = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     auto* file = h->GetFile(fd);
     if (file == nullptr) {
@@ -557,6 +622,13 @@ s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
     }
 
     return ReadFile(file, buf, nbytes);
+}
+
+s64 PS4_SYSV_ABI read(s32 fd, void* buf, u64 nbytes) {
+    const auto start = FileClock::now();
+    const s64 result = ReadImpl(fd, buf, nbytes);
+    TraceFileOperation("read", fd, result, start, "nbytes = {}", nbytes);
+    return result;
 }
 
 s64 PS4_SYSV_ABI posix_read(s32 fd, void* buf, u64 nbytes) {
@@ -789,7 +861,7 @@ s32 PS4_SYSV_ABI sceKernelCheckReachability(const char* path) {
     return ORBIS_OK;
 }
 
-s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
+static s32 FstatImpl(s32 fd, OrbisKernelStat* sb) {
     LOG_DEBUG(Kernel_Fs, "(PARTIAL) fd = {}", fd);
     if (sb == nullptr) {
         *__Error() = POSIX_EFAULT;
@@ -852,6 +924,14 @@ s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
         UNREACHABLE_MSG("{}", u32(file->type.load()));
     }
     return ORBIS_OK;
+}
+
+s32 PS4_SYSV_ABI fstat(s32 fd, OrbisKernelStat* sb) {
+    const auto start = FileClock::now();
+    const s32 result = FstatImpl(fd, sb);
+    TraceFileOperation("fstat", fd, result, start, "st_size = {}",
+                       result == ORBIS_OK && sb != nullptr ? sb->st_size : -1);
+    return result;
 }
 
 s32 PS4_SYSV_ABI posix_fstat(s32 fd, OrbisKernelStat* sb) {
@@ -981,7 +1061,7 @@ s32 PS4_SYSV_ABI sceKernelRename(const char* from, const char* to) {
     return result;
 }
 
-s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 offset) {
+static s64 PreadvImpl(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 offset) {
     if (offset < 0) {
         *__Error() = POSIX_EINVAL;
         return -1;
@@ -1029,6 +1109,13 @@ s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 off
         total_read += ReadFile(file, iov[i].iov_base, iov[i].iov_len);
     }
     return total_read;
+}
+
+s64 PS4_SYSV_ABI posix_preadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 offset) {
+    const auto start = FileClock::now();
+    const s64 result = PreadvImpl(fd, iov, iovcnt, offset);
+    TraceFileOperation("preadv", fd, result, start, "offset = {}, iovcnt = {}", offset, iovcnt);
+    return result;
 }
 
 s64 PS4_SYSV_ABI sceKernelPreadv(s32 fd, OrbisKernelIovec* iov, s32 iovcnt, s64 offset) {

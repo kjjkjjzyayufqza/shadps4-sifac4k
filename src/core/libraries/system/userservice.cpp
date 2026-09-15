@@ -516,7 +516,12 @@ s32 PS4_SYSV_ABI sceUserServiceGetInitialUser(int* user_id) {
         LOG_ERROR(Lib_UserService, "user_id is null");
         return ORBIS_USER_SERVICE_ERROR_INVALID_ARGUMENT;
     }
-    *user_id = UserManagement.GetDefaultUser().user_id;
+    User* u = UserManagement.GetPrimaryUser();
+    if (!u) {
+        LOG_ERROR(Lib_UserService, "no primary user is available");
+        return ORBIS_USER_SERVICE_ERROR_NOT_LOGGED_IN;
+    }
+    *user_id = u->user_id;
     return ORBIS_OK;
 }
 

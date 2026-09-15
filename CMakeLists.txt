@@ -40,6 +40,12 @@ option(ENABLE_DISCORD_RPC "Enable the Discord RPC integration" ON)
 option(ENABLE_UPDATER "Enables the options to updater" ON)
 option(ENABLE_TESTS "Build unit tests (requires GTest)" OFF)
 option(ENABLE_SYSTEM_LIBRARIES "Enable building against system libraries" OFF)
+# Diagnostic builds handed to testers compile their log filter in, so nothing has to be passed on
+# the command line or edited in a config file. An explicit --log-filter still replaces it.
+set(SHADPS4_BUILTIN_LOG_FILTER "" CACHE STRING
+    "Log filter entries used as the default --log-filter value, e.g. \"Kernel.Fs:debug\"")
+set_source_files_properties(src/main.cpp PROPERTIES COMPILE_DEFINITIONS
+    "SHADPS4_BUILTIN_LOG_FILTER=\"${SHADPS4_BUILTIN_LOG_FILTER}\"")
 
 # First, determine whether to use CMAKE_OSX_ARCHITECTURES or CMAKE_SYSTEM_PROCESSOR.
 if (APPLE AND CMAKE_OSX_ARCHITECTURES)
@@ -1247,6 +1253,8 @@ add_custom_command(
 
 set(SHADNET src/shadnet/client.cpp
             src/shadnet/client.h
+            src/shadnet/link_liveness.cpp
+            src/shadnet/link_liveness.h
             src/shadnet/server_probe.cpp
             src/shadnet/server_probe.h
             "${SHADNET_PROTO_OUT}/shadnet.pb.cc"

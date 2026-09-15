@@ -183,7 +183,7 @@ void NpHandler::Shutdown() {
             ids.push_back(uid);
     }
     for (s32 uid : ids)
-        DisconnectUser(uid);
+        DisconnectUser(uid, DisconnectReason::SignedOut);
 
     if (m_worker_thread.joinable())
         m_worker_thread.join();
@@ -511,7 +511,7 @@ void NpHandler::FailPendingRequests(s32 user_id, s32 error_code) {
     }
 }
 
-void NpHandler::DisconnectUser(s32 user_id) {
+void NpHandler::DisconnectUser(s32 user_id, DisconnectReason reason) {
     std::shared_ptr<ShadNet::ShadNetClient> client;
     {
         std::lock_guard lock(m_mutex_clients);
@@ -538,7 +538,15 @@ void NpHandler::DisconnectUser(s32 user_id) {
         had_last_client = m_clients.empty();
     }
     if (had_last_client) {
-        NpMatching2::ClearMmShadNetClient();
+        if (reason == DisconnectReason::ConnectionLost) {
+            NpMatching2::ClearMmShadNetClient(
+                NpMatching2::ORBIS_NP_MATCHING2_EVENT_CAUSE_CONNECTION_ERROR,
+                ORBIS_NP_MATCHING2_ERROR_SERVER_NOT_AVAILABLE);
+        } else {
+            NpMatching2::ClearMmShadNetClient(
+                NpMatching2::ORBIS_NP_MATCHING2_EVENT_CAUSE_NP_SIGNED_OUT,
+                ORBIS_NP_ERROR_SIGNED_OUT);
+        }
     }
 
     // The reader thread is joined, so no reply can race us: complete every
@@ -560,7 +568,7 @@ void NpHandler::OnUserLoggedOut(s32 user_id) {
         std::lock_guard lock(m_mutex_clients);
         m_reconnect.erase(user_id); // do not auto-reconnect
     }
-    DisconnectUser(user_id);
+    DisconnectUser(user_id, DisconnectReason::SignedOut);
 }
 
 void NpHandler::WorkerThread() {
@@ -582,7 +590,8 @@ void NpHandler::WorkerThread() {
 
         for (s32 uid : dropped) {
             LOG_WARNING(NpHandler, "user_id={} connection dropped (network); will retry", uid);
-            DisconnectUser(uid);   // reports SignedOut + stops/removes the dead client
+            // Reports SignedOut and stops/removes the dead client.
+            DisconnectUser(uid, DisconnectReason::ConnectionLost);
             MarkForReconnect(uid); // schedule transparent reconnect (network drop, not logout)
         }
 

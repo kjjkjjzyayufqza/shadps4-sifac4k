@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <cctype>
+#include <charconv>
 #include <cmath>
 
 #include "app_content.h"
 #include "common/assert.h"
 #include "common/elf_info.h"
+#include "common/io_file.h"
 #include "common/logging/log.h"
 #include "common/singleton.h"
 #include "core/emulator_settings.h"
@@ -35,6 +39,34 @@ static s32 sdk_ver = 0;
 static s32 addcont_count = 0;
 static std::string title_id;
 static bool is_initialized = false;
+
+// Some games (e.g. CUSA15006) only treat a DLC as owned when this key matches a value from
+// their own data tables. The real key sits in the encrypted license, so it can be supplied
+// as 32 hex digits in sce_sys/entitlement_key.txt; without that file the key stays zeroed.
+static OrbisAppContentGetEntitlementKey LoadEntitlementKey(const std::filesystem::path& dlc_path) {
+    OrbisAppContentGetEntitlementKey key{};
+    const auto key_path = dlc_path / "sce_sys/entitlement_key.txt";
+    if (!std::filesystem::exists(key_path)) {
+        return key;
+    }
+
+    const Common::FS::IOFile file(key_path, Common::FS::FileAccessMode::Read);
+    ASSERT_MSG(file.IsOpen(), "Failed to open entitlement key file {}", key_path.string());
+    std::string text = file.ReadString(file.GetSize());
+    std::erase_if(text, [](unsigned char c) { return std::isspace(c); });
+    ASSERT_MSG(text.size() == ORBIS_APP_CONTENT_ENTITLEMENT_KEY_SIZE * 2 &&
+                   std::ranges::all_of(text, [](unsigned char c) { return std::isxdigit(c); }),
+               "Entitlement key file {} must contain exactly {} hex digits", key_path.string(),
+               ORBIS_APP_CONTENT_ENTITLEMENT_KEY_SIZE * 2);
+
+    for (int i = 0; i < ORBIS_APP_CONTENT_ENTITLEMENT_KEY_SIZE; ++i) {
+        u8 byte{};
+        std::from_chars(text.data() + i * 2, text.data() + i * 2 + 2, byte, 16);
+        key.data[i] = static_cast<char>(byte);
+    }
+    LOG_INFO(Lib_AppContent, "Loaded entitlement key from {}", key_path.string());
+    return key;
+}
 
 int PS4_SYSV_ABI _Z5dummyv() {
     LOG_ERROR(Lib_AppContent, "(STUBBED) called");
@@ -344,6 +376,7 @@ int PS4_SYSV_ABI sceAppContentInitialize(const OrbisAppContentInitParam* initPar
                 auto& info = addcont_info[addcont_count++];
                 entitlement_id.copy(info.entitlement_label, entitlement_id.length());
                 info.status = OrbisAppContentAddcontDownloadStatus::Installed;
+                info.key = LoadEntitlementKey(entry.path());
             } else {
                 LOG_WARNING(Lib_AppContent, "Additonal content folder {} is not additional content",
                             entry.path().filename().string());

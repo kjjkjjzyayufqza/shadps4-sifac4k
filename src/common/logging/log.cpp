@@ -27,6 +27,7 @@ enum class ShadPs4ReturnCode : u32 {
 
 namespace Common::Log {
 bool g_should_append = false;
+std::string g_forced_filter;
 
 static std::shared_ptr<spdlog_stdout> g_console_sink;
 static std::shared_ptr<LogFileSink> g_shad_file_sink;
@@ -204,14 +205,14 @@ void Setup(std::string_view shadps4_filename) {
     g_console_sink = UpdateColorLevels(std::make_shared<spdlog_stdout>(spdlog::color_mode::always));
 #endif
 
-    g_console_sink->set_pattern("%^%v%$");
+    g_console_sink->set_pattern("%^[%T.%e] %v%$");
 
     // Setup file
 
     g_shad_file_sink = std::make_shared<LogFileSink>(
         (GetUserPath(Common::FS::PathType::LogDir) / shadps4_filename).string(), false,
         EmulatorSettings.GetLogSizeLimit());
-    g_shad_file_sink->set_pattern("%^%v%$");
+    g_shad_file_sink->set_pattern("%^[%T.%e] %v%$");
 
     UpdateSinks();
 }
@@ -287,8 +288,17 @@ void UpdateLogLevels(std::string_view log_filter) {
     spdlog::level default_log_level = spdlog::level::info;
     std::unordered_map<std::string, spdlog::level> log_level_per_class;
 
+    std::string effective_filter(log_filter);
+    if (!g_forced_filter.empty()) {
+        // Parsed last, so the command line entry overrides a class the config also names.
+        if (!effective_filter.empty()) {
+            effective_filter += ' ';
+        }
+        effective_filter += g_forced_filter;
+    }
+
     if (EmulatorSettings.IsLogEnable()) {
-        for (const auto class_level : std::views::split(log_filter, ' ')) {
+        for (const auto class_level : std::views::split(std::string_view(effective_filter), ' ')) {
             const auto class_level_pair =
                 std::views::split(class_level, ':') | std::ranges::to<std::vector<std::string>>();
 

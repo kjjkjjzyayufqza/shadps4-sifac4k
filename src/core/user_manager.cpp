@@ -86,6 +86,16 @@ User* UserManager::GetUserByPlayerIndex(s32 index) {
     return nullptr;
 }
 
+User* UserManager::GetPrimaryUser() {
+    if (User* u = GetUserByPlayerIndex(1)) {
+        return u;
+    }
+    if (!m_users.user.empty()) {
+        return &m_users.user.front();
+    }
+    return nullptr;
+}
+
 const std::vector<User>& UserManager::GetAllUsers() const {
     return m_users.user;
 }
@@ -318,7 +328,10 @@ bool UserManager::SetDefaultUser(u32 user_id) {
 }
 
 User UserManager::GetDefaultUser() {
-    return *GetUserByPlayerIndex(1);
+    if (User* u = GetPrimaryUser()) {
+        return *u;
+    }
+    return {};
 }
 
 void UserManager::SetControllerPort(u32 user_id, int port) {

@@ -1271,6 +1271,32 @@ s32 ContextManager::Stop(OrbisNpMatching2ContextId ctx_id) {
     return ORBIS_OK;
 }
 
+bool ContextManager::AbortStart(OrbisNpMatching2ContextId ctx_id) {
+    std::lock_guard lock(m_mutex);
+    ContextObject* ctx = GetLocked(ctx_id);
+    if (!ctx || !ctx->started) {
+        return false;
+    }
+    ctx->started = false;
+    LOG_DEBUG(Lib_NpMatching2, "context start aborted: id={}", ctx_id);
+    return true;
+}
+
+std::vector<OrbisNpMatching2ContextId> ContextManager::StopAllStarted() {
+    std::lock_guard lock(m_mutex);
+    std::vector<OrbisNpMatching2ContextId> stopped;
+    for (u32 id = 1; id <= kMaxContexts; ++id) {
+        ContextObject& ctx = m_contexts[id];
+        if (!m_used[id] || !ctx.started) {
+            continue;
+        }
+        ctx.started = false;
+        ctx.stop_pending = true;
+        stopped.push_back(static_cast<OrbisNpMatching2ContextId>(id));
+    }
+    return stopped;
+}
+
 void ContextManager::ApplyContextCallback(OrbisNpMatching2ContextCallback callback, void* arg) {
     std::lock_guard lock(m_mutex);
     m_pending_context_callback = callback;

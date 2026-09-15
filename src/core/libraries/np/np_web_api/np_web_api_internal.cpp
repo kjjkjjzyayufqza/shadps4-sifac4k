@@ -768,8 +768,10 @@ s32 sendRequest(s64 requestId, s32 partIndex, const void* pData, u64 dataSize, s
 
     unlockContext(context);
 
-    // Stubbing sceNpManagerIntGetSigninState call with a config check.
-    if (!EmulatorSettings.IsShadNetEnabled()) {
+    // The library checks sceNpManagerIntGetSigninState first: a user who is not signed in to
+    // shadNet is refused here instead of sending a request that has no valid token behind it.
+    if (!EmulatorSettings.IsShadNetEnabled() ||
+        !NpHandler::GetInstance().IsPsnSignedIn(user_context->userId)) {
         releaseRequest(request);
         releaseUserContext(user_context);
         releaseContext(context);

@@ -48,6 +48,8 @@ public:
     bool RenameUser(s32 user_id, const std::string& new_name);
     User* GetUserByID(s32 user_id);
     User* GetUserByPlayerIndex(s32 index);
+    // Player 1 if that port is assigned, otherwise the first user in the list.
+    User* GetPrimaryUser();
     const std::vector<User>& GetAllUsers() const;
     Users CreateDefaultUsers();
     bool SetDefaultUser(u32 user_id);
