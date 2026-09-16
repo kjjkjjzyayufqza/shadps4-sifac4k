@@ -424,6 +424,25 @@ struct WindowsGuestRedZoneProtectionSettings {
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WindowsGuestRedZoneProtectionSettings,
                                    windows_guest_red_zone_protection_mode)
 
+// Deterministic floating point for lockstep P2P titles
+//
+// Replaces the reciprocal and reciprocal-square-root estimates, whose results are
+// vendor-defined, with exact IEEE-754 arithmetic that every host agrees on. Off by
+// default: it costs performance and only matters to titles whose netplay advances an
+// identical simulation on both peers. See documents/deterministic-fp-netplay-plan.md.
+struct DeterministicFpSettings {
+    Setting<bool> deterministic_floating_point{false};
+
+    std::vector<OverrideItem> GetOverrideableFields() const {
+        return std::vector<OverrideItem>{
+            make_override<DeterministicFpSettings>("deterministic_floating_point",
+                                                   &DeterministicFpSettings::
+                                                       deterministic_floating_point)};
+    }
+};
+
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(DeterministicFpSettings, deterministic_floating_point)
+
 // -------------------------------
 // GPU settings
 // -------------------------------
@@ -582,6 +601,8 @@ private:
     AudioSettings m_audio{};
     // Windows static guest red-zone protection
     WindowsGuestRedZoneProtectionSettings m_windows_guest_red_zone_protection{};
+    // Deterministic floating point for lockstep P2P titles
+    DeterministicFpSettings m_deterministic_fp{};
     GPUSettings m_gpu{};
     VulkanSettings m_vulkan{};
     ConfigMode m_configMode{ConfigMode::Default};
@@ -639,6 +660,10 @@ public:
     // Windows static guest red-zone protection
     std::vector<OverrideItem> GetWindowsGuestRedZoneProtectionOverrideableFields() const {
         return m_windows_guest_red_zone_protection.GetOverrideableFields();
+    }
+
+    std::vector<OverrideItem> GetDeterministicFpOverrideableFields() const {
+        return m_deterministic_fp.GetOverrideableFields();
     }
     std::vector<OverrideItem> GetGPUOverrideableFields() const {
         return m_gpu.GetOverrideableFields();
@@ -734,6 +759,10 @@ public:
     // Windows static guest red-zone protection
     SETTING_FORWARD(m_windows_guest_red_zone_protection, WindowsGuestRedZoneProtectionMode,
                     windows_guest_red_zone_protection_mode)
+
+    // Deterministic floating point for lockstep P2P titles
+    SETTING_FORWARD_BOOL(m_deterministic_fp, DeterministicFloatingPoint,
+                         deterministic_floating_point)
 
     // Debug settings
     SETTING_FORWARD_BOOL(m_debug, DebugDump, debug_dump)

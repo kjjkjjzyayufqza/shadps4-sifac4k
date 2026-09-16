@@ -966,8 +966,14 @@ set(CORE src/core/aerolib/stubs.cpp
 
 if (ARCHITECTURE STREQUAL "x86_64")
     set(CORE ${CORE}
+             src/core/branch_targets.cpp
+             src/core/branch_targets.h
              src/core/cpu_patches.cpp
              src/core/cpu_patches.h
+             src/core/cpu_patches_fp.cpp
+             src/core/cpu_patches_fp.h
+             src/core/deterministic_fp_report.cpp
+             src/core/deterministic_fp_report.h
              ${FIBER_LIB})
 endif()
 

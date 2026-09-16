@@ -421,3 +421,8 @@ cmake-build-*
 
 # Nix Result symlink
 result
+
+# Prebuilt FFmpeg dropped in by hand. The supported path is the
+# externals/ffmpeg-core submodule; these are build artifacts, not sources.
+/externals/ffmpeg-[0-9a-f]*/
+/externals/ffmpeg-[0-9a-f]*.zip

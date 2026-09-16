@@ -9,6 +9,8 @@
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
+#include "common/elf_info.h"
+#include "core/branch_targets.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
 #include "core/loader/dwarf.h"
@@ -178,12 +180,30 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         }
     };
 
-#if defined(ARCH_X86_64) && defined(_WIN32)
+#ifdef ARCH_X86_64
+    // Static rewrites share one function walk, so the reasons are collected up front and
+    // the segments are gathered whenever any of them applies.
+    StaticRewriteReason static_rewrite_reasons = StaticRewriteReason::None;
+#ifdef _WIN32
     // Windows static guest red-zone protection
-    const bool use_static_windows_guest_red_zone_protection =
-        WindowsGuestRedZoneProtection::IsStaticPatchingEnabled();
+    if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
+        static_rewrite_reasons |= StaticRewriteReason::GuestRedZone;
+    }
+#endif
+    // Deterministic floating point for lockstep P2P titles
+    if (DeterministicFp::IsEnabled()) {
+        static_rewrite_reasons |= StaticRewriteReason::DeterministicFp;
+    }
+    const bool apply_static_rewrites = True(static_rewrite_reasons);
     std::vector<std::pair<VAddr, u64>> executable_segments;
     std::vector<uintptr_t> function_starts;
+    // Targets recovered offline, for functions whose indirect jumps the pass cannot
+    // resolve on its own. Absent for most modules, and absence only costs coverage.
+    const auto verified_branch_targets =
+        apply_static_rewrites
+            ? VerifiedBranchTargets::Load(VerifiedBranchTargets::PathForModule(
+                  Common::ElfInfo::Instance().GameSerial(), name))
+            : VerifiedBranchTargets{};
 #endif
     for (u16 i = 0; i < elf_header.e_phnum; i++) {
         const auto header_type = elf.ElfPheaderTypeStr(elf_pheader[i].p_type);
@@ -209,12 +229,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
 #ifdef ARCH_X86_64
             if (elf_pheader[i].p_flags & PF_EXEC) {
                 PrePatchInstructions(segment_addr, segment_file_size);
-#ifdef _WIN32
-                // Windows static guest red-zone protection
-                if (use_static_windows_guest_red_zone_protection) {
+                if (apply_static_rewrites) {
                     executable_segments.emplace_back(segment_addr, segment_file_size);
                 }
-#endif
             }
 #endif
             break;
@@ -257,9 +274,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
             const VAddr eh_hdr_end = eh_hdr_start + eh_frame_hdr_size;
             Dwarf::EHHeaderInfo hdr_info;
             if (Dwarf::DecodeEHHdr(eh_hdr_start, eh_hdr_end, hdr_info)) {
-#if defined(ARCH_X86_64) && defined(_WIN32)
-                // Windows static guest red-zone protection
-                if (use_static_windows_guest_red_zone_protection &&
+#ifdef ARCH_X86_64
+                if (apply_static_rewrites &&
                     !Dwarf::DecodeEHHdrTable(hdr_info, eh_hdr_end, function_starts)) {
                     LOG_ERROR(Core_Linker, "Failed to decode EH frame search table for {}", name);
                 }
@@ -278,19 +294,32 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         }
     }
 
-#if defined(ARCH_X86_64) && defined(_WIN32)
-    // Windows static guest red-zone protection
-    if (use_static_windows_guest_red_zone_protection) {
+#ifdef ARCH_X86_64
+    if (apply_static_rewrites) {
         u64 analyzed_function_count{};
         u64 stack_dependent_instruction_count{};
         u64 control_flow_instruction_count{};
         u64 unrelocatable_instruction_count{};
         u64 unsupported_cpu_patch_instruction_count{};
+        u64 fp_approximation_site_count{};
+        u64 patched_fp_approximation_count{};
+        u64 unsupported_fp_approximation_count{};
+        u64 fp_unsupported_operand_shape_count{};
+        u64 fp_unsupported_indirect_branch_count{};
+        u64 fp_unsupported_unrelocatable_count{};
+        u64 verified_target_function_count{};
         for (const auto& [segment_addr, segment_size] : executable_segments) {
-            // Windows static guest red-zone protection
             const auto result =
-                PatchRedZoneMemoryInstructions(segment_addr, segment_size, function_starts);
+                ApplyStaticRewrites(segment_addr, segment_size, function_starts,
+                                    static_rewrite_reasons, &verified_branch_targets);
             analyzed_function_count += result.function_count;
+            fp_approximation_site_count += result.fp_approximation_site_count;
+            patched_fp_approximation_count += result.patched_fp_approximation_count;
+            unsupported_fp_approximation_count += result.unsupported_fp_approximation_count;
+            fp_unsupported_operand_shape_count += result.fp_unsupported_operand_shape_count;
+            fp_unsupported_indirect_branch_count += result.fp_unsupported_indirect_branch_count;
+            fp_unsupported_unrelocatable_count += result.fp_unsupported_unrelocatable_count;
+            verified_target_function_count += result.verified_target_function_count;
             stack_dependent_instruction_count += result.stack_dependent_memory_instruction_count;
             control_flow_instruction_count += result.control_flow_memory_instruction_count;
             unrelocatable_instruction_count += result.unrelocatable_memory_instruction_count;
@@ -328,6 +357,34 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                 "{} CPU patch instructions were unsupported",
                 name, stack_dependent_instruction_count, control_flow_instruction_count,
                 unrelocatable_instruction_count, unsupported_cpu_patch_instruction_count);
+        }
+
+        // Deterministic floating point for lockstep P2P titles. Measured ground truth is
+        // 1258 sites for Maxi Boost ON and 2726 for Gundam Versus; any shortfall leaves a
+        // vendor-defined estimate running, and a lockstep peer that disagrees by one bit
+        // desyncs permanently, so this is reported as a failure rather than a statistic.
+        if (True(static_rewrite_reasons & StaticRewriteReason::DeterministicFp)) {
+            LOG_INFO(Core_Linker,
+                     "[FPDIAG] coverage {}: {} estimate sites found, {} replaced, {} left "
+                     "unsupported ({} functions used verified branch targets of {} in file)",
+                     name, fp_approximation_site_count, patched_fp_approximation_count,
+                     unsupported_fp_approximation_count, verified_target_function_count,
+                     verified_branch_targets.FunctionCount());
+            if (unsupported_fp_approximation_count != 0) {
+                LOG_CRITICAL(Core_Linker,
+                             "[FPDIAG] coverage for {} is incomplete: {} of {} estimate "
+                             "sites still execute vendor-defined results. Lockstep netplay with "
+                             "this module will desync.",
+                             name, unsupported_fp_approximation_count,
+                             fp_approximation_site_count);
+                LOG_CRITICAL(Core_Linker,
+                             "[FPDIAG] shortfall for {}: {} unexpressible operand "
+                             "shapes, {} in functions with branch tables, {} with no "
+                             "relocatable span or relay",
+                             name, fp_unsupported_operand_shape_count,
+                             fp_unsupported_indirect_branch_count,
+                             fp_unsupported_unrelocatable_count);
+            }
         }
     }
 #endif

@@ -53,6 +53,8 @@ set(SETTINGS_TEST_SOURCES
     test_emulator_settings.cpp
     # Windows static guest red-zone protection
     test_windows_guest_red_zone_protection_settings.cpp
+    # Deterministic floating point for lockstep P2P titles
+    test_deterministic_fp_settings.cpp
 )
 
 set(NGS2_TEST_SOURCES
@@ -498,3 +500,121 @@ gtest_discover_tests(shadps4_shadnet_link_test
     WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
     DISCOVERY_TIMEOUT 60
 )
+
+# ===========================================================================
+# Verified branch targets (side-car parsing for the static rewrite pass)
+# ===========================================================================
+# The pass borrows bytes around a patch site only in functions this file vouches
+# for, so a malformed entry has to yield nothing rather than a partial set.
+
+set(BRANCH_TARGETS_TEST_SOURCES
+    # Under test
+    ${CMAKE_SOURCE_DIR}/src/core/branch_targets.cpp
+
+    # Required by the logger's access to EmulatorSettings.
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+
+    # Minimal common support
+    ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+    ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+    # Stubs that replace dependencies
+    stubs/common_stub.cpp
+    stubs/scm_rev_stub.cpp
+    stubs/sdl_stub.cpp
+    stubs/core_stub.cpp
+    stubs/signals_stub.cpp
+    stubs/file_sys_stub.cpp
+
+    # Tests
+    core/test_branch_targets.cpp
+)
+
+add_executable(shadps4_branch_targets_test ${BRANCH_TARGETS_TEST_SOURCES})
+
+list(APPEND TEST_TARGETS shadps4_branch_targets_test)
+
+target_include_directories(shadps4_branch_targets_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${CMAKE_SOURCE_DIR}
+)
+target_compile_features(shadps4_branch_targets_test PRIVATE cxx_std_23)
+
+target_link_libraries(shadps4_branch_targets_test PRIVATE
+    GTest::gtest_main
+    fmt::fmt
+    magic_enum::magic_enum
+    nlohmann_json::nlohmann_json
+    toml11::toml11
+    SDL3::SDL3
+    spdlog::spdlog
+)
+
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+    CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    include(CheckCXXSymbolExists)
+    check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+    if (LIBCPP)
+        target_compile_options(shadps4_branch_targets_test PRIVATE -fexperimental-library)
+    endif()
+endif()
+
+if (WIN32)
+    target_link_libraries(shadps4_branch_targets_test PRIVATE onecore)
+    target_compile_definitions(shadps4_branch_targets_test PRIVATE
+        NOMINMAX
+        WIN32_LEAN_AND_MEAN
+        NTDDI_VERSION=0x0A000006
+        _WIN32_WINNT=0x0A00
+        WINVER=0x0A00
+    )
+endif()
+
+gtest_discover_tests(shadps4_branch_targets_test
+    WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    DISCOVERY_TIMEOUT 60
+)
+
+# ===========================================================================
+# Deterministic floating point (estimate-instruction replacement generators)
+# ===========================================================================
+# Self-contained: the generators depend only on Zydis and Xbyak, so the test
+# executes real replacement code without linking the emulator.
+
+if (ARCHITECTURE STREQUAL "x86_64")
+    add_executable(shadps4_deterministic_fp_test
+        # Under test
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_patches_fp.cpp
+
+        # Tests
+        cpu/test_deterministic_fp.cpp
+    )
+
+    list(APPEND TEST_TARGETS shadps4_deterministic_fp_test)
+
+    target_include_directories(shadps4_deterministic_fp_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+    target_compile_features(shadps4_deterministic_fp_test PRIVATE cxx_std_23)
+    target_link_libraries(shadps4_deterministic_fp_test PRIVATE
+        GTest::gtest_main
+        Zydis::Zydis
+        xbyak::xbyak
+    )
+
+    if (WIN32)
+        target_compile_definitions(shadps4_deterministic_fp_test PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+    endif()
+
+    gtest_discover_tests(shadps4_deterministic_fp_test
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        DISCOVERY_TIMEOUT 60
+    )
+endif()

@@ -29,6 +29,7 @@
 #include "common/scm_rev.h"
 #include "common/singleton.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
+#include "core/deterministic_fp_report.h"
 #include "core/debugger.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
@@ -433,6 +434,9 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     // Windows static guest red-zone protection
     WindowsGuestRedZoneProtection::SetActiveMode(
         EmulatorSettings.GetWindowsGuestRedZoneProtectionMode());
+    // Deterministic floating point for lockstep P2P titles
+    DeterministicFp::SetEnabled(EmulatorSettings.IsDeterministicFloatingPoint());
+    DeterministicFp::LogHostEnvironmentReport();
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");

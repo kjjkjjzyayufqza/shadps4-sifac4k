@@ -11,6 +11,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string>
 #include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
@@ -23,6 +24,7 @@
 #include "common/signal_context.h"
 #include "common/types.h"
 #include "core/signals.h"
+#include "core/cpu_patches_fp.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
 
@@ -89,7 +91,7 @@ static Xbyak::Address ZydisToXbyakMemoryOperand(const ZydisDecodedOperand& opera
     return ptr[expression];
 }
 
-static bool FilterTcbAccess(const ZydisDecodedOperand* operands) {
+static bool FilterTcbAccess(ZydisMnemonic, const ZydisDecodedOperand* operands) {
     const auto& dst_op = operands[0];
     const auto& src_op = operands[1];
 
@@ -208,7 +210,7 @@ static void GenerateTcbExclusiveOr(void* /* address */, const ZydisDecodedOperan
 #endif
 }
 
-static bool FilterNoSSE4a(const ZydisDecodedOperand*) {
+static bool FilterNoSSE4a(ZydisMnemonic, const ZydisDecodedOperand*) {
     Cpu cpu;
     return !cpu.has(Cpu::tSSE4a);
 }
@@ -513,7 +515,7 @@ static void ReplaceMOVNTSD(void* address, const ZydisDecodedOperand*, Xbyak::Cod
     ReplaceMOVNT(address, 0xF2);
 }
 
-using PatchFilter = bool (*)(const ZydisDecodedOperand*);
+using PatchFilter = bool (*)(ZydisMnemonic, const ZydisDecodedOperand*);
 using InstructionGenerator = void (*)(void*, const ZydisDecodedOperand*, Xbyak::CodeGenerator&);
 struct PatchInfo {
     /// Filter for more granular patch conditions past just the instruction mnemonic.
@@ -524,6 +526,12 @@ struct PatchInfo {
 
     /// Whether to use a trampoline for this patch.
     bool trampoline;
+
+    /// Whether the patch may only be applied where instruction boundaries are known to be
+    /// correct. A linear sweep can start mid-instruction and decode something that was
+    /// never there; for SSE4a that merely wastes a trampoline, but replacing an estimate
+    /// at a phantom site would corrupt whatever really lives at those bytes.
+    bool verified_boundaries_only;
 };
 
 constexpr size_t NearJumpSize = 5;
@@ -534,7 +542,61 @@ static const bool need_tcb_trampoline = true;
 static const bool need_tcb_trampoline = false;
 #endif
 
+// Deterministic FP is the opposite polarity to FilterNoSSE4a: SSE4a is emulated only
+// where the host lacks it, whereas an estimate has to be replaced on every host precisely
+// so that all hosts agree. Shapes no generator can express faithfully are refused here and
+// counted as unpatched by the pass, because leaving one behind is a correctness hole.
+static bool FilterDeterministicFp(ZydisMnemonic mnemonic, const ZydisDecodedOperand* operands) {
+    return DeterministicFp::IsEnabled() &&
+           DeterministicFp::IsSupportedOperandShape(mnemonic, operands);
+}
+
 static const std::unordered_map<ZydisMnemonic, std::vector<PatchInfo>> Patches = {
+    // Deterministic floating point for lockstep P2P titles. The reciprocal and
+    // reciprocal-square-root estimates are the only x86-64 FP operations whose results are
+    // implementation-defined, so Intel, AMD and the PS4's Jaguar core all disagree. Exact
+    // IEEE-754 division and square root are bit-identical everywhere.
+    {ZYDIS_MNEMONIC_VRCPPS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateVRCPPS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_VRCPSS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateVRCPSS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_VRSQRTPS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateVRSQRTPS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_VRSQRTSS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateVRSQRTSS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_RCPPS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateRCPPS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_RCPSS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateRCPSS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_RSQRTPS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateRSQRTPS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+    {ZYDIS_MNEMONIC_RSQRTSS,
+     {{.filter = FilterDeterministicFp,
+       .generator = DeterministicFp::GenerateRSQRTSS,
+       .trampoline = true,
+       .verified_boundaries_only = true}}},
+
     // SSE4a
     {ZYDIS_MNEMONIC_EXTRQ, {{FilterNoSSE4a, GenerateEXTRQ, true}}},
     {ZYDIS_MNEMONIC_INSERTQ, {{FilterNoSSE4a, GenerateINSERTQ, true}}},
@@ -610,7 +672,7 @@ static PatchModule* GetContainingModule(const void* ptr) {
 
 /// Returns a boolean indicating whether the instruction was patched, and the offset to advance past
 /// whatever is at the current code pointer.
-static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module) {
+static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module, bool boundaries_verified) {
     ZydisDecodedInstruction instruction;
     ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
     const auto status = Common::Decoder::Instance()->decodeInstruction(instruction, operands, code,
@@ -622,8 +684,11 @@ static std::pair<bool, u64> TryPatch(u8* code, PatchModule* module) {
     if (Patches.contains(instruction.mnemonic)) {
         const auto& patches = Patches.at(instruction.mnemonic);
         for (const auto& patch_info : patches) {
+            if (patch_info.verified_boundaries_only && !boundaries_verified) {
+                continue;
+            }
             bool needs_trampoline = patch_info.trampoline;
-            if (patch_info.filter(operands)) {
+            if (patch_info.filter(instruction.mnemonic, operands)) {
                 auto& patch_gen = module->patch_gen;
 
                 if (needs_trampoline && instruction.length < NearJumpSize) {
@@ -900,7 +965,7 @@ static bool TryPatchJit(void* code_address) {
         return true;
     }
 
-    return TryPatch(code, module).first;
+    return TryPatch(code, module, /*boundaries_verified=*/false).first;
 }
 
 static void TryPatchAot(void* code_address, u64 code_size) {
@@ -914,7 +979,7 @@ static void TryPatchAot(void* code_address, u64 code_size) {
 
     const auto* end = code + code_size;
     while (code < end) {
-        code += TryPatch(code, module).second;
+        code += TryPatch(code, module, /*boundaries_verified=*/false).second;
     }
 }
 
@@ -943,7 +1008,30 @@ bool IsStaticPatchingEnabled() noexcept {
 
 } // namespace WindowsGuestRedZoneProtection
 
-#if defined(_WIN32)
+// ============================================================================
+// Deterministic floating point for lockstep P2P titles
+// ============================================================================
+
+namespace DeterministicFp {
+namespace {
+
+std::atomic enabled{false};
+
+} // namespace
+
+void SetEnabled(bool value) noexcept {
+    enabled.store(value, std::memory_order_release);
+}
+
+bool IsEnabled() noexcept {
+    return enabled.load(std::memory_order_acquire);
+}
+
+} // namespace DeterministicFp
+
+// ============================================================================
+// End deterministic floating point
+// ============================================================================
 
 namespace {
 
@@ -972,6 +1060,9 @@ struct DecodedFunction {
     std::set<uintptr_t> branch_targets;
     bool uses_red_zone{};
     bool has_indirect_branch{};
+    /// An external analysis supplied a target set covering every instruction decoded here,
+    /// so an unresolved indirect jump no longer forces the pass to refuse borrowing.
+    bool targets_verified{};
     bool requires_conservative_red_zone_tracking{};
 };
 
@@ -979,6 +1070,7 @@ struct InstructionRewrite {
     const PatchInfo* cpu_patch{};
     bool protect_red_zone{};
     bool protected_indirect_call{};
+    bool fp_approximation{};
 };
 
 bool IsStackPointerRegister(ZydisRegister reg) {
@@ -1581,6 +1673,47 @@ bool IsInPlaceMemoryPatch(ZydisMnemonic mnemonic) {
     return mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
 }
 
+/// Adopts an external target set for a function, but only when every instruction the pass
+/// decoded falls inside an entry the file vouches for. One instruction outside them leaves
+/// part of the body unaccounted for, and borrowing there is exactly what has to stay
+/// forbidden.
+///
+/// More than one entry can be needed. A disassembler partitions code into functions by its
+/// own rules, and the module's unwind metadata partitions it by the compiler's, so a body
+/// the pass walks may span several entries. Where it does, each entry start inside the body
+/// is itself reachable from outside and is recorded as a target, so no borrowed range can
+/// straddle one.
+void MergeVerifiedTargets(DecodedFunction& function, uintptr_t module_base,
+                          const VerifiedBranchTargets* verified, u64& verified_function_count) {
+    if (verified == nullptr || function.instructions.empty()) {
+        return;
+    }
+
+    std::vector<const VerifiedBranchTargets::Function*> cover;
+    for (const auto& [address, decoded] : function.instructions) {
+        const auto* entry = verified->FindContaining(address - module_base);
+        if (entry == nullptr) {
+            return;
+        }
+        if (std::ranges::find(cover, entry) == cover.end()) {
+            cover.push_back(entry);
+        }
+    }
+
+    const uintptr_t decoded_start = function.instructions.begin()->first;
+    for (const auto* entry : cover) {
+        for (const u64 target : entry->targets) {
+            function.branch_targets.insert(module_base + target);
+        }
+        const uintptr_t entry_start = module_base + entry->start;
+        if (entry_start > decoded_start) {
+            function.branch_targets.insert(entry_start);
+        }
+    }
+    function.targets_verified = true;
+    ++verified_function_count;
+}
+
 const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
     const auto patches = Patches.find(decoded.instruction.mnemonic);
     if (patches == Patches.end()) {
@@ -1588,20 +1721,26 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
     }
     const auto patch =
         std::ranges::find_if(patches->second, [&decoded](const PatchInfo& candidate) {
-            return candidate.filter(decoded.operands.data());
+            return candidate.filter(decoded.instruction.mnemonic, decoded.operands.data());
         });
     return patch != patches->second.end() ? &*patch : nullptr;
 }
 
 } // namespace
 
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
-                                                  std::span<const uintptr_t> function_starts) {
-    RedZonePatchResult result{};
+StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
+                                        std::span<const uintptr_t> function_starts,
+                                        StaticRewriteReason reasons,
+                                        const VerifiedBranchTargets* verified) {
+    StaticRewriteResult result{};
     auto* module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
-    if (module == nullptr || function_starts.empty()) {
+    if (module == nullptr || function_starts.empty() || False(reasons)) {
         return result;
     }
+
+    const bool protect_red_zone = True(reasons & StaticRewriteReason::GuestRedZone);
+    const bool replace_fp_approximations = True(reasons & StaticRewriteReason::DeterministicFp);
+    const auto module_base = reinterpret_cast<uintptr_t>(module->start);
 
     const uintptr_t segment_end = segment_addr + segment_size;
     std::vector<uintptr_t> starts;
@@ -1626,7 +1765,25 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
         ++result.function_count;
         auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
-        AnalyzeRedZoneLiveness(function);
+        MergeVerifiedTargets(function, module_base, verified,
+                             result.verified_target_function_count);
+        const auto report_unpatched_site = [&](uintptr_t site,
+                                               const DecodedCodeInstruction& decoded,
+                                               const char* reason) {
+            std::string encoding;
+            for (u8 index = 0; index < decoded.instruction.length; ++index) {
+                encoding += fmt::format("{:02X}", *reinterpret_cast<const u8*>(site + index));
+            }
+            LOG_WARNING(Core,
+                        "[FPDIAG] unpatched module+{:#x} {} len={} bytes={} function+{:#x} "
+                        "reason={}",
+                        site - module_base, ZydisMnemonicGetString(decoded.instruction.mnemonic),
+                        decoded.instruction.length, encoding, function_start - module_base,
+                        reason);
+        };
+        if (protect_red_zone) {
+            AnalyzeRedZoneLiveness(function);
+        }
         result.instruction_count += function.instructions.size();
 
         std::map<uintptr_t, InstructionRewrite> rewrite_sites;
@@ -1636,21 +1793,40 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
         // the relocation pass below.
         for (auto& [address, decoded] : function.instructions) {
             const PatchInfo* matching_patch = FindMatchingPatch(decoded);
-            const auto [patched, _] = TryPatch(reinterpret_cast<u8*>(address), module);
+            const bool is_fp_approximation =
+                replace_fp_approximations &&
+                DeterministicFp::IsApproximationMnemonic(decoded.instruction.mnemonic);
+            if (is_fp_approximation) {
+                ++result.fp_approximation_site_count;
+            }
+            const auto [patched, _] =
+                TryPatch(reinterpret_cast<u8*>(address), module, /*boundaries_verified=*/true);
             if (IsInPlaceMemoryPatch(decoded.instruction.mnemonic)) {
                 const RedZoneMask red_zone_live = decoded.red_zone_live;
                 decoded = DecodeCodeInstruction(address, function_end);
                 decoded.red_zone_live = red_zone_live;
             } else if (patched) {
+                if (is_fp_approximation) {
+                    ++result.patched_fp_approximation_count;
+                }
                 decoded = DecodeCodeInstruction(address, function_end);
                 decoded.accesses_memory = false;
             } else if (matching_patch != nullptr && matching_patch->trampoline) {
-                rewrite_sites.emplace(address, InstructionRewrite{.cpu_patch = matching_patch});
+                rewrite_sites.emplace(address,
+                                      InstructionRewrite{.cpu_patch = matching_patch,
+                                                         .fp_approximation = is_fp_approximation});
                 ++result.cpu_patch_instruction_count;
+            } else if (is_fp_approximation) {
+                // Found, but neither patched nor queued: the operand shape has no faithful
+                // replacement. The estimate stays, and nothing at runtime can catch it,
+                // because it executes correctly on every host and simply disagrees.
+                ++result.unsupported_fp_approximation_count;
+                ++result.fp_unsupported_operand_shape_count;
+                report_unpatched_site(address, decoded, "operand-shape");
             }
         }
 
-        if (function.uses_red_zone) {
+        if (protect_red_zone && function.uses_red_zone) {
             ++result.red_zone_function_count;
             result.indirect_red_zone_function_count += function.has_indirect_branch;
             for (const auto& [address, decoded] : function.instructions) {
@@ -1752,6 +1928,9 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
                 }
                 if (rewrite->second.cpu_patch != nullptr) {
                     ++result.patched_cpu_patch_instruction_count;
+                    if (rewrite->second.fp_approximation) {
+                        ++result.patched_fp_approximation_count;
+                    }
                 }
                 module->patched.insert(reinterpret_cast<u8*>(decoded->address));
             }
@@ -1825,7 +2004,8 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             std::optional<RelocationSpan> selected_span;
             std::optional<size_t> trampoline_offset;
             const auto& site_instruction = function.instructions.at(site);
-            const bool can_relocate_neighbors = !function.has_indirect_branch;
+            const bool can_relocate_neighbors =
+                !function.has_indirect_branch || function.targets_verified;
             if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
                 auto forward_span = collect_forward_span();
                 if (forward_span) {
@@ -1872,6 +2052,18 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
             const auto& rewrite = rewrite_sites.at(site);
             if (rewrite.cpu_patch != nullptr) {
                 ++result.unsupported_cpu_patch_instruction_count;
+                if (rewrite.fp_approximation) {
+                    ++result.unsupported_fp_approximation_count;
+                    const bool indirect =
+                        function.has_indirect_branch && !function.targets_verified;
+                    if (indirect) {
+                        ++result.fp_unsupported_indirect_branch_count;
+                    } else {
+                        ++result.fp_unsupported_unrelocatable_count;
+                    }
+                    report_unpatched_site(site, function.instructions.at(site),
+                                          indirect ? "indirect-branch" : "no-relocatable-span");
+                }
             }
             if (rewrite.protect_red_zone) {
                 ++result.unrelocatable_memory_instruction_count;
@@ -1890,7 +2082,7 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
 
             const auto site_instruction = function.instructions.find(site);
             ASSERT(site_instruction != function.instructions.end());
-            if (function.has_indirect_branch ||
+            if ((function.has_indirect_branch && !function.targets_verified) ||
                 site_instruction->second.instruction.length < ShortJumpSize) {
                 record_unsupported(site);
                 continue;
@@ -2116,13 +2308,12 @@ RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_
     return result;
 }
 
-#else
-
-RedZonePatchResult PatchRedZoneMemoryInstructions(u64, u64, std::span<const uintptr_t>) {
-    return {};
+// Windows static guest red-zone protection
+RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
+                                                  std::span<const uintptr_t> function_starts) {
+    return ApplyStaticRewrites(segment_addr, segment_size, function_starts,
+                               StaticRewriteReason::GuestRedZone, nullptr);
 }
-
-#endif
 
 // ============================================================================
 // End Windows static guest red-zone protection

@@ -231,6 +231,8 @@ void EmulatorSettingsImpl::ClearGameSpecificOverrides() {
     ClearGroupOverrides(m_audio);
     // Windows static guest red-zone protection
     ClearGroupOverrides(m_windows_guest_red_zone_protection);
+    // Deterministic floating point for lockstep P2P titles
+    ClearGroupOverrides(m_deterministic_fp);
     ClearGroupOverrides(m_gpu);
     ClearGroupOverrides(m_vulkan);
 }
@@ -258,6 +260,9 @@ void EmulatorSettingsImpl::ResetGameSpecificValue(const std::string& key) {
         return;
     // Windows static guest red-zone protection
     if (tryGroup(m_windows_guest_red_zone_protection))
+        return;
+    // Deterministic floating point for lockstep P2P titles
+    if (tryGroup(m_deterministic_fp))
         return;
     if (tryGroup(m_gpu))
         return;
@@ -300,6 +305,11 @@ bool EmulatorSettingsImpl::Save(const std::string& serial) {
             SaveGroupGameSpecific(m_windows_guest_red_zone_protection,
                                   windowsGuestRedZoneProtectionObj);
             j["WindowsGuestRedZoneProtection"] = windowsGuestRedZoneProtectionObj;
+
+            // Deterministic floating point for lockstep P2P titles
+            json deterministicFpObj = json::object();
+            SaveGroupGameSpecific(m_deterministic_fp, deterministicFpObj);
+            j["DeterministicFp"] = deterministicFpObj;
 
             json gpuObj = json::object();
             SaveGroupGameSpecific(m_gpu, gpuObj);
@@ -477,6 +487,9 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
             if (gj.contains("WindowsGuestRedZoneProtection"))
                 ApplyGroupOverrides(m_windows_guest_red_zone_protection,
                                     gj.at("WindowsGuestRedZoneProtection"), changed);
+            // Deterministic floating point for lockstep P2P titles
+            if (gj.contains("DeterministicFp"))
+                ApplyGroupOverrides(m_deterministic_fp, gj.at("DeterministicFp"), changed);
             if (gj.contains("GPU"))
                 ApplyGroupOverrides(m_gpu, gj.at("GPU"), changed);
             if (gj.contains("Vulkan"))
@@ -500,6 +513,8 @@ void EmulatorSettingsImpl::SetDefaultValues() {
     m_audio = AudioSettings{};
     // Windows static guest red-zone protection
     m_windows_guest_red_zone_protection = WindowsGuestRedZoneProtectionSettings{};
+    // Deterministic floating point for lockstep P2P titles
+    m_deterministic_fp = DeterministicFpSettings{};
     m_gpu = GPUSettings{};
     m_vulkan = VulkanSettings{};
 }
@@ -760,6 +775,8 @@ std::vector<std::string> EmulatorSettingsImpl::GetAllOverrideableKeys() const {
     addGroup(m_audio.GetOverrideableFields());
     // Windows static guest red-zone protection
     addGroup(m_windows_guest_red_zone_protection.GetOverrideableFields());
+    // Deterministic floating point for lockstep P2P titles
+    addGroup(m_deterministic_fp.GetOverrideableFields());
     addGroup(m_gpu.GetOverrideableFields());
     addGroup(m_vulkan.GetOverrideableFields());
     return keys;
