@@ -149,8 +149,18 @@ jobs:
     needs: get-info
     steps:
     - uses: actions/checkout@v6
-      with:
-        submodules: recursive
+    - name: Init submodules
+      shell: bash
+      run: |
+        set -e
+        for attempt in 1 2 3 4; do
+          if git submodule update --init --recursive; then
+            exit 0
+          fi
+          echo "submodule fetch failed (attempt ${attempt}), retrying..."
+          sleep $((attempt * 15))
+        done
+        exit 1
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5
@@ -191,8 +201,17 @@ jobs:
     needs: get-info
     steps:
     - uses: actions/checkout@v6
-      with:
-        submodules: recursive
+    - name: Init submodules
+      run: |
+        set -e
+        for attempt in 1 2 3 4; do
+          if git submodule update --init --recursive; then
+            exit 0
+          fi
+          echo "submodule fetch failed (attempt ${attempt}), retrying..."
+          sleep $((attempt * 15))
+        done
+        exit 1
 
     - name: Setup latest Xcode
       uses: maxim-lobanov/setup-xcode@v1
@@ -204,7 +223,15 @@ jobs:
         brew install cmake meson pkg-config llvm spirv-tools spirv-llvm-translator libclc
         pip3 install --break-system-packages mako packaging pyyaml
         echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
-        echo "PKG_CONFIG_PATH=$(brew --prefix libclc)/share/pkgconfig:$(brew --prefix llvm)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+        LIBCLC_PC="$(find "$(brew --prefix libclc)" "$(brew --prefix llvm)" -name libclc.pc 2>/dev/null | head -n 1)"
+        if [ -n "$LIBCLC_PC" ]; then
+          echo "PKG_CONFIG_PATH=$(dirname "$LIBCLC_PC"):$(brew --prefix llvm)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+        else
+          echo "Homebrew libclc bottle has no libclc.pc; rebuilding from source"
+          brew reinstall --build-from-source libclc
+          echo "PKG_CONFIG_PATH=$(brew --prefix libclc)/share/pkgconfig:$(brew --prefix llvm)/lib/pkgconfig:${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
+        fi
+        pkg-config --modversion libclc
 
     - name: Cache CMake Configuration
       uses: actions/cache@v5

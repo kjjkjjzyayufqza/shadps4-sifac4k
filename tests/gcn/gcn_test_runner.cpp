@@ -143,7 +143,13 @@ void Runner::DestroyInstance() {
 }
 
 std::expected<void, ErrorInfo> Runner::initialize() {
-    VULKAN_HPP_DEFAULT_DISPATCHER.init();
+    static vk::detail::DynamicLoader loader;
+    const auto get_instance_proc_addr =
+        loader.getProcAddress<PFN_vkGetInstanceProcAddr>("vkGetInstanceProcAddr");
+    if (!get_instance_proc_addr) {
+        return make_error(Error::InstanceCreationFailed, "Vulkan loader not found");
+    }
+    VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
     // ---- Instance ------------------------------------------------------
     vk::ApplicationInfo app_info{
