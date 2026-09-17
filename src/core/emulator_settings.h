@@ -261,8 +261,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    extra_dmem_in_mbytes, extra_fmem_in_mbytes, shad_net_enabled,
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
                                    trophy_notification_side, connected_to_network,
-                                   network_interface_address, loopback_broadcast_peers,
-                                   p2p_port,
+                                   network_interface_address, loopback_broadcast_peers, p2p_port,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
                                    signaling_info, enable_upnp)
@@ -434,10 +433,9 @@ struct DeterministicFpSettings {
     Setting<bool> deterministic_floating_point{false};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
-        return std::vector<OverrideItem>{
-            make_override<DeterministicFpSettings>("deterministic_floating_point",
-                                                   &DeterministicFpSettings::
-                                                       deterministic_floating_point)};
+        return std::vector<OverrideItem>{make_override<DeterministicFpSettings>(
+            "deterministic_floating_point",
+            &DeterministicFpSettings::deterministic_floating_point)};
     }
 };
 

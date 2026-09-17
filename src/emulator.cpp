@@ -29,8 +29,8 @@
 #include "common/scm_rev.h"
 #include "common/singleton.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
-#include "core/deterministic_fp_report.h"
 #include "core/debugger.h"
+#include "core/deterministic_fp_report.h"
 #include "core/devtools/widget/module_list.h"
 #include "core/emulator_settings.h"
 #include "core/emulator_state.h"

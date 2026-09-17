@@ -110,7 +110,8 @@ std::unique_ptr<Runner> g_runner;
 
 Runner::~Runner() {
     if (device_) {
-        device_.waitIdle();
+        // Use the C entry point. The enhanced waitIdle() wrapper asserts on failure.
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkDeviceWaitIdle(static_cast<VkDevice>(device_));
         if (fence_)
             device_.destroyFence(fence_);
         if (pipeline_layout_)
@@ -163,11 +164,14 @@ std::expected<void, ErrorInfo> Runner::initialize() {
         }
     }
 
-    auto [ir, inst] = vk::createInstance({
+    const vk::InstanceCreateInfo instance_ci{
         .pApplicationInfo = &app_info,
         .enabledLayerCount = static_cast<std::uint32_t>(layers.size()),
         .ppEnabledLayerNames = layers.data(),
-    });
+    };
+    vk::Instance inst{};
+    // Pointer overload returns VkResult. The enhanced wrapper asserts on failure.
+    const auto ir = vk::createInstance(&instance_ci, nullptr, &inst);
     if (ir != vk::Result::eSuccess)
         return make_error(Error::InstanceCreationFailed,
                           std::format("createInstance: {}", vk::to_string(ir)));
@@ -243,14 +247,16 @@ std::expected<void, ErrorInfo> Runner::initialize() {
         .shaderInt16 = VK_TRUE,
     };
 
-    auto [dr, dev] = physical_device_.createDevice({
+    const vk::DeviceCreateInfo device_ci{
         .pNext = &v12_feat,
         .queueCreateInfoCount = 1,
         .pQueueCreateInfos = &qci,
-        .enabledExtensionCount = required_exts.size(),
+        .enabledExtensionCount = static_cast<std::uint32_t>(required_exts.size()),
         .ppEnabledExtensionNames = required_exts.data(),
         .pEnabledFeatures = &phys_feat,
-    });
+    };
+    vk::Device dev{};
+    const auto dr = physical_device_.createDevice(&device_ci, nullptr, &dev);
     if (dr != vk::Result::eSuccess)
         return make_error(Error::DeviceCreationFailed,
                           std::format("createDevice: {}", vk::to_string(dr)));
@@ -356,11 +362,11 @@ std::expected<void, ErrorInfo> Runner::run_raw(std::span<const std::uint32_t> sp
         .pushConstantRangeCount = push_constants.empty() ? 0u : 1u,
         .pPushConstantRanges = push_constants.empty() ? nullptr : &shader_pc,
     };
-    auto [sr, shaders] = device_.createShadersEXT(sci);
+    vk::ShaderEXT shader{};
+    const auto sr = device_.createShadersEXT(1, &sci, nullptr, &shader);
     if (sr != vk::Result::eSuccess)
         return make_error(Error::ShaderCreationFailed,
                           std::format("createShadersEXT: {}", vk::to_string(sr)));
-    auto shader = shaders[0];
     struct ShaderGuard {
         vk::Device d;
         vk::ShaderEXT s;
@@ -371,8 +377,12 @@ std::expected<void, ErrorInfo> Runner::run_raw(std::span<const std::uint32_t> sp
     } sg{device_, shader};
 
     // Reset cached command buffer + fence --------------------------------
-    device_.resetFences(fence_);
-    command_buffer_.reset();
+    // Count/pointer overloads return VkResult. Enhanced wrappers assert on failure.
+    if (device_.resetFences(1, &fence_) != vk::Result::eSuccess)
+        return make_error(Error::CommandSubmissionFailed, "resetFences");
+    if (VULKAN_HPP_DEFAULT_DISPATCHER.vkResetCommandBuffer(
+            static_cast<VkCommandBuffer>(command_buffer_), 0) != VK_SUCCESS)
+        return make_error(Error::CommandSubmissionFailed, "cmd.reset");
 
     if (command_buffer_.begin({
             .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,

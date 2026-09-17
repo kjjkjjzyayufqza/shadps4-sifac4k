@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
+SPDX-License-Identifier: GPL-2.0-or-later
+-->
+
 # Deterministic Floating Point for Lockstep P2P Titles (GVS / MBON)
 
 Status: layers A and B are implemented, tested, and at full instruction coverage on both

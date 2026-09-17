@@ -4,12 +4,12 @@
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "common/memory_patcher.h"
 #include "common/sha1.h"
 #include "common/string_util.h"
 #include "core/aerolib/aerolib.h"
-#include "common/elf_info.h"
 #include "core/branch_targets.h"
 #include "core/cpu_patches.h"
 #include "core/libraries/error_codes.h"
@@ -200,10 +200,9 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
     // Targets recovered offline, for functions whose indirect jumps the pass cannot
     // resolve on its own. Absent for most modules, and absence only costs coverage.
     const auto verified_branch_targets =
-        apply_static_rewrites
-            ? VerifiedBranchTargets::Load(VerifiedBranchTargets::PathForModule(
-                  Common::ElfInfo::Instance().GameSerial(), name))
-            : VerifiedBranchTargets{};
+        apply_static_rewrites ? VerifiedBranchTargets::Load(VerifiedBranchTargets::PathForModule(
+                                    Common::ElfInfo::Instance().GameSerial(), name))
+                              : VerifiedBranchTargets{};
 #endif
     for (u16 i = 0; i < elf_header.e_phnum; i++) {
         const auto header_type = elf.ElfPheaderTypeStr(elf_pheader[i].p_type);
@@ -375,8 +374,7 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                              "[FPDIAG] coverage for {} is incomplete: {} of {} estimate "
                              "sites still execute vendor-defined results. Lockstep netplay with "
                              "this module will desync.",
-                             name, unsupported_fp_approximation_count,
-                             fp_approximation_site_count);
+                             name, unsupported_fp_approximation_count, fp_approximation_site_count);
                 LOG_CRITICAL(Core_Linker,
                              "[FPDIAG] shortfall for {}: {} unexpressible operand "
                              "shapes, {} in functions with branch tables, {} with no "

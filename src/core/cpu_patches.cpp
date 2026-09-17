@@ -23,8 +23,8 @@
 #include "common/decoder.h"
 #include "common/signal_context.h"
 #include "common/types.h"
-#include "core/signals.h"
 #include "core/cpu_patches_fp.h"
+#include "core/signals.h"
 #include "core/tls.h"
 #include "cpu_patches.h"
 
@@ -1198,7 +1198,7 @@ DecodedCodeInstruction DecodeCodeInstruction(uintptr_t address, uintptr_t end) {
         const s64 access_start = operand.mem.disp.value;
         const s64 access_size = std::max<s64>(operand.size / 8, 1);
         const s64 range_start = std::max(access_start, -static_cast<s64>(GuestRedZoneSize));
-        const s64 range_end = std::min(access_start + access_size, 0LL);
+        const s64 range_end = std::min<s64>(access_start + access_size, 0);
         for (s64 offset = range_start; offset < range_end; ++offset) {
             const size_t bit = static_cast<size_t>(offset + static_cast<s64>(GuestRedZoneSize));
             if ((operand.actions & ZYDIS_OPERAND_ACTION_MASK_READ) != 0) {
@@ -1778,8 +1778,7 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
                         "[FPDIAG] unpatched module+{:#x} {} len={} bytes={} function+{:#x} "
                         "reason={}",
                         site - module_base, ZydisMnemonicGetString(decoded.instruction.mnemonic),
-                        decoded.instruction.length, encoding, function_start - module_base,
-                        reason);
+                        decoded.instruction.length, encoding, function_start - module_base, reason);
         };
         if (protect_red_zone) {
             AnalyzeRedZoneLiveness(function);

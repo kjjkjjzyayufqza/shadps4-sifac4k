@@ -165,7 +165,7 @@ inline std::optional<std::vector<u32>> ParseLoopbackPeers(u32 local_address,
 std::optional<Ipv4Interface> ResolveIpv4Interface(std::string_view address);
 
 inline std::optional<std::vector<u32>> ParseLoopbackPeerList(u32 local_address,
-                                                           std::string_view list) {
+                                                             std::string_view list) {
     std::vector<std::string> peers;
     while (!list.empty()) {
         const auto comma = list.find(',');

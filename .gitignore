@@ -422,6 +422,10 @@ cmake-build-*
 # Nix Result symlink
 result
 
+# Local Windows helper scripts with machine-specific toolchain paths.
+/build-debug.bat
+/build-release.bat
+
 # Prebuilt FFmpeg dropped in by hand. The supported path is the
 # externals/ffmpeg-core submodule; these are build artifacts, not sources.
 /externals/ffmpeg-[0-9a-f]*/

@@ -51,14 +51,10 @@ namespace Core::DeterministicFp {
 /// operand width.
 ///
 /// Operands must satisfy IsSupportedOperandShape; anything else throws Xbyak::Error.
-void GenerateVRCPPS(void* address, const ZydisDecodedOperand* operands,
-                    Xbyak::CodeGenerator& c);
-void GenerateVRCPSS(void* address, const ZydisDecodedOperand* operands,
-                    Xbyak::CodeGenerator& c);
-void GenerateVRSQRTPS(void* address, const ZydisDecodedOperand* operands,
-                      Xbyak::CodeGenerator& c);
-void GenerateVRSQRTSS(void* address, const ZydisDecodedOperand* operands,
-                      Xbyak::CodeGenerator& c);
+void GenerateVRCPPS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
+void GenerateVRCPSS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
+void GenerateVRSQRTPS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
+void GenerateVRSQRTSS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
 void GenerateRCPPS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
 void GenerateRCPSS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
 void GenerateRSQRTPS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);

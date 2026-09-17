@@ -247,8 +247,7 @@ void LogCpuIdentity() {
     LOG_INFO(Core, "[{}] host.cpu.brand={}", Tag, brand);
     LOG_INFO(Core, "[{}] host.cpu.family={:#x} model={:#x}", Tag, cpu.displayFamily,
              cpu.displayModel);
-    LOG_INFO(Core,
-             "[{}] host.cpu.features sse4a={} avx={} avx2={} fma={} f16c={} avx512f={}", Tag,
+    LOG_INFO(Core, "[{}] host.cpu.features sse4a={} avx={} avx2={} fma={} f16c={} avx512f={}", Tag,
              cpu.has(Xbyak::util::Cpu::tSSE4a), cpu.has(Xbyak::util::Cpu::tAVX),
              cpu.has(Xbyak::util::Cpu::tAVX2), cpu.has(Xbyak::util::Cpu::tFMA),
              cpu.has(Xbyak::util::Cpu::tF16C), cpu.has(Xbyak::util::Cpu::tAVX512F));
@@ -294,9 +293,8 @@ u64 LogInstructionProbes() {
         }
     }
 
-    LOG_INFO(Core,
-             "[{}] estimate.fingerprint={:016X} (expected to differ between Intel and AMD)", Tag,
-             estimate_fingerprint);
+    LOG_INFO(Core, "[{}] estimate.fingerprint={:016X} (expected to differ between Intel and AMD)",
+             Tag, estimate_fingerprint);
     LOG_INFO(Core,
              "[{}] replacement.fingerprint={:016X} (MUST match on every host; a mismatch here "
              "is the bug)",
@@ -379,10 +377,8 @@ u64 LogHostLibmProbes() {
         const u32 atan2_result = CallHostLibm2(atan2f, input, 0x3F800000);
         HashBits(fingerprint, (static_cast<u64>(input) << 32) | pow_result);
         HashBits(fingerprint, (static_cast<u64>(input) << 32) | atan2_result);
-        LOG_INFO(Core, "[{}] libm powf in={:08X} exp=40490FDB out={:08X}", Tag, input,
-                 pow_result);
-        LOG_INFO(Core, "[{}] libm atan2f y={:08X} x=3F800000 out={:08X}", Tag, input,
-                 atan2_result);
+        LOG_INFO(Core, "[{}] libm powf in={:08X} exp=40490FDB out={:08X}", Tag, input, pow_result);
+        LOG_INFO(Core, "[{}] libm atan2f y={:08X} x=3F800000 out={:08X}", Tag, input, atan2_result);
     }
 
     LOG_INFO(Core,

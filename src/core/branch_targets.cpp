@@ -98,8 +98,8 @@ VerifiedBranchTargets VerifiedBranchTargets::Load(const std::filesystem::path& p
     std::string line;
 
     const auto reject = [&](std::string_view reason) {
-        LOG_ERROR(Core, "Branch target file {} rejected at line {}: {}", path.string(),
-                  line_number, reason);
+        LOG_ERROR(Core, "Branch target file {} rejected at line {}: {}", path.string(), line_number,
+                  reason);
         return VerifiedBranchTargets{};
     };
 

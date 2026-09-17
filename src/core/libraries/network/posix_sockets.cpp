@@ -355,8 +355,8 @@ int PosixSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetS
         const auto configured_peers = EmulatorSettings.GetLoopbackBroadcastPeers();
         if (socket_family == AF_INET && socket_type == ORBIS_NET_SOCK_DGRAM && selected &&
             !configured_peers.empty()) {
-            const auto iface =
-                Common::Network::ResolveIpv4Interface(EmulatorSettings.GetNetworkInterfaceAddress());
+            const auto iface = Common::Network::ResolveIpv4Interface(
+                EmulatorSettings.GetNetworkInterfaceAddress());
             const u32 netmask = iface ? iface->netmask : 0;
             const u32 destination = ntohl(ipv4.sin_addr.s_addr);
             if (Common::Network::ShouldFanoutBroadcast(*selected, netmask, destination)) {
@@ -373,8 +373,8 @@ int PosixSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetS
                 } else {
                     int enabled{};
                     socklen_t enabled_size = sizeof(enabled);
-                    if (getsockopt(sock, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<char*>(&enabled),
-                                   &enabled_size) != 0) {
+                    if (getsockopt(sock, SOL_SOCKET, SO_BROADCAST,
+                                   reinterpret_cast<char*>(&enabled), &enabled_size) != 0) {
                         return ConvertReturnErrorCode(-1);
                     }
                     if (!enabled) {
@@ -391,9 +391,8 @@ int PosixSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetS
                     }
                     for (const auto peer : *peers) {
                         ipv4.sin_addr.s_addr = htonl(peer);
-                        const int result =
-                            sendto(sock, static_cast<const char*>(msg), len, posix_flags, &addr,
-                                   sizeof(sockaddr_in));
+                        const int result = sendto(sock, static_cast<const char*>(msg), len,
+                                                  posix_flags, &addr, sizeof(sockaddr_in));
                         if (result >= 0) {
                             sent = result;
                         }

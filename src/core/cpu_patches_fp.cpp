@@ -511,8 +511,7 @@ void GenerateRSQRTSS(void* address, const ZydisDecodedOperand* operands, Xbyak::
     const int dst_index = VectorRegisterIndex(operands[0].reg.value);
 
     const Xbyak::Xmm dst{dst_index};
-    const Xbyak::Xmm scratch{
-        PickScratchIndex(dst_index, SourceRegisterIndex(operands[1]), -1)};
+    const Xbyak::Xmm scratch{PickScratchIndex(dst_index, SourceRegisterIndex(operands[1]), -1)};
 
     SpillScratchLegacy(c, scratch);
     const SourceOperand src{operands[1], false, SpillDisplacement, address};
@@ -529,8 +528,7 @@ void GenerateRCPSS(void* address, const ZydisDecodedOperand* operands, Xbyak::Co
     const int dst_index = VectorRegisterIndex(operands[0].reg.value);
 
     const Xbyak::Xmm dst{dst_index};
-    const Xbyak::Xmm scratch{
-        PickScratchIndex(dst_index, SourceRegisterIndex(operands[1]), -1)};
+    const Xbyak::Xmm scratch{PickScratchIndex(dst_index, SourceRegisterIndex(operands[1]), -1)};
 
     SpillScratchLegacy(c, scratch);
     const SourceOperand src{operands[1], false, SpillDisplacement, address};

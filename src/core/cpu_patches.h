@@ -84,9 +84,9 @@ struct StaticRewriteResult {
 
     // Why the unsupported ones were left behind. Closing the gap needs a different fix for
     // each, so they are separated rather than summed.
-    u64 fp_unsupported_operand_shape_count{};    ///< no faithful replacement for the operands
-    u64 fp_unsupported_indirect_branch_count{};  ///< function has an unresolvable branch table
-    u64 fp_unsupported_unrelocatable_count{};    ///< no span or relay could reach the site
+    u64 fp_unsupported_operand_shape_count{};   ///< no faithful replacement for the operands
+    u64 fp_unsupported_indirect_branch_count{}; ///< function has an unresolvable branch table
+    u64 fp_unsupported_unrelocatable_count{};   ///< no span or relay could reach the site
 
     /// Functions whose target set an external analysis vouched for, letting the pass
     /// borrow neighbouring instructions where it would otherwise have refused.
