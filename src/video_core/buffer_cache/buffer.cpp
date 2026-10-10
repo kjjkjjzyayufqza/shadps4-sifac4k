@@ -64,7 +64,7 @@ UniqueBuffer::UniqueBuffer(vk::Device device_, VmaAllocator allocator_)
 
 UniqueBuffer::~UniqueBuffer() {
     if (buffer) {
-        LOG_WARNING(Render, "Destroying buffer bda_addr={:#x}, {}", u64(bda_addr), name);
+        LOG_DEBUG(Render, "Destroying buffer bda_addr={:#x}, {}", u64(bda_addr), name);
         vmaDestroyBuffer(allocator, buffer, allocation);
     }
 }

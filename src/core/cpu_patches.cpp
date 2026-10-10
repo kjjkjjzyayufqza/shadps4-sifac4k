@@ -12,6 +12,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 #include <Zydis/Zydis.h>
@@ -1418,10 +1419,15 @@ std::optional<std::vector<uintptr_t>> ResolveBoundedJumpTable(
     return resolved_targets;
 }
 
+/// Decodes the body reachable from its entry and from `extra_roots`, each of which must be
+/// an address control flow is known to enter. The entry sits on top of the stack, so the
+/// entry-rooted walk runs first and the extra roots only add what it could not reach.
 DecodedFunction DecodeFunction(uintptr_t function_start, uintptr_t function_end,
-                               uintptr_t segment_start, uintptr_t segment_end) {
+                               uintptr_t segment_start, uintptr_t segment_end,
+                               const std::set<uintptr_t>& extra_roots) {
     DecodedFunction function;
-    std::vector<uintptr_t> blocks{function_start};
+    std::vector<uintptr_t> blocks(extra_roots.rbegin(), extra_roots.rend());
+    blocks.push_back(function_start);
     std::unordered_set<uintptr_t> visited;
     std::set<uintptr_t> indirect_branches;
     std::set<uintptr_t> resolved_indirect_branches;
@@ -1673,33 +1679,33 @@ bool IsInPlaceMemoryPatch(ZydisMnemonic mnemonic) {
     return mnemonic == ZYDIS_MNEMONIC_MOVNTSS || mnemonic == ZYDIS_MNEMONIC_MOVNTSD;
 }
 
-/// Adopts an external target set for a function, but only when every instruction the pass
-/// decoded falls inside an entry the file vouches for. One instruction outside them leaves
-/// part of the body unaccounted for, and borrowing there is exactly what has to stay
-/// forbidden.
+/// Every entry of the file that contains a decoded instruction, or nothing when some decoded
+/// instruction lies outside every entry. One instruction outside them leaves part of the body
+/// unaccounted for, and borrowing there is exactly what has to stay forbidden.
 ///
 /// More than one entry can be needed. A disassembler partitions code into functions by its
 /// own rules, and the module's unwind metadata partitions it by the compiler's, so a body
-/// the pass walks may span several entries. Where it does, each entry start inside the body
-/// is itself reachable from outside and is recorded as a target, so no borrowed range can
-/// straddle one.
-void MergeVerifiedTargets(DecodedFunction& function, uintptr_t module_base,
-                          const VerifiedBranchTargets* verified, u64& verified_function_count) {
-    if (verified == nullptr || function.instructions.empty()) {
-        return;
-    }
-
+/// the pass walks may span several entries.
+std::optional<std::vector<const VerifiedBranchTargets::Function*>> FindVerifiedCover(
+    const DecodedFunction& function, uintptr_t module_base, const VerifiedBranchTargets& verified) {
     std::vector<const VerifiedBranchTargets::Function*> cover;
     for (const auto& [address, decoded] : function.instructions) {
-        const auto* entry = verified->FindContaining(address - module_base);
+        const auto* entry = verified.FindContaining(address - module_base);
         if (entry == nullptr) {
-            return;
+            return std::nullopt;
         }
         if (std::ranges::find(cover, entry) == cover.end()) {
             cover.push_back(entry);
         }
     }
+    return cover;
+}
 
+/// Adopts the target sets of the entries covering a function. Where a body spans several
+/// entries, each entry start inside it is itself reachable from outside and is recorded as a
+/// target, so no borrowed range can straddle one.
+void AdoptVerifiedTargets(DecodedFunction& function, uintptr_t module_base,
+                          std::span<const VerifiedBranchTargets::Function* const> cover) {
     const uintptr_t decoded_start = function.instructions.begin()->first;
     for (const auto* entry : cover) {
         for (const u64 target : entry->targets) {
@@ -1711,7 +1717,156 @@ void MergeVerifiedTargets(DecodedFunction& function, uintptr_t module_base,
         }
     }
     function.targets_verified = true;
-    ++verified_function_count;
+}
+
+/// Instruction starts of a linear decode of [start, end), up to the first byte that does not
+/// decode. The titles' compiler keeps data out of function code and pads between functions
+/// with nop and int3, so over the range a walk may decode this agrees with the walk; an
+/// address it does not list cannot be confirmed as an instruction start.
+std::vector<uintptr_t> LinearInstructionStarts(uintptr_t start, uintptr_t end) {
+    std::vector<uintptr_t> starts;
+    ZydisDecodedInstruction instruction;
+    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+    for (uintptr_t address = start; address < end; address += instruction.length) {
+        if (!ZYAN_SUCCESS(Common::Decoder::Instance()->decodeInstruction(
+                instruction, operands, reinterpret_cast<void*>(address), end - address))) {
+            break;
+        }
+        starts.push_back(address);
+    }
+    return starts;
+}
+
+struct WidenedFunction {
+    DecodedFunction function;
+    std::vector<const VerifiedBranchTargets::Function*> cover;
+};
+
+/// Decodes further from the targets the file names inside a body the entry-rooted walk has
+/// already been vouched for.
+///
+/// The walk follows only the edges it can prove from the entry, so a block reachable only
+/// through a jump table it cannot parse is never decoded, and an estimate there is never
+/// replaced. The file names every address control flow can enter, those case blocks
+/// included, so each one becomes a further starting point until no new one appears.
+///
+/// The file is a disassembler's analysis, and one misread table puts targets in the middle of
+/// instructions; as mere borrowing guards those cost nothing, but decoding from one would
+/// invent instructions over real ones. So a target is a starting point only if the linear
+/// decode of the function's range starts an instruction there, and the widened walk is kept
+/// only if every instruction it holds is one the linear decode agrees with and the file still
+/// covers all of it. Otherwise nothing is returned and the entry-rooted walk stands as it
+/// always did.
+std::optional<WidenedFunction> WidenWithVerifiedTargets(
+    const DecodedFunction& entry_rooted, std::vector<const VerifiedBranchTargets::Function*> cover,
+    uintptr_t function_start, uintptr_t function_end, uintptr_t segment_start,
+    uintptr_t segment_end, uintptr_t module_base, const VerifiedBranchTargets& verified) {
+    const auto instruction_starts = LinearInstructionStarts(function_start, function_end);
+    const auto is_instruction_start = [&instruction_starts](uintptr_t address) {
+        return std::ranges::binary_search(instruction_starts, address);
+    };
+
+    std::set<uintptr_t> roots;
+    std::optional<DecodedFunction> widened;
+    while (true) {
+        const DecodedFunction& current = widened ? *widened : entry_rooted;
+        bool found_new_root = false;
+        for (const auto* entry : cover) {
+            for (const u64 target : entry->targets) {
+                const uintptr_t address = module_base + target;
+                if (address >= function_start && address < function_end &&
+                    !current.instructions.contains(address) && is_instruction_start(address) &&
+                    roots.insert(address).second) {
+                    found_new_root = true;
+                }
+            }
+        }
+        if (!found_new_root) {
+            break;
+        }
+
+        widened = DecodeFunction(function_start, function_end, segment_start, segment_end, roots);
+        auto widened_cover = FindVerifiedCover(*widened, module_base, verified);
+        if (!widened_cover ||
+            !std::ranges::all_of(widened->instructions, [&](const auto& instruction) {
+                return is_instruction_start(instruction.first);
+            })) {
+            return std::nullopt;
+        }
+        cover = std::move(*widened_cover);
+    }
+    if (!widened) {
+        return std::nullopt;
+    }
+    return WidenedFunction{.function = std::move(*widened), .cover = std::move(cover)};
+}
+
+/// Decodes a body, and where an external analysis vouches for it, adopts the analysis's
+/// targets. With `widen`, it also decodes the parts the entry-rooted walk could not reach;
+/// only deterministic floating point asks for that, since an estimate hidden there is exactly
+/// what it exists to find.
+DecodedFunction DecodeFunctionWithVerifiedTargets(uintptr_t function_start, uintptr_t function_end,
+                                                  bool widen, uintptr_t segment_start,
+                                                  uintptr_t segment_end, uintptr_t module_base,
+                                                  const VerifiedBranchTargets* verified,
+                                                  StaticRewriteResult& result) {
+    auto function = DecodeFunction(function_start, function_end, segment_start, segment_end, {});
+    if (verified == nullptr || function.instructions.empty()) {
+        return function;
+    }
+    auto cover = FindVerifiedCover(function, module_base, *verified);
+    if (!cover) {
+        return function;
+    }
+
+    if (widen) {
+        if (auto widened =
+                WidenWithVerifiedTargets(function, *cover, function_start, function_end,
+                                         segment_start, segment_end, module_base, *verified)) {
+            function = std::move(widened->function);
+            cover = std::move(widened->cover);
+            ++result.verified_extended_function_count;
+        }
+    }
+    AdoptVerifiedTargets(function, module_base, *cover);
+    ++result.verified_target_function_count;
+    return function;
+}
+
+/// Finds estimates in the bytes of a body the walk never decoded. Each gap between decoded
+/// instructions is decoded linearly, and the sweep stops at the next decoded instruction so
+/// that a misaligned guess can never run into code whose boundaries are known. Nothing found
+/// here is patched: its neighbours' boundaries and the targets around it are unknown. It is
+/// reported, because an estimate nobody counted still executes vendor-defined results.
+std::vector<DecodedCodeInstruction> FindUndecodedApproximations(const DecodedFunction& function,
+                                                                uintptr_t sweep_start,
+                                                                uintptr_t sweep_end) {
+    std::vector<DecodedCodeInstruction> found;
+    auto next_decoded = function.instructions.lower_bound(sweep_start);
+    uintptr_t address = sweep_start;
+    while (address < sweep_end) {
+        while (next_decoded != function.instructions.end() && next_decoded->first < address) {
+            ++next_decoded;
+        }
+        if (next_decoded != function.instructions.end() && next_decoded->first == address) {
+            address += next_decoded->second.instruction.length;
+            ++next_decoded;
+            continue;
+        }
+        const uintptr_t gap_end = next_decoded != function.instructions.end()
+                                      ? std::min(next_decoded->first, sweep_end)
+                                      : sweep_end;
+        const auto decoded = DecodeCodeInstruction(address, gap_end);
+        if (decoded.instruction.length == 0) {
+            ++address;
+            continue;
+        }
+        if (DeterministicFp::IsApproximationMnemonic(decoded.instruction.mnemonic)) {
+            found.push_back(decoded);
+        }
+        address += decoded.instruction.length;
+    }
+    return found;
 }
 
 const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
@@ -1728,8 +1883,21 @@ const PatchInfo* FindMatchingPatch(const DecodedCodeInstruction& decoded) {
 
 } // namespace
 
+void PumpLoaderThread() {
+#ifdef _WIN32
+    static const bool ghosting_disabled = [] {
+        DisableProcessWindowsGhosting();
+        return true;
+    }();
+    (void)ghosting_disabled;
+    MSG msg{};
+    PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE);
+#endif
+}
+
 StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
                                         std::span<const uintptr_t> function_starts,
+                                        std::span<const Dwarf::FunctionBody> function_bodies,
                                         StaticRewriteReason reasons,
                                         const VerifiedBranchTargets* verified) {
     StaticRewriteResult result{};
@@ -1754,8 +1922,29 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
     const auto unique_end = std::ranges::unique(starts).begin();
     starts.erase(unique_end, starts.end());
 
+    // Where each body's code ends, for the search that finds estimates the walk never
+    // reached. The next body's start is no substitute: data can sit between two bodies.
+    std::unordered_map<uintptr_t, uintptr_t> body_ends;
+    if (replace_fp_approximations) {
+        body_ends.reserve(function_bodies.size());
+        for (const auto& body : function_bodies) {
+            auto& end = body_ends[body.start];
+            end = std::max(end, body.end);
+        }
+    }
+
     std::unique_lock lock{module->mutex};
+    if (replace_fp_approximations) {
+        // Before the first site, so the pool sits below every offset a failed trampoline
+        // attempt can rewind to. Emitted lazily it could land inside such an attempt and
+        // be handed to the next trampoline, leaving every later replacement reading its
+        // "1.0" out of code.
+        DeterministicFp::ReserveConstantPool(module->trampoline_gen);
+    }
     for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
+        if ((function_index & 0xff) == 0) {
+            PumpLoaderThread();
+        }
         const uintptr_t function_start = starts[function_index];
         const uintptr_t function_end =
             function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
@@ -1764,9 +1953,9 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
         }
 
         ++result.function_count;
-        auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
-        MergeVerifiedTargets(function, module_base, verified,
-                             result.verified_target_function_count);
+        auto function = DecodeFunctionWithVerifiedTargets(
+            function_start, function_end, replace_fp_approximations, segment_addr, segment_end,
+            module_base, verified, result);
         const auto report_unpatched_site = [&](uintptr_t site,
                                                const DecodedCodeInstruction& decoded,
                                                const char* reason) {
@@ -1774,12 +1963,34 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
             for (u8 index = 0; index < decoded.instruction.length; ++index) {
                 encoding += fmt::format("{:02X}", *reinterpret_cast<const u8*>(site + index));
             }
-            LOG_WARNING(Core,
-                        "[FPDIAG] unpatched module+{:#x} {} len={} bytes={} function+{:#x} "
-                        "reason={}",
-                        site - module_base, ZydisMnemonicGetString(decoded.instruction.mnemonic),
-                        decoded.instruction.length, encoding, function_start - module_base, reason);
+            // Per-site lines are for working through a shortfall from a log. They must
+            // not be WARNING: a lockstep eboot can have hundreds of them, and a synced
+            // log plus a color console will stall the loader thread long enough that
+            // the window looks frozen.
+            LOG_DEBUG(Core,
+                      "[FPDIAG] unpatched module+{:#x} {} len={} bytes={} function+{:#x} "
+                      "reason={}",
+                      site - module_base, ZydisMnemonicGetString(decoded.instruction.mnemonic),
+                      decoded.instruction.length, encoding, function_start - module_base, reason);
         };
+        if (replace_fp_approximations) {
+            // The walk below only sees what was decoded, so without this search an estimate
+            // in an unreached block would be missing from every count, and a coverage line
+            // reporting nothing unsupported would still leave it executing.
+            const auto body_end = body_ends.find(function_start);
+            if (body_end == body_ends.end()) {
+                ++result.fp_unmeasured_function_count;
+            } else {
+                const uintptr_t sweep_end = std::min(body_end->second, function_end);
+                for (const auto& undecoded :
+                     FindUndecodedApproximations(function, function_start, sweep_end)) {
+                    ++result.fp_approximation_site_count;
+                    ++result.unsupported_fp_approximation_count;
+                    ++result.fp_unsupported_undecoded_count;
+                    report_unpatched_site(undecoded.address, undecoded, "undecoded");
+                }
+            }
+        }
         if (protect_red_zone) {
             AnalyzeRedZoneLiveness(function);
         }
@@ -1810,7 +2021,13 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
                 }
                 decoded = DecodeCodeInstruction(address, function_end);
                 decoded.accesses_memory = false;
-            } else if (matching_patch != nullptr && matching_patch->trampoline) {
+            } else if (matching_patch != nullptr && matching_patch->trampoline &&
+                       (protect_red_zone || is_fp_approximation)) {
+                // A short non-FP patch site is only relocated when red-zone protection
+                // asked for it. Relocating one borrows bytes from its neighbours, and
+                // deterministic floating point is no reason to take that on: without this
+                // pass those sites are emulated from the illegal-instruction handler,
+                // which is what every title not running the rewrite already does.
                 rewrite_sites.emplace(address,
                                       InstructionRewrite{.cpu_patch = matching_patch,
                                                          .fp_approximation = is_fp_approximation});
@@ -1929,6 +2146,12 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
                     ++result.patched_cpu_patch_instruction_count;
                     if (rewrite->second.fp_approximation) {
                         ++result.patched_fp_approximation_count;
+                        if (span.instructions.size() > 1) {
+                            ++result.fp_borrowed_neighbour_count;
+                            if (!function.targets_verified) {
+                                ++result.fp_borrowed_unverified_count;
+                            }
+                        }
                     }
                 }
                 module->patched.insert(reinterpret_cast<u8*>(decoded->address));
@@ -2310,7 +2533,7 @@ StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
 // Windows static guest red-zone protection
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
-    return ApplyStaticRewrites(segment_addr, segment_size, function_starts,
+    return ApplyStaticRewrites(segment_addr, segment_size, function_starts, {},
                                StaticRewriteReason::GuestRedZone, nullptr);
 }
 

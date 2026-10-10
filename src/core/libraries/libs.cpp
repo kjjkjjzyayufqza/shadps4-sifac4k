@@ -39,6 +39,7 @@
 #include "core/libraries/np/np_auth.h"
 #include "core/libraries/np/np_commerce/np_commerce.h"
 #include "core/libraries/np/np_common.h"
+#include "core/libraries/np/np_ingame_message.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/libraries/np/np_matching2/np_matching2.h"
 #include "core/libraries/np/np_partner.h"
@@ -125,6 +126,9 @@ void InitHLELibs(Core::Loader::SymbolsResolver* sym) {
             {"libSceNpCommerce.sprx", Libraries::Np::NpCommerce::RegisterLib},
             {"libSceNpCommon.sprx", Libraries::Np::NpCommon::RegisterLib},
             {"libSceNpManager.sprx", Libraries::Np::NpManager::RegisterLib},
+            // sceNpInGameMessage* ships inside libSceNpManager but is an independent
+            // service, so it registers from its own translation unit.
+            {"libSceNpManager.sprx", Libraries::Np::NpInGameMessage::RegisterLib},
             {"libSceNpMatching2.sprx", Libraries::Np::NpMatching2::RegisterLib},
             {"libSceNpSignaling.sprx", Libraries::Np::NpSignaling::RegisterLib},
             {"libSceNpScore.sprx", Libraries::Np::NpScore::RegisterLib},

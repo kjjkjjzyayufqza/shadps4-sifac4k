@@ -445,8 +445,11 @@ bool Linker::Resolve(const std::string& name, Loader::SymbolType sym_type, Modul
         return_info->name = "Unknown !!!";
     }
     if (library->name != "libc" && library->name != "libSceFios2") {
-        LOG_WARNING(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,
-                    return_info->name, library->name, module->name);
+        // One line per imported symbol, several thousand per boot. Resolving a stub is
+        // ordinary loader work, not something an operator has to be told about, and under
+        // Log.sync it is paid for on the loader thread.
+        LOG_DEBUG(Core_Linker, "Linker: Stub resolved {} as {} (lib: {}, mod: {})", sr.name,
+                  return_info->name, library->name, module->name);
     } else {
         if (library->name == "libc" && return_info->name == "Need_sceLibc") {
             Libraries::SysModule::g_need_scelibc = true;

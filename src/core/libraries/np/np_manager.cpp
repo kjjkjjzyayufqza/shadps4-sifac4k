@@ -798,14 +798,41 @@ s32 PS4_SYSV_ABI sceNpSetContentRestriction(const OrbisNpContentRestriction* res
     return ORBIS_OK;
 }
 
+// Title id and secret as set by sceNpSetNpTitleId. Guarded because the setter runs on a guest
+// thread while anything reading it may not.
+static std::mutex g_np_title_mutex;
+static OrbisNpTitleId g_np_title_id{};
+static OrbisNpTitleSecret g_np_title_secret{};
+static bool g_np_title_set = false;
+
 s32 PS4_SYSV_ABI sceNpSetNpTitleId(const OrbisNpTitleId* title_id,
                                    const OrbisNpTitleSecret* title_secret) {
     if (title_id == nullptr || title_secret == nullptr) {
         LOG_ERROR(Lib_NpManager, "called with invalid arguments");
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
-    LOG_ERROR(Lib_NpManager, "(STUBBED) called, title_id = {}", title_id->id);
+    // Kept rather than discarded. Nothing shadPS4 does today reads the title secret - the
+    // communication id comes from npbind.dat - but a title that sets it expects the library to
+    // remember it, and a feature added later that needs it would otherwise silently work off a
+    // blank secret with no sign anything was wrong.
+    {
+        std::lock_guard lock(g_np_title_mutex);
+        g_np_title_id = *title_id;
+        g_np_title_secret = *title_secret;
+        g_np_title_set = true;
+    }
+    LOG_INFO(Lib_NpManager, "SetNpTitleId: title_id = {}", title_id->id);
     return ORBIS_OK;
+}
+
+bool GetNpTitleId(OrbisNpTitleId& out_title_id, OrbisNpTitleSecret& out_title_secret) {
+    std::lock_guard lock(g_np_title_mutex);
+    if (!g_np_title_set) {
+        return false;
+    }
+    out_title_id = g_np_title_id;
+    out_title_secret = g_np_title_secret;
+    return true;
 }
 
 struct NpStateCallbackForNpToolkit {

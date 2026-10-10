@@ -24,9 +24,15 @@ namespace Core {
 // cannot identify, so scanning proves nothing about whether an address is a target. A
 // disassembler that recovered the table does know, and this is how it says so.
 //
-// Produced by `scripts/export_branch_targets.py`. Anything the file does not mention keeps
-// the pass's own conservative refusal, so a missing, partial or stale file can only cost
-// coverage, never correctness.
+// Produced by `scripts/export_branch_targets.py`. A body the file does not describe keeps
+// the pass's own conservative refusal, so a missing or partial file costs only coverage.
+//
+// A file built from a *different* build of the same title is the case that would cost
+// correctness: its entries can still cover a body the pass walks, and it would then vouch
+// for addresses that are not this build's entry points. The export therefore records how
+// many bodies the module's unwind table held, and `Load` refuses a file whose count
+// disagrees with the module being rewritten. A file predating that record declares
+// nothing and is still accepted, so `DeclaredBodyCount() == 0` is worth reporting.
 class VerifiedBranchTargets {
 public:
     struct Function {
@@ -37,7 +43,13 @@ public:
 
     /// Reads the file for one module. A missing file yields an empty set, which is not an
     /// error: most modules have none and need none.
-    [[nodiscard]] static VerifiedBranchTargets Load(const std::filesystem::path& path);
+    ///
+    /// `module_body_count` is how many bodies the module's own unwind table holds. When
+    /// it is non-zero and the file declares a different count, the file describes another
+    /// build and the whole set is refused. Pass zero to skip the check, which is what a
+    /// caller with no module to compare against does.
+    [[nodiscard]] static VerifiedBranchTargets Load(const std::filesystem::path& path,
+                                                    u64 module_body_count = 0);
 
     /// Path convention: <user>/branch_targets/<title serial>/<module name>.txt. The serial
     /// is part of it because every title's main module is called eboot.bin, and applying
@@ -53,6 +65,11 @@ public:
         return functions.size();
     }
 
+    /// Unwind-table body count the file declared, or 0 when it declared none.
+    [[nodiscard]] u64 DeclaredBodyCount() const {
+        return declared_body_count;
+    }
+
     /// The entry whose range contains this module-relative offset, or nullptr when the
     /// file says nothing about it. Containment rather than an exact start, because a
     /// disassembler sometimes merges into one function what the module's unwind metadata
@@ -62,6 +79,7 @@ public:
 
 private:
     std::map<u64, Function> functions;
+    u64 declared_body_count{};
 };
 
 } // namespace Core

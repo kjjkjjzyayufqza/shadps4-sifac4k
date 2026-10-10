@@ -42,9 +42,23 @@ struct EHHeaderInfo {
     u8 table_enc{DW_EH_PE_omit}; // Windows static guest red-zone protection
 };
 
+/// The code range one FDE describes: [start, end).
+struct FunctionBody {
+    uintptr_t start{};
+    uintptr_t end{};
+};
+
 bool DecodeEHHdr(uintptr_t ehHdrStart, uintptr_t ehHdrEnd, EHHeaderInfo& ehHdrInfo);
 // Windows static guest red-zone protection
 bool DecodeEHHdrTable(const EHHeaderInfo& ehHdrInfo, uintptr_t ehHdrEnd,
                       std::vector<uintptr_t>& functionStarts);
+
+/// Reads every FDE the search table points at and returns the body each one describes.
+/// The search table only records where a body starts; its extent lives in the FDE. Every
+/// FDE and CIE read must lie inside [imageStart, imageEnd), and each FDE's pc_begin must
+/// equal the start the table recorded for it. Anything malformed or encoded in a way this
+/// reader does not handle fails the whole decode rather than yielding a partial list.
+bool DecodeEHFunctionBodies(const EHHeaderInfo& ehHdrInfo, uintptr_t ehHdrEnd, uintptr_t imageStart,
+                            uintptr_t imageEnd, std::vector<FunctionBody>& bodies);
 
 } // namespace Dwarf

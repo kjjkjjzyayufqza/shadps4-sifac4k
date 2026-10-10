@@ -51,9 +51,9 @@ private:
     std::filesystem::path path;
 };
 
-VerifiedBranchTargets LoadFrom(std::string_view contents) {
+VerifiedBranchTargets LoadFrom(std::string_view contents, u64 module_body_count = 0) {
     const TemporaryFile file{contents};
-    return VerifiedBranchTargets::Load(file.Path());
+    return VerifiedBranchTargets::Load(file.Path(), module_body_count);
 }
 
 constexpr std::string_view kValid = R"(# a comment
@@ -71,8 +71,8 @@ func 0x2000 0x2010
 } // namespace
 
 TEST(VerifiedBranchTargets, AbsentFileIsEmptyAndNotAnError) {
-    const auto targets = VerifiedBranchTargets::Load(
-        std::filesystem::temp_directory_path() / "shadps4_branch_targets_does_not_exist.txt");
+    const auto targets = VerifiedBranchTargets::Load(std::filesystem::temp_directory_path() /
+                                                     "shadps4_branch_targets_does_not_exist.txt");
     EXPECT_TRUE(targets.Empty());
     EXPECT_EQ(0u, targets.FunctionCount());
 }
@@ -113,6 +113,40 @@ TEST(VerifiedBranchTargets, PathIsScopedByTitleSerial) {
     EXPECT_EQ("CUSA15006", first.parent_path().filename().string());
 }
 
+// A file exported from another build of the same title is the one malformed input that
+// still parses: its entries can cover a body the pass walks, and it would then vouch for
+// addresses that are not this build's entry points. The unwind-body count is what ties a
+// file to one build, so a disagreement has to refuse the whole set.
+TEST(VerifiedBranchTargets, BodyCountMatchingTheModuleIsAccepted) {
+    constexpr std::string_view kBound = "version 1\nbase 0x400000\nbodies 71985\n"
+                                        "func 0x1000 0x1100\ntarget 0x1020\n";
+    const auto targets = LoadFrom(kBound, 71985);
+    ASSERT_EQ(1u, targets.FunctionCount());
+    EXPECT_EQ(71985u, targets.DeclaredBodyCount());
+}
+
+TEST(VerifiedBranchTargets, BodyCountFromAnotherBuildYieldsNothing) {
+    constexpr std::string_view kBound = "version 1\nbase 0x400000\nbodies 71985\n"
+                                        "func 0x1000 0x1100\ntarget 0x1020\n";
+    const auto targets = LoadFrom(kBound, 71984);
+    EXPECT_TRUE(targets.Empty())
+        << "one body more or less is a different build, and its targets mean other addresses";
+}
+
+TEST(VerifiedBranchTargets, BodyCountIsNotCheckedWhenTheCallerHasNoModule) {
+    constexpr std::string_view kBound = "version 1\nbase 0x400000\nbodies 71985\n"
+                                        "func 0x1000 0x1100\n";
+    EXPECT_EQ(1u, LoadFrom(kBound, 0).FunctionCount());
+}
+
+TEST(VerifiedBranchTargets, FileWithoutABodyCountStillLoads) {
+    // Files exported before the record exist. They keep working, and report that nothing
+    // ties them to a build, rather than being refused outright.
+    const auto targets = LoadFrom(kValid, 71985);
+    EXPECT_EQ(2u, targets.FunctionCount());
+    EXPECT_EQ(0u, targets.DeclaredBodyCount());
+}
+
 class BranchTargetRejection : public ::testing::TestWithParam<std::string_view> {};
 
 TEST_P(BranchTargetRejection, MalformedInputYieldsNothing) {
@@ -145,5 +179,9 @@ INSTANTIATE_TEST_SUITE_P(
         std::string_view{"version 1\nfunc 0x1000 0x1100 0x1200\n"},
         // Overlapping entries: lookup is by containment, so which one describes 0x1050?
         std::string_view{"version 1\nfunc 0x1000 0x1100\nfunc 0x1050 0x1200\n"},
+        // A body count that is not a count cannot tie the file to anything.
+        std::string_view{"version 1\nbodies zzzz\nfunc 0x1000 0x1100\n"},
+        std::string_view{"version 1\nbodies 0\nfunc 0x1000 0x1100\n"},
+        std::string_view{"version 1\nbodies\nfunc 0x1000 0x1100\n"},
         // A directive from some other format.
         std::string_view{"version 1\nfunc 0x1000 0x1100\nsection .text\n"}));

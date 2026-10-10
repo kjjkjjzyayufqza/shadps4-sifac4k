@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <mutex>
 #include <optional>
 #include <unordered_map>
@@ -38,29 +39,70 @@ constexpr size_t OneDoubleOffset = 32;
 constexpr u32 OneFloatBits = 0x3F800000;
 constexpr u64 OneDoubleBits = 0x3FF0000000000000ULL;
 
+constexpr size_t ConstantPoolBytes = OneDoubleOffset + sizeof(u64);
+
 std::mutex constant_pool_mutex;
-std::unordered_map<const Xbyak::CodeGenerator*, const u8*> constant_pools;
+// Offsets rather than pointers: validity has to be decided against the generator's
+// current size, which a rewind can move backwards underneath a cached address.
+std::unordered_map<const Xbyak::CodeGenerator*, size_t> constant_pools;
 
-// Emits the pool on first use for a generator and hands back its address. Emitting it
-// per site instead would put a branch on a path that occurs over a thousand times in a
-// single title. Patch modules live for the process, so the cache never dangles.
-const u8* GetConstantPool(Xbyak::CodeGenerator& c) {
-    std::scoped_lock lock{constant_pool_mutex};
-    if (const auto it = constant_pools.find(&c); it != constant_pools.end()) {
-        return it->second;
+// True when the bytes at `pool` are still the constants this file emitted. A trampoline
+// attempt that fails rewinds the generator with setSize(), and a pool emitted inside such
+// an attempt is overwritten by whatever trampoline is emitted next. Checking the bytes
+// rather than only the offset means a pool is trusted for what it holds, not for when it
+// was written.
+[[nodiscard]] bool HoldsConstants(const u8* pool) {
+    for (size_t index = 0; index < 8; ++index) {
+        u32 value;
+        std::memcpy(&value, pool + OnesPackedOffset + index * sizeof(u32), sizeof(value));
+        if (value != OneFloatBits) {
+            return false;
+        }
     }
+    u64 wide;
+    std::memcpy(&wide, pool + OneDoubleOffset, sizeof(wide));
+    return wide == OneDoubleBits;
+}
 
+// Cached pool for a generator, or nullptr when it never had one or the bytes are gone.
+// Callers hold constant_pool_mutex.
+[[nodiscard]] const u8* FindValidConstantPool(const Xbyak::CodeGenerator& c) {
+    const auto it = constant_pools.find(&c);
+    if (it == constant_pools.end()) {
+        return nullptr;
+    }
+    const u8* pool = c.getCode() + it->second;
+    if (it->second + ConstantPoolBytes <= c.getSize() && HoldsConstants(pool)) {
+        return pool;
+    }
+    constant_pools.erase(it);
+    return nullptr;
+}
+
+// Emits the pool and records where it landed. Callers hold constant_pool_mutex.
+const u8* EmitConstantPool(Xbyak::CodeGenerator& c) {
     Xbyak::Label skip;
     c.jmp(skip, Xbyak::CodeGenerator::LabelType::T_NEAR);
-    const u8* pool = c.getCurr();
+    const size_t offset = c.getSize();
     for (int i = 0; i < 8; ++i) {
         c.dd(OneFloatBits);
     }
     c.db(OneDoubleBits, sizeof(u64));
     c.L(skip);
 
-    constant_pools.emplace(&c, pool);
-    return pool;
+    constant_pools.insert_or_assign(&c, offset);
+    return c.getCode() + offset;
+}
+
+// Hands back the pool for a generator, emitting one when it has none. Emitting it per
+// site instead would put a branch on a path that occurs over a thousand times in a single
+// title.
+const u8* GetConstantPool(Xbyak::CodeGenerator& c) {
+    std::scoped_lock lock{constant_pool_mutex};
+    if (const u8* pool = FindValidConstantPool(c)) {
+        return pool;
+    }
+    return EmitConstantPool(c);
 }
 
 Xbyak::Address PackedOnes(const u8* pool) {
@@ -346,6 +388,13 @@ void EmitLegacyPackedReciprocal(Xbyak::CodeGenerator& c, const ZydisDecodedOpera
 }
 
 } // namespace
+
+void ReserveConstantPool(Xbyak::CodeGenerator& c) {
+    std::scoped_lock lock{constant_pool_mutex};
+    if (FindValidConstantPool(c) == nullptr) {
+        EmitConstantPool(c);
+    }
+}
 
 void ForgetCodeGenerator(const Xbyak::CodeGenerator& c) {
     std::scoped_lock lock{constant_pool_mutex};

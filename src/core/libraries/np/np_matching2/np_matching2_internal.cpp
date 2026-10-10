@@ -20,6 +20,13 @@ NpMatching2State g_state;
 
 namespace {
 
+// Function-local so it exists before any thread can reach it, whatever order the translation
+// units' static initialisers run in.
+std::recursive_mutex& StateMutexImpl() {
+    static std::recursive_mutex mutex;
+    return mutex;
+}
+
 CallbackPayload& RequestPayload(ContextObject& ctx) {
     return ctx.request_payload_override ? *ctx.request_payload_override : ctx.request_payload;
 }
@@ -136,26 +143,25 @@ void BuildCreateJoinRoomPayloadCommon(ContextObject& ctx,
     rc.joined_slot_mask = room.joinedSlotMask;
     rc.flags = room.flags;
     rc.owner = resp.me_member_id() == resp.owner_member_id();
+    rc.owner_member_id = static_cast<OrbisNpMatching2RoomMemberId>(resp.owner_member_id());
+    rc.has_password = ctx.pending_room_password_set;
+    rc.password = ctx.pending_room_password;
+    ctx.pending_room_password_set = false;
+    ctx.pending_room_password = OrbisNpMatching2SessionPassword{};
     rc.signaling_type = ORBIS_NP_MATCHING2_SIGNALING_TYPE_MESH;
-    rc.signaling_main_member = static_cast<OrbisNpMatching2RoomMemberId>(resp.owner_member_id());
-    rc.bin_attrs_internal.resize(p.room_bin_attrs.size());
-    rc.bin_buffers.clear();
-    rc.bin_buffers.reserve(p.room_bin_attrs.size());
-    for (size_t i = 0; i < p.room_bin_attrs.size(); ++i) {
-        const auto& a = p.room_bin_attrs[i].binAttr;
-        if (a.data && a.dataSize > 0) {
-            rc.bin_buffers.emplace_back(a.data, a.data + a.dataSize);
-        } else {
-            rc.bin_buffers.emplace_back();
-        }
-        auto& buf = rc.bin_buffers.back();
-        auto& dst = rc.bin_attrs_internal[i];
-        dst = OrbisNpMatching2RoomBinAttrInternal{};
-        dst.lastUpdate = p.room_bin_attrs[i].lastUpdate;
-        dst.memberId = p.room_bin_attrs[i].memberId;
-        dst.binAttr.id = a.id;
-        dst.binAttr.data = buf.empty() ? nullptr : buf.data();
-        dst.binAttr.dataSize = buf.size();
+    rc.signaling_main_member = rc.owner_member_id;
+    // Copy the bytes into owned storage. The payload pointers above are only valid until the
+    // callback returns, and later room updates must not invalidate this cache.
+    rc.room_bins.clear();
+    rc.room_bins.reserve(static_cast<size_t>(rd.bin_attrs_internal_size()));
+    for (int i = 0; i < rd.bin_attrs_internal_size(); ++i) {
+        const auto& a = rd.bin_attrs_internal(i);
+        RoomBinCache bin;
+        bin.id = static_cast<OrbisNpMatching2AttributeId>(a.attr_id());
+        bin.update_date = a.update_date();
+        bin.member_id = static_cast<OrbisNpMatching2RoomMemberId>(a.update_member_id());
+        bin.data.assign(a.data().begin(), a.data().end());
+        rc.room_bins.push_back(std::move(bin));
     }
     ctx.room_id = room.roomId;
     ctx.my_member_id = static_cast<OrbisNpMatching2RoomMemberId>(resp.me_member_id());
@@ -230,9 +236,21 @@ OrbisNpMatching2RoomMemberBinAttrInternal* AppendMemberBinAttrs(
     return count == 0 ? nullptr : &p.member_bin_attrs[first];
 }
 
+void ReserveCreateJoinBinStorage(CallbackPayload& p, const shadnet::CreateJoinRoomResponse& resp) {
+    // Room attributes and every member blob share one buffer vector. Pointers into it are handed
+    // to the title, so the vector has to be sized for all of them before the first pointer is
+    // taken. A 4-player join is what used to grow it past that and free the room blob mid-callback.
+    size_t count = static_cast<size_t>(resp.room_data().bin_attrs_internal_size());
+    for (const auto& member : resp.members()) {
+        count += static_cast<size_t>(member.bin_attrs_internal_size());
+    }
+    p.bin_buffers.reserve(count);
+}
+
 void* BuildCreateJoinRoomPayload(ContextObject& ctx, const shadnet::CreateJoinRoomResponse& resp) {
     CallbackPayload& p = RequestPayload(ctx);
     p.Reset();
+    ReserveCreateJoinBinStorage(p, resp);
     BuildCreateJoinRoomPayloadCommon(ctx, resp);
 
     const int member_count = resp.members_size();
@@ -280,6 +298,7 @@ void* BuildCreateJoinRoomPayload(ContextObject& ctx, const shadnet::CreateJoinRo
 void* BuildCreateJoinRoomPayloadA(ContextObject& ctx, const shadnet::CreateJoinRoomResponse& resp) {
     CallbackPayload& p = RequestPayload(ctx);
     p.Reset();
+    ReserveCreateJoinBinStorage(p, resp);
     BuildCreateJoinRoomPayloadCommon(ctx, resp);
 
     const int member_count = resp.members_size();
@@ -992,6 +1011,103 @@ void* BuildGetUserInfoListPayloadA(ContextObject& ctx, const shadnet::GetUserInf
     return p.request_data;
 }
 
+// Appends one member's internal bin attributes to the shared payload arrays and points `dst` at
+// them. The caller is responsible for having reserved `p.member_bin_attrs` and `p.bin_buffers`
+// for every member it will fill; this function only takes addresses inside them.
+static void AppendMemberBinAttrs(CallbackPayload& p, const MemberCache& mc,
+                                 OrbisNpMatching2RoomMemberDataInternal& dst) {
+    if (mc.bins.empty()) {
+        dst.roomMemberBinAttrInternal = nullptr;
+        dst.roomMemberBinAttrInternalNum = 0;
+        return;
+    }
+    const size_t first = p.member_bin_attrs.size();
+    for (const auto& [attr_id, bin] : mc.bins) {
+        p.bin_buffers.emplace_back(bin.data.begin(), bin.data.end());
+        auto& buf = p.bin_buffers.back();
+        auto& attr = p.member_bin_attrs.emplace_back();
+        attr = OrbisNpMatching2RoomMemberBinAttrInternal{};
+        attr.lastUpdate.tick = bin.update_date;
+        attr.binAttr.id = bin.id;
+        attr.binAttr.data = buf.empty() ? nullptr : buf.data();
+        attr.binAttr.dataSize = buf.size();
+    }
+    dst.roomMemberBinAttrInternal = &p.member_bin_attrs[first];
+    dst.roomMemberBinAttrInternalNum = p.member_bin_attrs.size() - first;
+}
+
+void* BuildGetRoomMemberDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
+                                            OrbisNpMatching2RoomMemberId member_id) {
+    const auto rc_it = ctx.room_cache.find(room_id);
+    if (rc_it == ctx.room_cache.end()) {
+        return nullptr;
+    }
+    const auto mem_it = rc_it->second.members.find(member_id);
+    if (mem_it == rc_it->second.members.end()) {
+        return nullptr;
+    }
+    const MemberCache& mc = mem_it->second;
+
+    CallbackPayload& p = RequestPayload(ctx);
+    p.Reset();
+
+    if (mc.group_id != 0) {
+        const auto grp_it = rc_it->second.groups.find(mc.group_id);
+        if (grp_it != rc_it->second.groups.end()) {
+            p.room_groups.resize(1);
+            p.room_groups[0] = grp_it->second;
+        }
+    }
+
+    p.member_bin_attrs.reserve(mc.bins.size());
+    p.bin_buffers.reserve(mc.bins.size());
+
+    if (ctx.a_variant) {
+        p.member_data_a.resize(1);
+        auto& m = p.member_data_a[0];
+        m = OrbisNpMatching2RoomMemberDataInternalA{};
+        m.memberId = mc.member_id;
+        m.teamId = mc.team_id;
+        m.natType = mc.nat_type;
+        m.flags = mc.flag_attr;
+        m.joinDateTicks.tick = mc.join_date;
+        m.user.accountId = mc.account_id;
+        m.user.platform = mc.platform;
+        m.onlineId = mc.np_id.handle;
+        m.roomGroup = p.room_groups.empty() ? nullptr : p.room_groups.data();
+        // The A and non-A member structures carry the same bin-attribute fields in the same
+        // order, so the shared helper fills either through a reinterpreted reference.
+        OrbisNpMatching2RoomMemberDataInternal scratch{};
+        AppendMemberBinAttrs(p, mc, scratch);
+        m.roomMemberInternalBinAttr = scratch.roomMemberBinAttrInternal;
+        m.roomMemberInternalBinAttrs = scratch.roomMemberBinAttrInternalNum;
+
+        p.room_member_data_internal_response_a =
+            std::make_unique<OrbisNpMatching2GetRoomMemberDataInternalResponseA>();
+        p.room_member_data_internal_response_a->roomMemberDataInternal = &p.member_data_a[0];
+        p.request_data = p.room_member_data_internal_response_a.get();
+        return p.request_data;
+    }
+
+    p.member_data.resize(1);
+    auto& m = p.member_data[0];
+    m = OrbisNpMatching2RoomMemberDataInternal{};
+    m.memberId = mc.member_id;
+    m.teamId = mc.team_id;
+    m.natType = mc.nat_type;
+    m.flagAttr = mc.flag_attr;
+    m.joinDate = mc.join_date;
+    m.npId = mc.np_id;
+    m.roomGroup = p.room_groups.empty() ? nullptr : p.room_groups.data();
+    AppendMemberBinAttrs(p, mc, m);
+
+    p.room_member_data_internal_response =
+        std::make_unique<OrbisNpMatching2GetRoomMemberDataInternalResponse>();
+    p.room_member_data_internal_response->roomMemberDataInternal = &p.member_data[0];
+    p.request_data = p.room_member_data_internal_response.get();
+    return p.request_data;
+}
+
 void* BuildGetRoomDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId room_id) {
     const auto rc_it = ctx.room_cache.find(room_id);
     if (rc_it == ctx.room_cache.end()) {
@@ -1008,22 +1124,24 @@ void* BuildGetRoomDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId
         p.room_groups.push_back(g);
     }
 
-    p.room_bin_attrs.resize(rc.bin_attrs_internal.size());
+    size_t member_bin_count = 0;
+    for (const auto& [member_id, mc] : rc.members) {
+        member_bin_count += mc.bins.size();
+    }
+    // One reserve for the room blob and every member blob. Reserving again after the room
+    // pointers were taken moved the storage out from under them.
     p.bin_buffers.clear();
-    p.bin_buffers.reserve(rc.bin_attrs_internal.size());
-    for (size_t i = 0; i < rc.bin_attrs_internal.size(); ++i) {
-        const auto& src = rc.bin_attrs_internal[i];
-        const auto* data = static_cast<const u8*>(src.binAttr.data);
-        if (data && src.binAttr.dataSize > 0) {
-            p.bin_buffers.emplace_back(data, data + src.binAttr.dataSize);
-        } else {
-            p.bin_buffers.emplace_back();
-        }
+    p.bin_buffers.reserve(rc.room_bins.size() + member_bin_count);
+    p.room_bin_attrs.resize(rc.room_bins.size());
+    for (size_t i = 0; i < rc.room_bins.size(); ++i) {
+        const auto& src = rc.room_bins[i];
+        p.bin_buffers.push_back(src.data);
         auto& buf = p.bin_buffers.back();
         auto& dst = p.room_bin_attrs[i];
         dst = OrbisNpMatching2RoomBinAttrInternal{};
-        dst.lastUpdate = src.lastUpdate;
-        dst.binAttr.id = src.binAttr.id;
+        dst.lastUpdate.tick = src.update_date;
+        dst.memberId = src.member_id;
+        dst.binAttr.id = src.id;
         dst.binAttr.data = buf.empty() ? nullptr : buf.data();
         dst.binAttr.dataSize = buf.size();
     }
@@ -1048,6 +1166,9 @@ void* BuildGetRoomDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId
     room.internalBinAttr = p.room_bin_attrs.empty() ? nullptr : p.room_bin_attrs.data();
     room.internalBinAttrs = p.room_bin_attrs.size();
 
+    p.member_bin_attrs.clear();
+    p.member_bin_attrs.reserve(member_bin_count);
+
     p.member_data.clear();
     p.member_data.reserve(rc.members.size());
     for (const auto& [member_id, mc] : rc.members) {
@@ -1059,6 +1180,7 @@ void* BuildGetRoomDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId
         dst.teamId = mc.team_id;
         dst.natType = mc.nat_type;
         dst.flagAttr = mc.flag_attr;
+        AppendMemberBinAttrs(p, mc, dst);
     }
     for (size_t i = 0; i < p.member_data.size(); ++i) {
         p.member_data[i].next = (i + 1 < p.member_data.size()) ? &p.member_data[i + 1] : nullptr;
@@ -1318,6 +1440,10 @@ void ContextManager::Reset() {
     m_next_id = 1;
     m_pending_context_callback = nullptr;
     m_pending_context_callback_arg = nullptr;
+}
+
+std::recursive_mutex& Matching2StateMutex() {
+    return StateMutexImpl();
 }
 
 OrbisNpMatching2RequestId AllocRequestId() {

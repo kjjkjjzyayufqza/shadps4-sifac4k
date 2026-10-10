@@ -426,9 +426,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(WindowsGuestRedZoneProtectionSettings,
 // Deterministic floating point for lockstep P2P titles
 //
 // Replaces the reciprocal and reciprocal-square-root estimates, whose results are
-// vendor-defined, with exact IEEE-754 arithmetic that every host agrees on. Off by
-// default: it costs performance and only matters to titles whose netplay advances an
-// identical simulation on both peers. See documents/deterministic-fp-netplay-plan.md.
+// vendor-defined, with exact IEEE-754 arithmetic that every host agrees on. The
+// global default stays off: the rewrite costs load time and only lockstep netplay
+// needs bit-identical hosts. Gundam Versus (CUSA08379) and Maxi Boost ON
+// (CUSA15006) turn it on when their profile does not set the key, so Intel and AMD
+// peers do not desync without a config edit. An explicit per-title false still
+// wins. See documents/deterministic-fp-netplay-plan.md.
 struct DeterministicFpSettings {
     Setting<bool> deterministic_floating_point{false};
 

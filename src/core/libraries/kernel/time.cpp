@@ -115,6 +115,16 @@ s32 PS4_SYSV_ABI sceKernelSleep(u32 seconds) {
     return sceKernelUsleep(seconds * 1'000'000);
 }
 
+// The network clocks report UTC time synchronized from the network. The retail libSceRtc reads
+// them for sceRtcGetCurrentNetworkTick, so a title that loads it LLE stores and compares these
+// values as calendar dates; the host wall clock is the equivalent. Serving them from the
+// monotonic clock handed titles the host uptime counted from 1970, which breaks every stored
+// timestamp across reboots (GUNDAM VERSUS then re-imposes its disconnect penalty).
+static bool IsNetworkClock(u32 clock_id) {
+    return clock_id == ORBIS_CLOCK_EXT_NETWORK || clock_id == ORBIS_CLOCK_EXT_DEBUG_NETWORK ||
+           clock_id == ORBIS_CLOCK_EXT_AD_NETWORK || clock_id == ORBIS_CLOCK_EXT_RAW_NETWORK;
+}
+
 s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
     if (ts == nullptr) {
         SetPosixErrno(EFAULT);
@@ -127,10 +137,8 @@ s32 PS4_SYSV_ABI posix_clock_gettime(u32 clock_id, OrbisKernelTimespec* ts) {
         ts->tv_nsec = static_cast<s64>((us % 1'000'000) * 1000);
         return 0;
     }
-    if (clock_id == ORBIS_CLOCK_EXT_NETWORK || clock_id == ORBIS_CLOCK_EXT_DEBUG_NETWORK ||
-        clock_id == ORBIS_CLOCK_EXT_AD_NETWORK || clock_id == ORBIS_CLOCK_EXT_RAW_NETWORK) {
-        LOG_ERROR(Lib_Kernel, "Unsupported clock type {}, using CLOCK_MONOTONIC", clock_id);
-        clock_id = ORBIS_CLOCK_MONOTONIC;
+    if (IsNetworkClock(clock_id)) {
+        clock_id = ORBIS_CLOCK_REALTIME;
     }
 
 #ifdef _WIN32
@@ -298,10 +306,8 @@ s32 PS4_SYSV_ABI posix_clock_getres(u32 clock_id, OrbisKernelTimespec* res) {
         return -1;
     }
 
-    if (clock_id == ORBIS_CLOCK_EXT_NETWORK || clock_id == ORBIS_CLOCK_EXT_DEBUG_NETWORK ||
-        clock_id == ORBIS_CLOCK_EXT_AD_NETWORK || clock_id == ORBIS_CLOCK_EXT_RAW_NETWORK) {
-        LOG_ERROR(Lib_Kernel, "Unsupported clock type {}, using CLOCK_MONOTONIC", clock_id);
-        clock_id = ORBIS_CLOCK_MONOTONIC;
+    if (IsNetworkClock(clock_id)) {
+        clock_id = ORBIS_CLOCK_REALTIME;
     }
 
 #ifdef _WIN32

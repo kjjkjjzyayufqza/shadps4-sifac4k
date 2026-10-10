@@ -130,5 +130,10 @@ s32 PS4_SYSV_ABI sceNpGetAccountLanguageA(s32 req_id,
 s32 PS4_SYSV_ABI
 sceNpGetParentalControlInfoA(s32 req_id, Libraries::UserService::OrbisUserServiceUserId user_id,
                              s8* age, OrbisNpParentalControlInfo* info);
+/// Title id and secret the game passed to sceNpSetNpTitleId, or false when it never did.
+/// shadPS4 takes the communication id from npbind.dat instead, so nothing needs this yet; it
+/// exists so a feature that does need the title secret finds it recorded rather than blank.
+bool GetNpTitleId(OrbisNpTitleId& out_title_id, OrbisNpTitleSecret& out_title_secret);
+
 void RegisterLib(Core::Loader::SymbolsResolver* sym);
 } // namespace Libraries::Np::NpManager

@@ -5,6 +5,7 @@
 #include <vector>
 #include "common/logging/log.h"
 #include "shadnet/client.h" // socket platform typedefs + protocol constants
+#include "shadnet/resolve.h"
 #include "shadnet/server_probe.h"
 
 #ifdef _WIN32
@@ -51,19 +52,19 @@ ProbeInfo ProbeServer(const std::string& host, u16 port, u32 timeout_ms) {
 
     ProbePlatformInit();
 
-    struct addrinfo hints{}, *res_list = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (::getaddrinfo(host.c_str(), std::to_string(port).c_str(), &hints, &res_list) != 0 ||
-        !res_list) {
+    const std::vector<u32> addresses = ResolveIPv4(host);
+    if (addresses.empty()) {
         LOG_WARNING(ShadNet, "probe: DNS resolution failed for '{}'", host);
         return info; // Unreachable
     }
 
-    ShadSocketHandle sock = ::socket(res_list->ai_family, SOCK_STREAM, IPPROTO_TCP);
+    sockaddr_in dst{};
+    dst.sin_family = AF_INET;
+    dst.sin_port = htons(port);
+    dst.sin_addr.s_addr = addresses.front();
+
+    ShadSocketHandle sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (sock == SHAD_INVALID_SOCK) {
-        ::freeaddrinfo(res_list);
         return info; // Unreachable
     }
 
@@ -79,8 +80,7 @@ ProbeInfo ProbeServer(const std::string& host, u16 port, u32 timeout_ms) {
     }
 #endif
 
-    const int cr = ::connect(sock, res_list->ai_addr, static_cast<int>(res_list->ai_addrlen));
-    ::freeaddrinfo(res_list);
+    const int cr = ::connect(sock, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
 
     bool connected = false;
 #ifdef _WIN32

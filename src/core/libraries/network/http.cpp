@@ -143,6 +143,10 @@ struct HttpState {
     int next_obj_id = 0;
     bool default_accept_encoding_gzip = false;
     std::unordered_set<int> active_contexts;
+    // Pool size each context was initialised with. Requests run on the host's HTTP stack, so
+    // nothing is allocated from it, but sceHttpGetMemoryPoolStats must still report the budget
+    // the title handed over.
+    std::unordered_map<int, u64> context_pool_size;
     // Contexts where sceHttpsLoadCert was called. We can't actually parse the
     // PS4 cert blobs, but we use this as a signal that
     // the game expects custom CA validation. Connections under these contexts
@@ -1614,8 +1618,24 @@ int PS4_SYSV_ABI sceHttpGetEpollId() {
 
 int PS4_SYSV_ABI sceHttpGetMemoryPoolStats(int libhttpCtxId,
                                            OrbisHttpMemoryPoolStats* currentStat) {
-    LOG_ERROR(Lib_Http, "(STUBBED) called libhttpCtxId={}, currentStat={}", libhttpCtxId,
-              fmt::ptr(currentStat));
+    if (currentStat == nullptr) {
+        LOG_ERROR(Lib_Http, "GetMemoryPoolStats: currentStat null");
+        return ORBIS_HTTP_ERROR_INVALID_VALUE;
+    }
+    std::lock_guard<std::mutex> lock(g_state.m_mutex);
+    if (!g_state.active_contexts.contains(libhttpCtxId)) {
+        LOG_ERROR(Lib_Http, "GetMemoryPoolStats: invalid libhttpCtxId={}", libhttpCtxId);
+        return ORBIS_HTTP_ERROR_INVALID_ID;
+    }
+    const u64 pool_size = g_state.context_pool_size.contains(libhttpCtxId)
+                              ? g_state.context_pool_size.at(libhttpCtxId)
+                              : 0;
+    // Requests are issued over the host's HTTP stack, so none of the title's pool is in use.
+    // Writing the structure is what matters here: leaving it untouched, as this did before, left
+    // the caller reading its own uninitialised stack and drawing conclusions from it.
+    *currentStat = OrbisHttpMemoryPoolStats{};
+    currentStat->poolSize = pool_size;
+    LOG_INFO(Lib_Http, "GetMemoryPoolStats: ctx={} poolSize={} inUse=0", libhttpCtxId, pool_size);
     return ORBIS_OK;
 }
 
@@ -1634,6 +1654,7 @@ int PS4_SYSV_ABI sceHttpInit(int libnetMemId, int libsslCtxId, u64 poolSize) {
     }
     const int ctx_id = ++g_state.next_ctx_id;
     g_state.active_contexts.insert(ctx_id);
+    g_state.context_pool_size[ctx_id] = poolSize;
     g_state.inited = true; // true while at least one context is alive
     g_state.shutting_down.store(false);
     LOG_INFO(Lib_Http, "initialized -> ctxId={} (active contexts: {})", ctx_id,
@@ -2124,6 +2145,7 @@ int PS4_SYSV_ABI sceHttpTerm(int libhttpCtxId) {
         return ORBIS_HTTP_ERROR_INVALID_ID;
     }
     g_state.contexts_with_loaded_certs.erase(libhttpCtxId);
+    g_state.context_pool_size.erase(libhttpCtxId);
     g_state.redirect_cache_301.erase(libhttpCtxId);
     if (g_state.active_contexts.empty()) {
         // Last context torn down - wipe all dependent objects.

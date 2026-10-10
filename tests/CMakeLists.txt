@@ -21,8 +21,21 @@ if (WIN32)
     target_link_libraries(shadps4_ipv4_interface_test PRIVATE ws2_32 iphlpapi)
 endif()
 
+# Game-data (replay) chunking and resume. Header-only state under test, so the target needs
+# nothing from the emulator beyond the include path.
+add_executable(shadps4_np_score_gamedata_xfer_test
+    network/test_np_score_gamedata_xfer.cpp
+)
+target_include_directories(shadps4_np_score_gamedata_xfer_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(shadps4_np_score_gamedata_xfer_test PRIVATE cxx_std_23)
+target_link_libraries(shadps4_np_score_gamedata_xfer_test PRIVATE GTest::gtest_main)
+if (WIN32)
+    target_compile_definitions(shadps4_np_score_gamedata_xfer_test PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 set(TEST_TARGETS
     shadps4_ipv4_interface_test
+    shadps4_np_score_gamedata_xfer_test
     shadps4_settings_test
     shadps4_ngs2_test
     shadps4_gcn_test
@@ -502,14 +515,17 @@ gtest_discover_tests(shadps4_shadnet_link_test
 )
 
 # ===========================================================================
-# Verified branch targets (side-car parsing for the static rewrite pass)
+# Static rewrite inputs (verified branch targets, unwind body extents)
 # ===========================================================================
-# The pass borrows bytes around a patch site only in functions this file vouches
-# for, so a malformed entry has to yield nothing rather than a partial set.
+# The pass borrows bytes around a patch site only in functions the side-car file
+# vouches for, and bounds its search for unreached estimates by each unwind body's
+# extent, so malformed input of either kind has to yield nothing rather than a
+# partial answer.
 
 set(BRANCH_TARGETS_TEST_SOURCES
     # Under test
     ${CMAKE_SOURCE_DIR}/src/core/branch_targets.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/loader/dwarf.cpp
 
     # Required by the logger's access to EmulatorSettings.
     ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
@@ -532,6 +548,7 @@ set(BRANCH_TARGETS_TEST_SOURCES
 
     # Tests
     core/test_branch_targets.cpp
+    core/test_dwarf_function_bodies.cpp
 )
 
 add_executable(shadps4_branch_targets_test ${BRANCH_TARGETS_TEST_SOURCES})
@@ -614,6 +631,90 @@ if (ARCHITECTURE STREQUAL "x86_64")
     endif()
 
     gtest_discover_tests(shadps4_deterministic_fp_test
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+        DISCOVERY_TIMEOUT 60
+    )
+
+    # =======================================================================
+    # Static rewrite pass (function walk, coverage accounting, relocation)
+    # =======================================================================
+    # Runs the real pass over hand-assembled code in executable memory, then
+    # executes what it produced.
+
+    add_executable(shadps4_static_rewrite_test
+        # Under test
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_patches.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/cpu_patches_fp.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/branch_targets.cpp
+
+        # What the pass decodes with and patches through
+        ${CMAKE_SOURCE_DIR}/src/common/decoder.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/signal_context.cpp
+
+        # Required by the logger's access to EmulatorSettings.
+        ${CMAKE_SOURCE_DIR}/src/core/emulator_settings.cpp
+        ${CMAKE_SOURCE_DIR}/src/core/emulator_state.cpp
+
+        # Minimal common support
+        ${CMAKE_SOURCE_DIR}/src/common/path_util.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/assert.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/error.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/string_util.cpp
+        ${CMAKE_SOURCE_DIR}/src/common/logging/log.cpp
+
+        # Stubs that replace dependencies
+        stubs/common_stub.cpp
+        stubs/scm_rev_stub.cpp
+        stubs/sdl_stub.cpp
+        stubs/core_stub.cpp
+        stubs/signals_stub.cpp
+        stubs/file_sys_stub.cpp
+        stubs/tls_stub.cpp
+
+        # Tests
+        core/test_static_rewrite.cpp
+    )
+
+    list(APPEND TEST_TARGETS shadps4_static_rewrite_test)
+
+    target_include_directories(shadps4_static_rewrite_test PRIVATE
+        ${CMAKE_SOURCE_DIR}/src
+        ${CMAKE_SOURCE_DIR}
+    )
+    target_compile_features(shadps4_static_rewrite_test PRIVATE cxx_std_23)
+    target_link_libraries(shadps4_static_rewrite_test PRIVATE
+        GTest::gtest_main
+        Zydis::Zydis
+        xbyak::xbyak
+        fmt::fmt
+        magic_enum::magic_enum
+        nlohmann_json::nlohmann_json
+        toml11::toml11
+        SDL3::SDL3
+        spdlog::spdlog
+    )
+
+    if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+        CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+        include(CheckCXXSymbolExists)
+        check_cxx_symbol_exists(_LIBCPP_VERSION version LIBCPP)
+        if (LIBCPP)
+            target_compile_options(shadps4_static_rewrite_test PRIVATE -fexperimental-library)
+        endif()
+    endif()
+
+    if (WIN32)
+        target_link_libraries(shadps4_static_rewrite_test PRIVATE onecore)
+        target_compile_definitions(shadps4_static_rewrite_test PRIVATE
+            NOMINMAX
+            WIN32_LEAN_AND_MEAN
+            NTDDI_VERSION=0x0A000006
+            _WIN32_WINNT=0x0A00
+            WINVER=0x0A00
+        )
+    endif()
+
+    gtest_discover_tests(shadps4_static_rewrite_test
         WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
         DISCOVERY_TIMEOUT 60
     )

@@ -8,6 +8,7 @@
 #include "common/enum.h"
 #include "common/types.h"
 #include "core/branch_targets.h"
+#include "core/loader/dwarf.h"
 
 // ============================================================================
 // Windows static guest red-zone protection
@@ -87,10 +88,29 @@ struct StaticRewriteResult {
     u64 fp_unsupported_operand_shape_count{};   ///< no faithful replacement for the operands
     u64 fp_unsupported_indirect_branch_count{}; ///< function has an unresolvable branch table
     u64 fp_unsupported_unrelocatable_count{};   ///< no span or relay could reach the site
+    /// Lies in a body's code but the walk never reached it - typically a switch case behind
+    /// a jump table the pass cannot parse and no external analysis described.
+    u64 fp_unsupported_undecoded_count{};
+
+    /// Functions whose unwind extent was unknown, so the bytes the walk did not reach could
+    /// not be searched for estimates. Any here means the counts above prove nothing.
+    u64 fp_unmeasured_function_count{};
 
     /// Functions whose target set an external analysis vouched for, letting the pass
     /// borrow neighbouring instructions where it would otherwise have refused.
     u64 verified_target_function_count{};
+    /// Of those, the ones where the vouched-for targets led the walk into code it had not
+    /// reached from the entry alone.
+    u64 verified_extended_function_count{};
+
+    // Replaced sites that had to borrow bytes from the instructions around them, because
+    // the estimate itself was too short to hold a near jump. Borrowing is only sound
+    // where every address control flow can enter is known. The pass recovers targets
+    // within a function body, but an entry from outside it - an exception landing pad,
+    // say - is only known where an external analysis vouched for the body. The second
+    // number is therefore the pass's exposure, not a statistic.
+    u64 fp_borrowed_neighbour_count{};
+    u64 fp_borrowed_unverified_count{};
 };
 
 // Windows static guest red-zone protection
@@ -103,14 +123,23 @@ void RegisterPatchModule(void* module_ptr, u64 module_size, void* trampoline_are
 /// Applies CPU patches that need to be done before beginning executions.
 void PrePatchInstructions(u64 segment_addr, u64 segment_size);
 
+/// Resets the Windows hung-window timer without dispatching messages. The static
+/// rewrite pass and symbol load run on the loader thread long enough for QtLauncher
+/// to ghost the window and delay IPC START.
+void PumpLoaderThread();
+
 /// Rewrites a loaded executable segment ahead of time, using the verified function
 /// boundaries the caller decoded from the module's EH metadata. Instructions too short to
 /// take a near jump are relocated along with enough neighbours to make room.
 /// `verified` may be null, in which case the pass relies only on the targets it can
 /// recover itself and refuses to borrow neighbours in any function with an indirect jump
 /// it could not resolve.
+/// `function_bodies` is the extent of each unwind-table body. Deterministic floating point
+/// searches the bytes of each body the walk never reached, because an estimate there is
+/// otherwise invisible; a function with no extent is counted as unmeasured.
 StaticRewriteResult ApplyStaticRewrites(u64 segment_addr, u64 segment_size,
                                         std::span<const uintptr_t> function_starts,
+                                        std::span<const Dwarf::FunctionBody> function_bodies,
                                         StaticRewriteReason reasons,
                                         const VerifiedBranchTargets* verified);
 

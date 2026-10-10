@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 
 #include "common/alignment.h"
 #include "common/logging/log.h"
@@ -205,9 +208,11 @@ using Libraries::Net::sceNetNtohs;
 
 static Kernel::PthreadT g_dispatch_thread{};
 static Kernel::PthreadT g_receive_thread{};
-static bool g_receive_stop = false;
+static std::atomic<bool> g_receive_stop = false;
 static Kernel::PthreadT g_ping_thread{};
-static bool g_ping_stop = false;
+static std::atomic<bool> g_ping_stop = false;
+static std::mutex g_ping_mutex;
+static std::condition_variable g_ping_cv;
 
 // Both STUN endpoints land here. The primary one also publishes the endpoint the contexts hand
 // to peers; the alternate one only contributes the second observation the NAT classifier needs.
@@ -388,10 +393,18 @@ static void StopReceiveThread() {
     }
 }
 
+// sceNpSignalingTerminate joins the ping thread on the title's main thread, so the idle time
+// between rounds must end the moment a stop is requested. A plain sleep froze the title for up to
+// kSigPingMs every time it left an online mode.
+static void WaitPingInterval(u32 ms) {
+    std::unique_lock lock(g_ping_mutex);
+    g_ping_cv.wait_for(lock, std::chrono::milliseconds(ms), [] { return g_ping_stop.load(); });
+}
+
 static void PingThreadMain() {
-    while (!g_ping_stop) {
+    while (!g_ping_stop.load()) {
         if (!Stubs::EnsureTransport()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kSigRetryMs));
+            WaitPingInterval(kSigRetryMs);
             continue;
         }
 
@@ -440,8 +453,7 @@ static void PingThreadMain() {
 
         const bool any_unresolved = std::any_of(contexts.begin(), contexts.end(),
                                                 [](const auto& cs) { return !cs.resolved; });
-        const u32 sleep_ms = any_unresolved ? kSigRetryMs : kSigPingMs;
-        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_ms));
+        WaitPingInterval(any_unresolved ? kSigRetryMs : kSigPingMs);
     }
 }
 
@@ -451,7 +463,10 @@ static PS4_SYSV_ABI void* PingThreadFunc(void*) {
 }
 
 static void StartPingThread(s32 priority, u64 affinity_mask, u64 stack_size) {
-    g_ping_stop = false;
+    {
+        std::lock_guard lock(g_ping_mutex);
+        g_ping_stop = false;
+    }
     if (!g_ping_thread) {
         NpCommon::sceNpCreateThread(&g_ping_thread, PingThreadFunc, nullptr, priority, stack_size,
                                     affinity_mask, "SceNpSignalingPing");
@@ -459,7 +474,13 @@ static void StartPingThread(s32 priority, u64 affinity_mask, u64 stack_size) {
 }
 
 static void StopPingThread() {
-    g_ping_stop = true;
+    {
+        // Set under the mutex so a wait that has just evaluated its predicate cannot miss the
+        // notification.
+        std::lock_guard lock(g_ping_mutex);
+        g_ping_stop = true;
+    }
+    g_ping_cv.notify_all();
     if (g_ping_thread) {
         NpCommon::sceNpJoinThread(g_ping_thread, nullptr);
         g_ping_thread = {};

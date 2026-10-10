@@ -353,8 +353,23 @@ s32 PS4_SYSV_ABI sceNpWebApiGetHttpStatusCode(s64 requestId, s32* out_status_cod
 
 s32 PS4_SYSV_ABI sceNpWebApiGetMemoryPoolStats(s32 libCtxId,
                                                OrbisNpWebApiMemoryPoolStats* pCurrentStat) {
-    LOG_ERROR(Lib_NpWebApi, "called (STUBBED), libCtxId = {:#x}, pCurrentStat = {}", libCtxId,
-              fmt::ptr(pCurrentStat));
+    if (pCurrentStat == nullptr) {
+        LOG_ERROR(Lib_NpWebApi, "GetMemoryPoolStats: pCurrentStat null");
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    }
+    auto* context = findAndValidateContext(libCtxId);
+    if (context == nullptr) {
+        LOG_ERROR(Lib_NpWebApi, "GetMemoryPoolStats: invalid libCtxId {:#x}", libCtxId);
+        return ORBIS_NP_WEBAPI_ERROR_LIB_CONTEXT_NOT_FOUND;
+    }
+    // shadPS4 does not allocate WebApi traffic from the title's pool, so there is nothing in use.
+    // Reporting the configured size with zero usage is the only honest answer, and writing the
+    // structure at all is the point: leaving it untouched had callers reading their own
+    // uninitialised stack and deciding the library was out of memory.
+    *pCurrentStat = OrbisNpWebApiMemoryPoolStats{};
+    pCurrentStat->poolSize = context->poolSize;
+    LOG_INFO(Lib_NpWebApi, "GetMemoryPoolStats: libCtxId={:#x} poolSize={:#x} inUse=0", libCtxId,
+             context->poolSize);
     return ORBIS_OK;
 }
 
@@ -557,8 +572,21 @@ s32 PS4_SYSV_ABI sceNpWebApiSetHandleTimeout(s32 libCtxId, s32 handleId, u32 tim
 }
 
 s32 PS4_SYSV_ABI sceNpWebApiSetMaxConnection(s32 libCtxId, s32 maxConnection) {
-    LOG_ERROR(Lib_NpWebApi, "called (STUBBED), libCtxId = {:#x}, maxConnection = {}", libCtxId,
-              maxConnection);
+    if (maxConnection <= 0) {
+        LOG_ERROR(Lib_NpWebApi, "SetMaxConnection: invalid maxConnection {}", maxConnection);
+        return ORBIS_NP_WEBAPI_ERROR_INVALID_ARGUMENT;
+    }
+    auto* context = findAndValidateContext(libCtxId);
+    if (context == nullptr) {
+        LOG_ERROR(Lib_NpWebApi, "SetMaxConnection: invalid libCtxId {:#x}", libCtxId);
+        return ORBIS_NP_WEBAPI_ERROR_LIB_CONTEXT_NOT_FOUND;
+    }
+    // Recorded rather than enforced: requests go out over the host's HTTP stack, which has its own
+    // connection management. Keeping the value means GetConnectionStats and any later enforcement
+    // have the number the title chose instead of a default nobody asked for.
+    context->maxConnection = maxConnection;
+    LOG_INFO(Lib_NpWebApi, "SetMaxConnection: libCtxId={:#x} maxConnection={}", libCtxId,
+             maxConnection);
     return ORBIS_OK;
 }
 

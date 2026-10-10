@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <array>
+#include <map>
 #include <mutex>
 #include <optional>
 #include "common/types.h"
@@ -35,12 +37,24 @@ public:
 
     s32 RegisterCallback(OrbisNetCtlCallback func, void* arg);
     s32 RegisterNpToolkitCallback(OrbisNetCtlCallbackForNpToolkit func, void* arg);
+    // Release a slot taken by the matching Register call. Titles unregister and re-register
+    // around a reconnect; leaving the old entry in place makes the same callback fire twice for
+    // every later event and eventually exhausts the table.
+    s32 UnregisterCallback(int cid);
+    s32 UnregisterNpToolkitCallback(int cid);
     void CheckCallback();
     void CheckNpToolkitCallback();
+
+    // Error recorded for the most recent transition of `event_type`, which is what
+    // sceNetCtlGetResult answers with. Every transition shadPS4 produces comes from the host
+    // being connected or not and so carries no error, but a title branches on this value and
+    // must see the code for the event it just handled rather than a constant.
+    s32 LastEventError(int event_type) const;
 
 public:
     std::array<NetCtlCallbackForNpToolkit, 8> nptool_callbacks{};
     std::array<NetCtlCallback, 8> callbacks{};
-    std::mutex m_mutex;
+    std::map<int, s32> last_event_errors;
+    mutable std::mutex m_mutex;
 };
 } // namespace Libraries::NetCtl

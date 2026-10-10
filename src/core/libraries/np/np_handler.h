@@ -108,6 +108,15 @@ public:
     // Reverse lookup: server account_id to local user_id.
     // Returns -1 if no connected user owns that account_id.
     s32 GetUserIdByAccountId(u64 account_id) const;
+    /// First user with an authenticated shadNet session, or -1 when nobody is signed in.
+    /// libSceNpManager's in-game message path picks the sending user the same way: the API
+    /// carries no user id, so the library walks the signed-in list itself.
+    s32 GetFirstSignedInUserId() const;
+    /// Relays a short title-defined payload to the named accounts (shadNet command 42). The
+    /// server delivers it as an NP WebApi push event with data type "inGameMessage", which is
+    /// the channel the retail library both sends and receives on.
+    s32 SendInGameMessage(s32 user_id, const std::vector<u64>& target_account_ids, const u8* msg,
+                          size_t msg_len, u32 message_type);
 
     // Reverse lookup: OrbisNpOnlineId to local user_id.
     // Scans m_np_ids for a matching handle.data string.

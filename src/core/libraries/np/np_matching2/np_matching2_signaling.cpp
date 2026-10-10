@@ -40,6 +40,9 @@ constexpr auto kMatching2HandshakeTimeout = std::chrono::seconds(20);
 constexpr auto kMatching2RelayAfter = std::chrono::seconds(6);
 constexpr auto kMatching2StunPingInterval = std::chrono::seconds(5);
 constexpr auto kMatching2PingInterval = std::chrono::seconds(1);
+// A pong that is merely slower than the send interval is not a loss. Counting it as one
+// made a playable link report 100% loss, which the room antenna draws as its worst bar.
+constexpr auto kMatching2PingLossAfter = std::chrono::seconds(3);
 // One line per interval describing every peer, so a session that will not connect can be
 // diagnosed from the log alone instead of from a rebuild with extra prints.
 constexpr auto kMatching2StatusInterval = std::chrono::seconds(5);
@@ -278,9 +281,25 @@ bool SendMatching2Handshake(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
     return true;
 }
 
+// GVS shows "lv_load" (no settled bars) for any RTT above 340 ms, and MBON's worst lamp
+// starts at 320 ms. A 3/4 average of one slow sample stays above those cuts for many
+// seconds, so the published value is the median of the recent echoes instead.
+void PublishMatching2Ping(PeerInfo& peer, u32 sample_us) {
+    constexpr u32 kSlots = sizeof(peer.ping_samples) / sizeof(peer.ping_samples[0]);
+    peer.ping_samples[peer.ping_sample_pos] = sample_us;
+    peer.ping_sample_pos = static_cast<u8>((peer.ping_sample_pos + 1) % kSlots);
+    if (peer.ping_sample_count < kSlots) {
+        ++peer.ping_sample_count;
+    }
+    u32 sorted[kSlots];
+    std::copy_n(peer.ping_samples, peer.ping_sample_count, sorted);
+    std::sort(sorted, sorted + peer.ping_sample_count);
+    peer.ping_us = sorted[peer.ping_sample_count / 2];
+}
+
 // Connection quality is reported per resolved ping: a pong answers its ping, and a ping still
-// unanswered when the next one falls due is a lost packet. The counters halve once the window is
-// full so the rate follows the current link instead of the whole session.
+// unanswered after kMatching2PingLossAfter is a lost packet. The counters halve once the window
+// is full so the rate follows the current link instead of the whole session.
 void UpdateMatching2PacketLoss(PeerInfo& peer, bool lost) {
     ++peer.pings_resolved;
     if (lost) {
@@ -293,18 +312,23 @@ void UpdateMatching2PacketLoss(PeerInfo& peer, bool lost) {
     }
 }
 
-// The handshake only ever produces one RTT sample, but titles poll GetConnectionInfo for as long
-// as the connection lives and show the link quality from it, so an established peer keeps being
-// measured.
+// Titles poll GetConnectionInfo for as long as the connection lives and show the link
+// quality from it, so an established peer keeps being measured. The handshake itself is
+// not an echo and is not published as the RTT.
 void MaybeSendMatching2Ping(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
                             OrbisNpMatching2RoomMemberId member_id, PeerInfo& peer,
                             std::chrono::steady_clock::time_point now) {
-    if (peer.last_ping_send.time_since_epoch().count() != 0 &&
-        now - peer.last_ping_send < kMatching2PingInterval) {
-        return;
-    }
+    // One echo in flight. Replacing it at the send interval threw away a pong that was
+    // already on the way and counted the ping as lost.
     if (peer.ping_pending) {
+        if (peer.last_ping_send.time_since_epoch().count() != 0 &&
+            now - peer.last_ping_send < kMatching2PingLossAfter) {
+            return;
+        }
         UpdateMatching2PacketLoss(peer, true);
+    } else if (peer.last_ping_send.time_since_epoch().count() != 0 &&
+               now - peer.last_ping_send < kMatching2PingInterval) {
+        return;
     }
     ++peer.ping_seq;
     peer.ping_pending = true;
@@ -328,11 +352,13 @@ ContextObject* FindContextForMatching2Packet(const Matching2HandshakePacket& pkt
 }
 
 void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port, bool relayed,
-                                    const Matching2HandshakePacket& pkt) {
+                                    const Matching2HandshakePacket& pkt,
+                                    std::chrono::steady_clock::time_point recv_time) {
     if (!HasMatching2Magic(pkt)) {
         return;
     }
 
+    std::lock_guard state_lock(Matching2StateMutex());
     ContextObject* ctx = FindContextForMatching2Packet(pkt);
     if (!ctx) {
         LOG_DEBUG(Lib_NpMatching2, "Matching2 handshake: no ctx for room={} to_member={}",
@@ -345,6 +371,16 @@ void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port, bool relayed,
     auto room_it = ctx->room_cache.find(room_id);
     if (room_it == ctx->room_cache.end() ||
         !ShouldConnectToPeer(room_it->second, ctx->my_member_id, member_id)) {
+        return;
+    }
+    // A packet from a member that has already left must not create a peer entry. Nothing can
+    // be sent to a non-member, so the entry would stay pending and be retried every 5 ms for
+    // the rest of the session. A room of three or more churns members often enough to pile
+    // those entries up.
+    if (room_it->second.members.find(member_id) == room_it->second.members.end()) {
+        LOG_DEBUG(Lib_NpMatching2,
+                  "Matching2 handshake from member {} which is not in room {} any more: dropped",
+                  member_id, room_id);
         return;
     }
 
@@ -396,15 +432,10 @@ void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port, bool relayed,
         MarkMatching2PeerActive(*ctx, room_id, member_id, peer.addr, peer.port);
         break;
     case Matching2HandshakeKind::CheckAck:
+        // The check round is not an echo: it includes the peer finishing its own handshake.
+        // Publishing that elapsed time pinned the antenna above the games' worst-bar cut
+        // until later pings could drag the average back down.
         if (pkt.nonce == 0 || pkt.nonce == peer.nonce) {
-            if (peer.last_check_send.time_since_epoch().count() != 0) {
-                const auto rtt = std::chrono::duration_cast<std::chrono::microseconds>(
-                    std::chrono::steady_clock::now() - peer.last_check_send);
-                peer.ping_us =
-                    static_cast<u32>(std::min<u64>(static_cast<u64>(std::max<s64>(0, rtt.count())),
-                                                   std::numeric_limits<u32>::max()));
-                peer.last_check_send = {};
-            }
             MarkMatching2PeerActive(*ctx, room_id, member_id, peer.addr, peer.port);
         }
         break;
@@ -413,13 +444,13 @@ void HandleMatching2HandshakePacket(u32 from_addr, u16 from_port, bool relayed,
         break;
     case Matching2HandshakeKind::Pong:
         if (peer.ping_pending && pkt.nonce == peer.ping_seq) {
+            // recv_time is taken when the datagram arrives, before this handler waits for
+            // the state mutex. The wait is ours, not the link's.
             const auto rtt = std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - peer.last_ping_send);
+                recv_time - peer.last_ping_send);
             const u32 sample = static_cast<u32>(std::min<u64>(
                 static_cast<u64>(std::max<s64>(0, rtt.count())), std::numeric_limits<u32>::max()));
-            // A single sample carries the scheduling jitter of both ends; smooth it the way a
-            // signaling stack does so the reported value is stable between frames.
-            peer.ping_us = peer.ping_us == 0 ? sample : (peer.ping_us * 3 + sample) / 4;
+            PublishMatching2Ping(peer, sample);
             peer.ping_pending = false;
             UpdateMatching2PacketLoss(peer, false);
         }
@@ -502,7 +533,8 @@ void Matching2HandshakeThreadMain() {
             if (rc != sizeof(pkt)) {
                 break;
             }
-            HandleMatching2HandshakePacket(from_addr, from_port, relayed, pkt);
+            const auto recv_time = std::chrono::steady_clock::now();
+            HandleMatching2HandshakePacket(from_addr, from_port, relayed, pkt, recv_time);
         }
 
         const auto now = std::chrono::steady_clock::now();
@@ -518,6 +550,9 @@ void Matching2HandshakeThreadMain() {
                                      NpSignaling::Stubs::MmServerUdpPort());
         }
         for (u32 id = 1; id <= ContextManager::kMaxContexts; ++id) {
+            // One context at a time, so a room event on the ShadNet reader is not stuck behind
+            // the whole sweep. The sleep below this loop stays outside the lock.
+            std::lock_guard state_lock(Matching2StateMutex());
             ContextObject* ctx =
                 ContextManager::Instance().Get(static_cast<OrbisNpMatching2ContextId>(id));
             if (!ctx) {
@@ -532,6 +567,25 @@ void Matching2HandshakeThreadMain() {
             auto room_it = ctx->room_cache.find(ctx->room_id);
             if (room_it == ctx->room_cache.end()) {
                 continue;
+            }
+            // A member that left is erased by the room-event handler, but a late handshake packet
+            // can put the entry back. Drop anything the room no longer has before this sweep
+            // takes references into the map.
+            for (auto peer_it = ctx->peers.begin(); peer_it != ctx->peers.end();) {
+                const bool still_member =
+                    room_it->second.members.find(peer_it->first) != room_it->second.members.end();
+                if (still_member) {
+                    ++peer_it;
+                    continue;
+                }
+                if (peer_it->second.relay_active && peer_it->second.addr != 0 &&
+                    peer_it->second.port != 0) {
+                    Net::SetP2PPeerRelayed(peer_it->second.addr, peer_it->second.port, false);
+                }
+                LOG_DEBUG(Lib_NpMatching2,
+                          "Matching2 peer {} dropped: it is no longer a member of room {}",
+                          peer_it->first, ctx->room_id);
+                peer_it = ctx->peers.erase(peer_it);
             }
             if (should_log_status) {
                 LogMatching2PeerStatus(*ctx);
@@ -645,6 +699,7 @@ void QueueMatching2SignalingEvent(ContextObject& ctx, OrbisNpMatching2RoomId roo
 
 void StartMatching2PeerHandshake(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
                                  OrbisNpMatching2RoomMemberId member_id) {
+    std::lock_guard state_lock(Matching2StateMutex());
     auto room_it = ctx.room_cache.find(room_id);
     if (room_it == ctx.room_cache.end() ||
         !ShouldConnectToPeer(room_it->second, ctx.my_member_id, member_id)) {
@@ -660,6 +715,11 @@ void StartMatching2PeerHandshake(ContextObject& ctx, OrbisNpMatching2RoomId room
     PeerInfo& peer = ctx.peers[member_id];
     peer.member_id = member_id;
     if (peer.status == kMatching2ConnActive) {
+        return;
+    }
+    // A second join notice for someone we are already punching must not clear sent_check
+    // and start the offer over.
+    if (peer.handshake_started) {
         return;
     }
     ResolvePeerEndpoint(member_it->second, peer);
@@ -678,6 +738,7 @@ void StartMatching2PeerHandshake(ContextObject& ctx, OrbisNpMatching2RoomId room
 }
 
 void StartMatching2SignalingForRoomPeers(ContextObject& ctx, OrbisNpMatching2RoomId room_id) {
+    std::lock_guard state_lock(Matching2StateMutex());
     const auto room_it = ctx.room_cache.find(room_id);
     if (room_it == ctx.room_cache.end()) {
         return;
@@ -689,6 +750,7 @@ void StartMatching2SignalingForRoomPeers(ContextObject& ctx, OrbisNpMatching2Roo
 
 void QueueMatching2DeadForRoomPeers(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
                                     s32 error_code) {
+    std::lock_guard state_lock(Matching2StateMutex());
     auto room_it = ctx.room_cache.find(room_id);
     if (room_it == ctx.room_cache.end()) {
         return;
@@ -741,6 +803,7 @@ void StopMatching2HandshakeThread() {
 }
 
 u32 GetRoomPingUs(const ContextObject& ctx, OrbisNpMatching2RoomId roomId) {
+    std::lock_guard state_lock(Matching2StateMutex());
     const auto room_it = ctx.room_cache.find(roomId);
     if (room_it == ctx.room_cache.end()) {
         return 0;
@@ -764,6 +827,7 @@ u32 GetRoomPingUs(const ContextObject& ctx, OrbisNpMatching2RoomId roomId) {
 }
 
 void* BuildSignalingGetPingInfoPayload(ContextObject& ctx, OrbisNpMatching2RoomId roomId) {
+    std::lock_guard state_lock(Matching2StateMutex());
     CallbackPayload& p =
         ctx.request_payload_override ? *ctx.request_payload_override : ctx.request_payload;
     p.Reset();
@@ -795,6 +859,7 @@ s32 FillMatching2ConnectionInfo(const ContextObject& ctx, OrbisNpMatching2RoomId
         return ORBIS_NP_MATCHING2_ERROR_INVALID_ARGUMENT;
     }
 
+    std::lock_guard state_lock(Matching2StateMutex());
     const auto room_it = ctx.room_cache.find(roomId);
     if (room_it == ctx.room_cache.end()) {
         LOG_INFO(Lib_NpMatching2, "room={} not cached for connection info", roomId);

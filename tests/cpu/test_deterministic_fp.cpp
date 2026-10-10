@@ -106,9 +106,8 @@ DecodedInstruction Assemble(const std::function<void(Xbyak::CodeGenerator&)>& em
 
     ZydisDecoder decoder;
     ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-    const auto status = ZydisDecoderDecodeFull(&decoder, decoded.bytes.data(),
-                                               decoded.bytes.size(), &decoded.info,
-                                               decoded.operands);
+    const auto status = ZydisDecoderDecodeFull(&decoder, decoded.bytes.data(), decoded.bytes.size(),
+                                               &decoded.info, decoded.operands);
     EXPECT_TRUE(ZYAN_SUCCESS(status)) << "failed to decode the assembled instruction";
     return decoded;
 }
@@ -288,8 +287,8 @@ void ExpectWithinEstimateBudget(u32 hardware_bits, u32 replacement_bits, float i
 
 /// Finite positive inputs, where the estimate error budget is meaningful.
 const std::vector<float> kFinitePositiveInputs = {
-    1.0f,          4.0f,        0.25f,        2.0f,          1e-20f,       1e20f,
-    3.14159265f,   1.17549435e-38f,           3.40282347e38f, 16777216.0f, 0.5f,
+    1.0f,           4.0f,        0.25f, 2.0f, 1e-20f, 1e20f, 3.14159265f, 1.17549435e-38f,
+    3.40282347e38f, 16777216.0f, 0.5f,
 };
 
 /// Values whose behaviour is specified rather than approximate.
@@ -337,17 +336,14 @@ protected:
 // vrsqrtss xmm1, xmm0, xmm0 is the shape that dominates Maxi Boost ON: 1152 of its
 // 1258 estimate sites, and the destination aliases neither source.
 TEST_F(DeterministicFpTest, VrsqrtssScalarMatchesLaneSemanticsAndStaysInBudget) {
-    const auto original = Assemble([](Xbyak::CodeGenerator& c) {
-        c.vrsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0), Xbyak::Xmm(0));
-    });
+    const auto original = Assemble(
+        [](Xbyak::CodeGenerator& c) { c.vrsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0), Xbyak::Xmm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRSQRTSS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTSS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTSS(nullptr, original.operands, c); }};
 
     EXPECT_FALSE(replacement.ContainsApproximation());
 
@@ -386,12 +382,10 @@ TEST_F(DeterministicFpTest, VrsqrtssScalarMatchesLaneSemanticsAndStaysInBudget) 
 // +0, -0, infinities and NaNs. -0 is the one documented departure from hardware: the
 // reordered form returns NaN where the estimate returns -inf.
 TEST_F(DeterministicFpTest, VrsqrtssSpecialValuesFollowTheDocumentedModel) {
-    const auto original = Assemble([](Xbyak::CodeGenerator& c) {
-        c.vrsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0), Xbyak::Xmm(0));
-    });
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTSS(nullptr, original.operands, c);
-    }};
+    const auto original = Assemble(
+        [](Xbyak::CodeGenerator& c) { c.vrsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0), Xbyak::Xmm(0)); });
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTSS(nullptr, original.operands, c); }};
 
     for (const u32 input_bits : kSpecialInputBits) {
         VectorState state = MakeState();
@@ -416,16 +410,14 @@ TEST_F(DeterministicFpTest, VrsqrtssSpecialValuesFollowTheDocumentedModel) {
 }
 
 TEST_F(DeterministicFpTest, VrsqrtpsNarrowMatchesEveryLane) {
-    const auto original = Assemble(
-        [](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(0)); });
+    const auto original =
+        Assemble([](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Xmm(1), Xbyak::Xmm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRSQRTPS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTPS(nullptr, original.operands, c); }};
 
     EXPECT_FALSE(replacement.ContainsApproximation());
 
@@ -449,16 +441,14 @@ TEST_F(DeterministicFpTest, VrsqrtpsNarrowMatchesEveryLane) {
 }
 
 TEST_F(DeterministicFpTest, VrsqrtpsWideCoversAllEightLanes) {
-    const auto original = Assemble(
-        [](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Ymm(1), Xbyak::Ymm(0)); });
+    const auto original =
+        Assemble([](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Ymm(1), Xbyak::Ymm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRSQRTPS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTPS(nullptr, original.operands, c); }};
 
     VectorState hardware = MakeState();
     for (int lane = 0; lane < LanesPerRegister; ++lane) {
@@ -483,12 +473,10 @@ TEST_F(DeterministicFpTest, VrcppsIsExactReciprocal) {
         Assemble([](Xbyak::CodeGenerator& c) { c.vrcpps(Xbyak::Ymm(2), Xbyak::Ymm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRCPPS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRCPPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRCPPS(nullptr, original.operands, c); }};
 
     EXPECT_FALSE(replacement.ContainsApproximation());
 
@@ -508,19 +496,82 @@ TEST_F(DeterministicFpTest, VrcppsIsExactReciprocal) {
     }
 }
 
+// ApplyStaticRewrites emits a trampoline span, and rewinds the generator with setSize()
+// when the span turns out not to encode. The next span is then emitted over the bytes the
+// failure gave back. A constant pool emitted inside a rewound attempt is therefore
+// overwritten while a cached address still points at it, and every replacement after that
+// would read its 1.0 out of the code that replaced it - silently, since nothing faults.
+TEST_F(DeterministicFpTest, ConstantPoolOutlivesARewoundTrampolineAttempt) {
+    const auto original =
+        Assemble([](Xbyak::CodeGenerator& c) { c.vrcpps(Xbyak::Ymm(2), Xbyak::Ymm(0)); });
+
+    // Nothing over the rewound bytes leaves the pool intact but below the generator's
+    // size; a following span overwrites it. Both have to be caught.
+    for (const int filler : {0, 128}) {
+        SCOPED_TRACE(filler == 0 ? "rewound, nothing written over it"
+                                 : "rewound, the next span took the bytes");
+
+        Stub replacement{[&](Xbyak::CodeGenerator& c) {
+            const size_t attempt = c.getSize();
+            Fp::GenerateVRCPPS(nullptr, original.operands, c);
+            c.setSize(attempt);
+            if (filler != 0) {
+                c.nop(filler);
+            }
+            Fp::GenerateVRCPPS(nullptr, original.operands, c);
+        }};
+
+        VectorState patched = MakeState();
+        for (int lane = 0; lane < LanesPerRegister; ++lane) {
+            patched.lane[0][lane] = Bits(kFinitePositiveInputs[lane]);
+        }
+        replacement.Run(patched);
+
+        for (int lane = 0; lane < LanesPerRegister; ++lane) {
+            EXPECT_EQ(Bits(ModelReciprocal(kFinitePositiveInputs[lane])), patched.lane[2][lane])
+                << "lane " << lane << " took its constant from discarded bytes";
+        }
+    }
+}
+
+// The arrangement the pass actually uses: reserving the pool before the first site puts it
+// below every offset a later rewind can return to, so no failed attempt can reach it.
+TEST_F(DeterministicFpTest, ReservedConstantPoolSitsBelowEveryLaterAttempt) {
+    const auto original =
+        Assemble([](Xbyak::CodeGenerator& c) { c.vrcpps(Xbyak::Ymm(2), Xbyak::Ymm(0)); });
+
+    Stub replacement{[&](Xbyak::CodeGenerator& c) {
+        Fp::ReserveConstantPool(c);
+        const size_t attempt = c.getSize();
+        Fp::GenerateVRCPPS(nullptr, original.operands, c);
+        c.setSize(attempt);
+        c.nop(128);
+        Fp::GenerateVRCPPS(nullptr, original.operands, c);
+    }};
+
+    VectorState patched = MakeState();
+    for (int lane = 0; lane < LanesPerRegister; ++lane) {
+        patched.lane[0][lane] = Bits(kFinitePositiveInputs[lane]);
+    }
+    replacement.Run(patched);
+
+    for (int lane = 0; lane < LanesPerRegister; ++lane) {
+        EXPECT_EQ(Bits(ModelReciprocal(kFinitePositiveInputs[lane])), patched.lane[2][lane])
+            << "lane " << lane;
+    }
+}
+
 // The destination aliasing its source forces the generator down the scratch path, which
 // has to spill below the guest red zone and restore what it borrowed.
 TEST_F(DeterministicFpTest, VrsqrtpsWithAliasedOperandsRestoresScratch) {
-    const auto original = Assemble(
-        [](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Ymm(2), Xbyak::Ymm(2)); });
+    const auto original =
+        Assemble([](Xbyak::CodeGenerator& c) { c.vrsqrtps(Xbyak::Ymm(2), Xbyak::Ymm(2)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRSQRTPS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTPS(nullptr, original.operands, c); }};
 
     VectorState hardware = MakeState();
     for (int lane = 0; lane < LanesPerRegister; ++lane) {
@@ -553,12 +604,10 @@ TEST_F(DeterministicFpTest, VrsqrtpsWithMemorySourceRebuildsTheOperand) {
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_VRSQRTPS);
     ASSERT_EQ(original.operands[1].type, ZYDIS_OPERAND_TYPE_MEMORY);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateVRSQRTPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateVRSQRTPS(nullptr, original.operands, c); }};
 
     VectorState hardware = MakeState();
     for (int lane = 0; lane < 4; ++lane) {
@@ -583,12 +632,10 @@ TEST_F(DeterministicFpTest, LegacyRsqrtssPreservesTheDestinationUpperLanes) {
         Assemble([](Xbyak::CodeGenerator& c) { c.rsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_RSQRTSS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateRSQRTSS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateRSQRTSS(nullptr, original.operands, c); }};
 
     EXPECT_FALSE(replacement.ContainsApproximation());
 
@@ -625,12 +672,10 @@ TEST_F(DeterministicFpTest, LegacyRsqrtssPreservesTheDestinationUpperLanes) {
 TEST_F(DeterministicFpTest, LegacyRsqrtssKeepsHardwareSignedZeroBehaviour) {
     const auto original =
         Assemble([](Xbyak::CodeGenerator& c) { c.rsqrtss(Xbyak::Xmm(1), Xbyak::Xmm(0)); });
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateRSQRTSS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateRSQRTSS(nullptr, original.operands, c); }};
 
     VectorState hardware = MakeState();
     hardware.lane[0][0] = 0x80000000u; // -0
@@ -648,12 +693,10 @@ TEST_F(DeterministicFpTest, LegacyRcppsIsExactReciprocal) {
         Assemble([](Xbyak::CodeGenerator& c) { c.rcpps(Xbyak::Xmm(1), Xbyak::Xmm(0)); });
     ASSERT_EQ(original.info.mnemonic, ZYDIS_MNEMONIC_RCPPS);
 
-    Stub reference{[&](Xbyak::CodeGenerator& c) {
-        c.db(original.bytes.data(), original.bytes.size());
-    }};
-    Stub replacement{[&](Xbyak::CodeGenerator& c) {
-        Fp::GenerateRCPPS(nullptr, original.operands, c);
-    }};
+    Stub reference{
+        [&](Xbyak::CodeGenerator& c) { c.db(original.bytes.data(), original.bytes.size()); }};
+    Stub replacement{
+        [&](Xbyak::CodeGenerator& c) { Fp::GenerateRCPPS(nullptr, original.operands, c); }};
 
     EXPECT_FALSE(replacement.ContainsApproximation());
 

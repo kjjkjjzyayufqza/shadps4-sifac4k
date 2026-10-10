@@ -1612,7 +1612,17 @@ int PS4_SYSV_ABI sceNetResolverCreate(const char* name, int poolid, int flags) {
 }
 
 int PS4_SYSV_ABI sceNetResolverDestroy(OrbisNetId resolverid) {
-    LOG_ERROR(Lib_Net, "(STUBBED) called rid = {}", resolverid);
+    // Every sceNetResolverCreate takes a handle-table slot. Not releasing it here leaked one per
+    // name lookup: a title that resolves a host each time it retries a connection eventually runs
+    // the table out, and the failure shows up as an unrelated socket call failing.
+    auto* file = FDTable::Instance()->GetFile(resolverid);
+    if (file == nullptr || !file->is_opened || file->type != Core::FileSys::FileType::Resolver) {
+        LOG_ERROR(Lib_Net, "ResolverDestroy: rid={} is not an open resolver", resolverid);
+        *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+        return ORBIS_NET_ERROR_EBADF;
+    }
+    LOG_INFO(Lib_Net, "ResolverDestroy: rid={}", resolverid);
+    FDTable::Instance()->DeleteHandle(resolverid);
     return ORBIS_OK;
 }
 

@@ -16,6 +16,17 @@ namespace Libraries::Np::NpMatching2 {
 constexpr u32 ORBIS_NP_MATCHING2_SESSION_PASSWORD_SIZE = 8;
 constexpr u32 ORBIS_NP_MATCHING2_GROUP_LABEL_SIZE = 8;
 
+// The room-member internal attribute is the only per-member blob the matching service carries.
+// libSceNpMatching2 rejects any other id for SetRoomMemberDataInternal (module offset 0x5BD90
+// compares against 0x59 literally) and any payload above 64 bytes.
+constexpr u64 ORBIS_NP_MATCHING2_ROOMMEMBER_BIN_ATTR_INTERNAL_MAX_SIZE = 64;
+
+// Room member ids are allocated by the matching server as (slot << 4) | counter with slot in
+// 1..64 and a non-zero counter, so a valid id always lands in this window with a non-zero low
+// nibble. libSceNpMatching2 enforces exactly that before sending a member-scoped request.
+constexpr u16 ORBIS_NP_MATCHING2_ROOM_MEMBER_ID_MIN = 16;
+constexpr u16 ORBIS_NP_MATCHING2_ROOM_MEMBER_ID_MAX = 1039;
+
 // Default initialization values
 enum OrbisNpMatching2InitDefault : u64 {
     ORBIS_NP_MATCHING2_THREAD_STACK_SIZE_DEFAULT = 32768,
@@ -67,9 +78,17 @@ enum OrbisNpMatching2Event : u16 {
     ORBIS_NP_MATCHING2_REQUEST_EVENT_KICKOUT_ROOM_MEMBER = 0x0104,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_GRANT_ROOM_OWNER = 0x0105,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SEARCH_ROOM = 0x0106,
+    // 0x0107, 0x010B..0x010D read out of libSceNpMatching2 itself: each request builder writes
+    // its event id as `mov word ptr [msg+0Ah], imm16`, so the value is a literal in the module
+    // (SendRoomChatMessage at module+0x5338D, SetRoomMemberDataInternal at +0x55D2D,
+    // GetRoomMemberDataInternal at +0x55881, SetSignalingOptParam at +0x5420D).
+    ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_CHAT_MESSAGE = 0x0107,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SEND_ROOM_MESSAGE = 0x0108,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_DATA_INTERNAL = 0x0109,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_DATA_INTERNAL = 0x010A,
+    ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_ROOM_MEMBER_DATA_INTERNAL = 0x010B,
+    ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_MEMBER_DATA_INTERNAL = 0x010C,
+    ORBIS_NP_MATCHING2_REQUEST_EVENT_SET_SIGNALING_OPT_PARAM = 0x010D,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_JOIN_LOBBY = 0x0201,
     ORBIS_NP_MATCHING2_REQUEST_EVENT_SIGNALING_GET_PING_INFO = 0x0E01,
     ORBIS_NP_MATCHING2_ROOM_EVENT_MEMBER_JOINED = 0x1101,
@@ -852,6 +871,74 @@ struct OrbisNpMatching2GetRoomDataInternalRequest {
     u64 attrIdNum;
 };
 
+// SetRoomMemberDataInternal request.
+//
+// Field placement is taken from libSceNpMatching2's own validator (NID HoqTrkS9c5Q, module
+// offset 0x5BD90) and its serializer (module offset 0x4B900), which read exactly these
+// offsets: roomId at 0, memberId at 8, teamId at 10, two flag words at 16/20, and the bin
+// attribute pointer/count at 24/32. The five bytes at 11 must be zero or the library returns
+// INVALID_ARGUMENT, so the padding is part of the contract and not an implementation detail.
+struct OrbisNpMatching2SetRoomMemberDataInternalRequest {
+    OrbisNpMatching2RoomId roomId;
+    OrbisNpMatching2RoomMemberId memberId; // 0 targets the caller
+    OrbisNpMatching2TeamId teamId;         // 0 leaves the team assignment untouched
+    u8 padding[5];
+    OrbisNpMatching2Flags flagFilter;
+    OrbisNpMatching2Flags flagAttr;
+    const OrbisNpMatching2BinAttr* roomMemberBinAttrInternal;
+    u64 roomMemberBinAttrInternalNum;
+};
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest, memberId) == 0x08);
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest, teamId) == 0x0A);
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest, flagFilter) == 0x10);
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest, flagAttr) == 0x14);
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest,
+                       roomMemberBinAttrInternal) == 0x18);
+static_assert(offsetof(OrbisNpMatching2SetRoomMemberDataInternalRequest,
+                       roomMemberBinAttrInternalNum) == 0x20);
+static_assert(sizeof(OrbisNpMatching2SetRoomMemberDataInternalRequest) == 0x28);
+
+// GetRoomMemberDataInternal request (validator at module offset 0x5BD30). The six bytes after
+// memberId must be zero; memberId itself must be a live room member id, which the server hands
+// out as (slot << 4) | counter, hence the 16..1039 range the library enforces.
+struct OrbisNpMatching2GetRoomMemberDataInternalRequest {
+    OrbisNpMatching2RoomId roomId;
+    OrbisNpMatching2RoomMemberId memberId;
+    u8 padding[6];
+};
+static_assert(offsetof(OrbisNpMatching2GetRoomMemberDataInternalRequest, memberId) == 0x08);
+static_assert(sizeof(OrbisNpMatching2GetRoomMemberDataInternalRequest) == 0x10);
+
+// GetRoomMemberDataInternal response
+struct OrbisNpMatching2GetRoomMemberDataInternalResponse {
+    OrbisNpMatching2RoomMemberDataInternal* roomMemberDataInternal;
+};
+
+// GetRoomMemberDataInternal response (account-id variant)
+struct OrbisNpMatching2GetRoomMemberDataInternalResponseA {
+    OrbisNpMatching2RoomMemberDataInternalA* roomMemberDataInternal;
+};
+
+// SetSignalingOptParam request (validator at module offset 0x5BB80: roomId non-zero, the four
+// bytes at 12 zero). The payload is the same 8-byte option block GetSignalingOptParamLocal
+// returns, so a title can read back exactly what it set.
+struct OrbisNpMatching2SetSignalingOptParamRequest {
+    OrbisNpMatching2RoomId roomId;
+    OrbisNpMatching2SignalingOptParam sigOptParam;
+};
+static_assert(offsetof(OrbisNpMatching2SetSignalingOptParamRequest, sigOptParam) == 0x08);
+static_assert(sizeof(OrbisNpMatching2SetSignalingOptParamRequest) == 0x10);
+
+// Allocator accounting reported by sceNpMatching2GetMemoryInfo / GetSslMemoryInfo. The library
+// writes the three sizes in this order (module offset 0x4F290 stores total first, then swaps
+// the remaining 16 bytes so current precedes maximum).
+struct OrbisNpMatching2MemoryInfo {
+    u64 totalMemSize;
+    u64 curMemUsage;
+    u64 maxMemUsage;
+};
+static_assert(sizeof(OrbisNpMatching2MemoryInfo) == 0x18);
+
 // SetUserInfo request
 struct OrbisNpMatching2SetUserInfoRequest {
     OrbisNpMatching2ServerId serverId;
@@ -951,6 +1038,22 @@ struct OrbisNpMatching2RoomMemberUpdateA {
     OrbisNpMatching2RoomMemberDataInternalA* roomMemberDataInternal;
     OrbisNpMatching2EventCause eventCause;
     u8 padding[7];
+    OrbisNpMatching2PresenceOptionData optData;
+};
+
+// Room owner update information, delivered with ROOM_EVENT_ROOM_OWNER_CHANGED (0x1105).
+//
+// Provenance: unlike the request structures above, this layout was not read back out of
+// libSceNpMatching2 - the module's event path only exposes the wire message, not the callback
+// struct. It follows the same SDK struct family as the room/member update structures in this
+// header. The builder zero-initialises the whole object and gives roomPassword a real address,
+// so a title reading a field this layout places differently sees zeroes rather than garbage.
+struct OrbisNpMatching2RoomOwnerUpdateInfo {
+    OrbisNpMatching2RoomMemberId prevOwner;
+    OrbisNpMatching2RoomMemberId newOwner;
+    OrbisNpMatching2EventCause eventCause;
+    u8 padding[3];
+    OrbisNpMatching2SessionPassword* roomPassword;
     OrbisNpMatching2PresenceOptionData optData;
 };
 

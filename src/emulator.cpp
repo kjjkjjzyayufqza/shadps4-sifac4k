@@ -436,10 +436,12 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
         EmulatorSettings.GetWindowsGuestRedZoneProtectionMode());
     // Deterministic floating point for lockstep P2P titles
     DeterministicFp::SetEnabled(EmulatorSettings.IsDeterministicFloatingPoint());
-    DeterministicFp::LogHostEnvironmentReport();
     // Switch to configured log
     Common::Log::Switch((!id.empty() && EmulatorSettings.IsLogSeparate()) ? id + ".log"
                                                                           : "shad_log.txt");
+    // After the switch: it truncates the log file, and a report written before it never
+    // reaches the log a tester sends back.
+    DeterministicFp::LogHostEnvironmentReport();
 #ifdef _WIN32
     // Windows static guest red-zone protection
     if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {

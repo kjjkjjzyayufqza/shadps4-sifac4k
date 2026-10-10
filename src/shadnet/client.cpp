@@ -12,6 +12,7 @@
 #include "common/scm_rev.h"
 #include "common/thread.h"
 #include "link_liveness.h"
+#include "resolve.h"
 #include "shadnet.pb.h"
 
 #ifdef _WIN32
@@ -312,64 +313,70 @@ void ShadNetClient::WriterThread() {
 
 bool ShadNetClient::DoConnect() {
     m_state = ShadNetState::Ok; // reset; this attempt sets a failure code only on error
-    struct addrinfo hints{}, *res_list = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (::getaddrinfo(m_host.c_str(), std::to_string(m_port).c_str(), &hints, &res_list) != 0 ||
-        !res_list) {
-        LOG_ERROR(ShadNet, "DNS resolution failed for '{}'", m_host);
+    const std::vector<u32> addresses = ResolveIPv4(m_host);
+    if (addresses.empty()) {
         m_state = ShadNetState::FailureResolve;
         return false;
     }
 
-    m_sock = ::socket(res_list->ai_family, SOCK_STREAM, IPPROTO_TCP);
-    if (m_sock == SHAD_INVALID_SOCK) {
-        ::freeaddrinfo(res_list);
-        m_state = ShadNetState::FailureConnect;
-        return false;
-    }
-
-    // Use non-blocking connect + select() so we time out instead of hanging
-    // for the OS default TCP timeout (75 s on Linux, >20 s on Windows).
-#ifdef _WIN32
-    {
-        u_long nb = 1;
-        ::ioctlsocket(m_sock, FIONBIO, &nb);
-    }
-#else
-    {
-        int fl = ::fcntl(m_sock, F_GETFL, 0);
-        ::fcntl(m_sock, F_SETFL, fl | O_NONBLOCK);
-    }
-#endif
-
-    const int cr = ::connect(m_sock, res_list->ai_addr, static_cast<int>(res_list->ai_addrlen));
-    ::freeaddrinfo(res_list);
-
+    // Every A record, not only the first. A blackholed address must not consume the
+    // whole connect budget before the next one is tried.
     bool connected = false;
+    for (const u32 addr_be : addresses) {
+        if (connected || m_terminate) {
+            break;
+        }
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(static_cast<u16>(m_port));
+        dst.sin_addr.s_addr = addr_be;
+
+        m_sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (m_sock == SHAD_INVALID_SOCK) {
+            continue;
+        }
+
+        // Non-blocking connect + select(), so a dead address cannot sit on the OS TCP timeout.
 #ifdef _WIN32
-    const bool in_progress = (cr < 0 && WSAGetLastError() == WSAEWOULDBLOCK);
+        {
+            u_long nb = 1;
+            ::ioctlsocket(m_sock, FIONBIO, &nb);
+        }
 #else
-    const bool in_progress = (cr < 0 && errno == EINPROGRESS);
+        {
+            int fl = ::fcntl(m_sock, F_GETFL, 0);
+            ::fcntl(m_sock, F_SETFL, fl | O_NONBLOCK);
+        }
 #endif
-    if (cr == 0 || in_progress) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(m_sock, &wfds);
-        struct timeval tv{static_cast<long>(SHAD_CONNECT_TIMEOUT_MS / 1000),
-                          static_cast<long>((SHAD_CONNECT_TIMEOUT_MS % 1000) * 1000)};
-        if (::select(static_cast<int>(m_sock) + 1, nullptr, &wfds, nullptr, &tv) > 0) {
-            int err = 0;
-            socklen_t len = sizeof(err);
-            ::getsockopt(m_sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
-            connected = (err == 0);
+
+        const int cr = ::connect(m_sock, reinterpret_cast<sockaddr*>(&dst), sizeof(dst));
+#ifdef _WIN32
+        const bool in_progress = (cr < 0 && WSAGetLastError() == WSAEWOULDBLOCK);
+#else
+        const bool in_progress = (cr < 0 && errno == EINPROGRESS);
+#endif
+        if (cr == 0 || in_progress) {
+            fd_set wfds;
+            FD_ZERO(&wfds);
+            FD_SET(m_sock, &wfds);
+            struct timeval tv{static_cast<long>(SHAD_CONNECT_TIMEOUT_MS / 1000),
+                              static_cast<long>((SHAD_CONNECT_TIMEOUT_MS % 1000) * 1000)};
+            if (::select(static_cast<int>(m_sock) + 1, nullptr, &wfds, nullptr, &tv) > 0) {
+                int err = 0;
+                socklen_t len = sizeof(err);
+                ::getsockopt(m_sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&err), &len);
+                connected = (err == 0);
+            }
+        }
+        if (!connected) {
+            LOG_WARNING(ShadNet, "connect() timed out or failed for {}:{}, trying next address",
+                        m_host, m_port);
+            SHAD_CLOSE(m_sock);
+            m_sock = SHAD_INVALID_SOCK;
         }
     }
     if (!connected) {
         LOG_ERROR(ShadNet, "connect() timed out or failed for {}:{}", m_host, m_port);
-        SHAD_CLOSE(m_sock);
-        m_sock = SHAD_INVALID_SOCK;
         m_state = ShadNetState::FailureConnect;
         return false;
     }
@@ -943,6 +950,9 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.flags = pb.flags();
         n.has_passwd_mask = pb.has_passwd_mask();
         n.passwd_slot_mask = pb.passwd_slot_mask();
+        n.signaling_type = pb.signaling_type();
+        n.signaling_flag = pb.signaling_flag();
+        n.signaling_hub_member_id = pb.signaling_hub_member_id();
         if (pb.has_member()) {
             const auto& m = pb.member();
             n.member_npid = m.npid();
@@ -998,6 +1008,9 @@ void ShadNetClient::HandleNotification(u16 cmd_raw, const std::vector<u8>& paylo
         n.src_account_id = pb.src_account_id();
         n.src_platform = pb.src_platform();
         n.msg.assign(pb.msg().begin(), pb.msg().end());
+        n.is_chat = pb.is_chat();
+        LOG_DEBUG(ShadNet, "RoomMessage room_id={} src={} cast={} chat={} bytes={}", n.room_id,
+                  n.src_member_id, n.cast_type, n.is_chat, n.msg.size());
         if (onRoomMessage)
             onRoomMessage(n);
         break;

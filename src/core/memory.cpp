@@ -356,7 +356,7 @@ s32 MemoryManager::Free(PAddr phys_addr, u64 size, bool is_checked) {
     std::scoped_lock lk2{mutex};
 
     for (const auto& [addr, size] : remove_list) {
-        LOG_INFO(Kernel_Vmm, "Unmapping direct mapping {:#x} with size {:#x}", addr, size);
+        LOG_DEBUG(Kernel_Vmm, "Unmapping direct mapping {:#x} with size {:#x}", addr, size);
         UnmapMemoryImpl(addr, size);
     }
 

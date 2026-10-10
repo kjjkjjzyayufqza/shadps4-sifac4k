@@ -6,7 +6,8 @@ SPDX-License-Identifier: GPL-2.0-or-later
 # Deterministic Floating Point for Lockstep P2P Titles (GVS / MBON)
 
 Status: layers A and B are implemented, tested, and at full instruction coverage on both
-titles; the diagnostics are implemented; C, D and E are not.
+titles - measured against every estimate in the unwind bodies, not only the ones the walk
+reached (section 11.11); the diagnostics are implemented; C, D and E are not.
 See section 11 for what was measured on real hardware and what remains.
 Scope: `src/core/cpu_patches.*`, `src/core/module.cpp`,
        `src/core/libraries/libc_internal/libc_internal_math.cpp`,
@@ -725,9 +726,10 @@ execution on an AMD host, closing the O9 sub-item.
 |---|---|---|
 | B - replacement generators | Done, 19 differential tests | `src/core/cpu_patches_fp.{h,cpp}`, `tests/cpu/test_deterministic_fp.cpp` |
 | A - generalised static AOT rewrite pass | Done | `ApplyStaticRewrites` in `src/core/cpu_patches.cpp`, `src/core/module.cpp` |
-| Setting | Done, per-title override, default off | `DeterministicFpSettings` in `src/core/emulator_settings.h`, JSON group `DeterministicFp` |
+| Setting | Done, per-title override, global default off; CUSA08379 / CUSA15006 auto-enable unless the profile sets false | `DeterministicFpSettings` in `src/core/emulator_settings.h`, JSON group `DeterministicFp` |
 | Startup diagnostics | Done, always on in release | `src/core/deterministic_fp_report.{h,cpp}` |
-| Verified branch targets | Done, takes MBON to full coverage | `src/core/branch_targets.{h,cpp}`, `scripts/export_branch_targets.py` |
+| Verified branch targets | Done, takes MBON to full coverage; tied to one build by the exported `bodies` count | `src/core/branch_targets.{h,cpp}`, `scripts/export_branch_targets.py` |
+| Borrowing exposure | Measured per module, `[FPDIAG] relocation` | `StaticRewriteResult::fp_borrowed_*` in `src/core/cpu_patches.{h,cpp}` |
 | C - deterministic libm | Not started | - |
 | D - profile negotiation | Not started | - |
 | E - divergence harness | Not started | - |
@@ -886,6 +888,9 @@ video and audio path both run.
 | MBON CUSA15006 | 1243 | **1243** | **0** | 1429 of 1429 used |
 | GVS CUSA08379 | 2535 | **2535** | **0** | 3385 of 3385 used |
 
+These counts are wrong, and section 11.11 explains why: they are the estimates the walk
+decoded, and 15 in MBON and 191 in GVS sat where it never looked.
+
 Getting there took three corrections to the exporter, each found by measuring rather than
 reasoning:
 
@@ -944,9 +949,9 @@ Install, per title:
 Boot the title once and send back the lines containing `FPDIAG`. Two things are being
 read from them:
 
-- `coverage eboot.bin: N found, N replaced, 0 left unsupported`. Anything else means the
-  side-car did not match that build of the title, and the run says nothing about
-  determinism.
+- `coverage eboot.bin: N found, N replaced, 0 left unsupported`, with N = 1258 for MBON and
+  2726 for GVS. Anything else means the side-car did not match that build of the title, and
+  the run says nothing about determinism.
 - The three fingerprints, compared against an Intel log:
 
 | Fingerprint | Expected | Meaning if it differs |
@@ -955,6 +960,146 @@ read from them:
 | `libm.fingerprint` | identical | O7 is live: the peers desync on the first transcendental whatever the instruction patching does |
 | `estimate.fingerprint` | differs | confirms the mechanism this work removes; identical values would mean the premise is wrong |
 
-Intel reference, Core i7-12700K, Windows: `estimate.fingerprint=3CEFC9F88621AF41`,
-`replacement.fingerprint=59B2788E530449CF`, `libm.fingerprint=F85085DB4ECB276D`.
+Intel reference, Core i7-12700K, Windows, measured 2026-09-21 on the build carrying section
+11.11: `estimate.fingerprint=3CEFC9F88621AF41`, `replacement.fingerprint=944E09D51CD86E80`,
+`libm.fingerprint=F85085DB4ECB276D`. The replacement fingerprint describes the generators of
+one build; compare it only between peers running the same build.
 
+
+### 11.9 Three corrections found by running the titles, not by reasoning
+
+Measured 2026-09-20 on the Core i7-12700K, both titles launched directly with stdout to a
+file so neither the QtLauncher nor its log widget was in the picture.
+
+**The constant pool could be handed back to the next trampoline.** `emit_span` rewinds the
+generator with `setSize()` when a span turns out not to encode, and the next span is
+emitted over those bytes. The pool was emitted lazily at the first site that needed it and
+cached by address, so a pool emitted inside a rewound attempt was overwritten while the
+cache still pointed at it: every replacement after that would read its `1.0` out of code,
+at every site, with nothing faulting to say so. `ReserveConstantPool` now emits it before
+the first site, below every offset a later rewind can return to, and the cache validates
+the bytes it finds rather than trusting the offset.
+`DeterministicFpTest.ConstantPoolOutlivesARewoundTrampolineAttempt` pins it; reverting the
+fix makes all eight lanes wrong.
+
+**Turning the setting on used to move code the setting has nothing to do with.** With
+Windows red-zone protection disabled - which is how both titles are configured - enabling
+deterministic floating point switched on the whole static pass, and the pass relocated
+every short `extrq`, `insertq` and TCB-access site as well. Those already work from the
+illegal-instruction handler in every title not running the pass, so they are left there
+now; only estimates, or a red zone that actually asked for it, get relocated.
+
+**How much borrowing there is, and how much of it is vouched for.** The estimates are all
+shorter than a near jump, so a replacement borrows bytes from its neighbours, which is
+only sound where every address control flow can enter is known. The pass recovers targets
+inside a body; an entry from outside it - an exception landing pad - it cannot. That is
+what the exported target sets are for, and the export only described bodies with an
+indirect jump, which is a different set from the bodies that get borrowed in:
+
+| Title | replaced | borrowed neighbours | in bodies nothing vouched for |
+|---|---:|---:|---:|
+| GVS CUSA08379 | 2535 | 2485 | 2049 |
+| MBON CUSA15006 | 1243 | 1228 | 1027 |
+
+Both titles boot and play at those numbers, so this is exposure rather than a known
+defect, but it was invisible before and is now one `[FPDIAG] relocation` line per module.
+The exporter emits bodies holding an estimate as well now, which closes the third column
+on the next re-export; the files in use predate that change.
+
+### 11.10 The 30-second boot stalls are the antivirus
+
+Worth recording because it cost a full investigation round and twice looked like the
+rewrite corrupting the guest. Boots with the setting on stalled for exactly 30.009,
+30.004 and 30.016 seconds, on the loader thread and then on the guest thread, and the
+process was sometimes terminated with no shutdown log. It reproduces with no launcher and
+stdout going to a file, and it disappears entirely with the setting off on the same
+binary. The host runs Kaspersky with Defender passive. The pass writes thousands of
+patches into RWX memory and then executes them, which is what the behaviour scanner
+holds; the verdict is cached per binary, so only the first run or two after a rebuild are
+affected and later runs of the same file are clean.
+
+Nothing in the emulator can fix that, and nothing in the emulator should try. Exclude the
+build output and the user directory, and read a run that ends with `UpdatePlayTime` as a
+window close rather than a crash.
+
+### 11.11 Coverage that was reported but not real
+
+Measured 2026-09-21 after an Intel peer (Core i7-8700) and an AMD peer (Ryzen 7 7745HX)
+desynced in MBON while both logs read `1243 estimate sites found, 1243 replaced, 0 left
+unsupported`. In the same match the Intel world had 1P destroyed twice and never ended; the
+AMD world had 2P destroyed three times and went to the result screen. GVS between the same
+kind of machines stayed in sync.
+
+**The count only covered what the walk decoded.** `DecodeFunction` walks from each body's
+entry and follows the edges it can prove. A block reachable only through a jump table
+`ResolveBoundedJumpTable` cannot bound is never decoded, so an estimate there is never
+counted, never replaced, and nothing reports it. The recogniser gives up on ordinary compiler
+output: the index copied after the bounds check (`cmp ebx, 3; ja; mov eax, ebx`), the table
+base copied to another register, an unrelated store between the load and the add. The
+verified targets did name those case blocks, but `MergeVerifiedTargets` only added them as
+borrowing guards, never as places to decode from.
+
+Every estimate inside the unwind bodies, counted by a linear decode of each FDE range and
+checked against a replica of the walk that reproduces the runtime counts exactly:
+
+| Title | In the bodies | Walk decoded (old count) | Never decoded |
+|---|---:|---:|---:|
+| MBON CUSA15006 | 1258 | 1243 | **15** |
+| GVS CUSA08379 | 2726 | 2535 | **191** |
+
+The 15 are all four-byte encodings; that section 2 also counts 15 five-byte encodings is a
+coincidence, and it made the gap look explained. They include `sub_F27BF0` and `sub_F28260` (IDA
+addresses, module offset plus 0x400000): a switch over a compression type whose cases rebuild
+a quaternion's fourth component as `sqrt(1 - x² - y² - z²)` - animation keyframes - and a
+horizontal distance `(Δx)² + (Δz)²` in `sub_F01600`. Each estimate is followed by one
+Newton-Raphson step, which narrows the vendor difference but does not remove it. GVS's 191
+evidently sit off its simulation path, which is luck rather than a property.
+
+Ruled out on the same logs: both peers load `libSceLibcInternal.sprx` and `libc.sprx` LLE, so
+the host-libm exposure of O7 was not in play, and neither module contains an estimate or an
+x87 transcendental other than the exact `fscale`/`fxtract`. MBON's eboot has no DPPS, x87,
+SSE4a or `rdtsc`. Both peers' side-cars were identical and correct.
+
+**Fix, in three parts.**
+
+1. *Decode from the vouched-for targets.* Where the file covers a body's entry-rooted walk,
+   its targets inside the body become further starting points until no new one appears
+   (`WidenWithVerifiedTargets`). The file is a disassembler's analysis and can be wrong: in
+   MBON 96 targets sit in the middle of instructions, a misread table in one body putting a
+   target every 16 bytes. As borrowing guards they cost nothing; as starting points they
+   would invent instructions over real ones. So a target is a starting point only where the
+   linear decode of the function's range starts an instruction, and the widened walk is kept
+   only if every instruction it holds is one the linear decode agrees with and the file still
+   covers it. Otherwise the entry-rooted walk is kept, vouched for exactly as before. Only
+   deterministic floating point widens; red-zone-only runs are unchanged.
+2. *Count what the walk did not reach.* `Dwarf::DecodeEHFunctionBodies` reads each FDE's
+   `pc_begin`/`pc_range` (cross-checked against the search table). The pass decodes the gaps
+   the walk left inside each body and reports every estimate there as
+   `in code the walk never decoded`, so a shortfall can no longer read as full coverage. A
+   module whose extents cannot be read is reported as unverified.
+3. *Keep the report.* `LogHostEnvironmentReport` ran before `Common::Log::Switch`, which
+   truncates the log, so no tester log ever carried the fingerprints of 11.8. It now runs
+   after the switch.
+
+Measured on the Core i7-12700K with the side-cars already in testers' hands, no re-export:
+
+```
+[FPDIAG] coverage eboot.bin: 1258 estimate sites found, 1258 replaced, 0 left unsupported
+         (1425 functions used verified branch targets of 1425 in file, 268 of them decoded
+         further from those targets)
+[FPDIAG] relocation eboot.bin: 1243 of 1258 replaced sites borrowed neighbour bytes, 1027 of
+         those in bodies no external analysis vouched for
+
+[FPDIAG] coverage eboot.bin: 2726 estimate sites found, 2726 replaced, 0 left unsupported
+         (3377 functions used verified branch targets of 3377 in file, 731 of them decoded
+         further from those targets)
+[FPDIAG] relocation eboot.bin: 2665 of 2726 replaced sites borrowed neighbour bytes, 2049 of
+         those in bodies no external analysis vouched for
+```
+
+The unvouched-for borrowing counts are unchanged from 11.9: every newly replaced site borrows
+inside a vouched-for body. Both titles boot through engine initialisation and render.
+
+`tests/core/test_static_rewrite.cpp` runs the real pass over a hand-assembled switch of this
+shape and executes the result; `tests/core/test_dwarf_function_bodies.cpp` covers the FDE
+reader. Disabling either the root check or the agreement check makes a test fail.

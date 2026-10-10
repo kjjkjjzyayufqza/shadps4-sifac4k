@@ -36,6 +36,8 @@ enum class MmCommand : u16 {
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
     GetLobbyInfoList = 116,
+    SetRoomMemberDataInternal = 117,
+    SetSignalingOptParam = 118,
 };
 
 void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
@@ -93,6 +95,15 @@ s32 MmSetRoomDataInternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2Requ
                           const OrbisNpMatching2SetRoomDataInternalRequest& request);
 s32 MmSetRoomDataExternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                           const OrbisNpMatching2SetRoomDataExternalRequest& request);
+// Chat messages ride the same room-message command as SendRoomMessage; the request event the
+// title sees differs (0x0107 vs 0x0108) and the server tags the notification so the receiving
+// side can tell a chat line from a title-defined room message.
+s32 MmSendRoomChatMessage(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                          const OrbisNpMatching2SendRoomMessageRequest& request);
+s32 MmSetRoomMemberDataInternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                                const OrbisNpMatching2SetRoomMemberDataInternalRequest& request);
+s32 MmSetSignalingOptParam(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                           const OrbisNpMatching2SetSignalingOptParamRequest& request);
 s32 MmKickoutRoomMember(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                         const OrbisNpMatching2KickoutRoomMemberRequest& request);
 

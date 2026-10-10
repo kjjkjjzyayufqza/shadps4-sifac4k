@@ -5,6 +5,7 @@
 #include <vector>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/error_codes.h"
 #include "core/libraries/network/net_ctl_codes.h"
 #include "core/libraries/network/net_ctl_obj.h"
 #include "core/tls.h"
@@ -49,6 +50,38 @@ s32 NetCtlInternal::RegisterNpToolkitCallback(OrbisNetCtlCallbackForNpToolkit fu
     return next_id;
 }
 
+s32 NetCtlInternal::LastEventError(int event_type) const {
+    std::scoped_lock lock{m_mutex};
+    const auto it = last_event_errors.find(event_type);
+    return it == last_event_errors.end() ? 0 : it->second;
+}
+
+s32 NetCtlInternal::UnregisterCallback(int cid) {
+    if (cid < 0 || static_cast<size_t>(cid) >= callbacks.size()) {
+        return ORBIS_NET_CTL_ERROR_INVALID_ID;
+    }
+    std::scoped_lock lock{m_mutex};
+    if (callbacks[cid].func == nullptr) {
+        return ORBIS_NET_CTL_ERROR_ID_NOT_FOUND;
+    }
+    callbacks[cid] = NetCtlCallback{};
+    LOG_DEBUG(Lib_NetCtl, "unregistered callback {}", cid);
+    return ORBIS_OK;
+}
+
+s32 NetCtlInternal::UnregisterNpToolkitCallback(int cid) {
+    if (cid < 0 || static_cast<size_t>(cid) >= nptool_callbacks.size()) {
+        return ORBIS_NET_CTL_ERROR_INVALID_ID;
+    }
+    std::scoped_lock lock{m_mutex};
+    if (nptool_callbacks[cid].func == nullptr) {
+        return ORBIS_NET_CTL_ERROR_ID_NOT_FOUND;
+    }
+    nptool_callbacks[cid] = NetCtlCallbackForNpToolkit{};
+    LOG_DEBUG(Lib_NetCtl, "unregistered NpToolkit callback {}", cid);
+    return ORBIS_OK;
+}
+
 void NetCtlInternal::CheckCallback() {
     const auto event = EmulatorSettings.IsConnectedToNetwork()
                            ? ORBIS_NET_CTL_EVENT_TYPE_IPOBTAINED
@@ -57,6 +90,9 @@ void NetCtlInternal::CheckCallback() {
     std::vector<NetCtlCallback> due;
     {
         std::scoped_lock lock{m_mutex};
+        // A transition produced from host connectivity always succeeds; recording it keeps
+        // sceNetCtlGetResult answering for the event the title is actually handling.
+        last_event_errors[event] = 0;
         for (auto& cb : callbacks) {
             if (cb.func == nullptr || (cb.last_event && *cb.last_event == event)) {
                 continue;
@@ -81,6 +117,7 @@ void NetCtlInternal::CheckNpToolkitCallback() {
     std::vector<NetCtlCallbackForNpToolkit> due;
     {
         std::scoped_lock lock{m_mutex};
+        last_event_errors[event] = 0;
         for (auto& cb : nptool_callbacks) {
             if (cb.func == nullptr || (cb.last_event && *cb.last_event == event)) {
                 continue;

@@ -60,6 +60,16 @@ void GenerateRCPSS(void* address, const ZydisDecodedOperand* operands, Xbyak::Co
 void GenerateRSQRTPS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
 void GenerateRSQRTSS(void* address, const ZydisDecodedOperand* operands, Xbyak::CodeGenerator& c);
 
+/// Emits the shared constant pool into a generator before any replacement is generated.
+///
+/// The pool is otherwise emitted lazily, at the first site that needs it. That site can
+/// be inside a trampoline attempt which later fails and is rewound with `setSize()`,
+/// which hands the pool's bytes back to the next trampoline while the cached address
+/// still points at them. Every replacement after that would read its "1.0" out of
+/// whatever code landed there. Reserving up front puts the pool below every offset a
+/// later rewind can return to, so no rewind can reach it.
+void ReserveConstantPool(Xbyak::CodeGenerator& c);
+
 /// Drops the cached constant pool belonging to a generator. Patch modules live for the
 /// process, so the emulator never needs this; a caller that destroys and recreates
 /// generators must call it, or a later generator reusing the same address would be

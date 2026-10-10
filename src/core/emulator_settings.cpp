@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iomanip>
 #include <map>
+#include <string_view>
 #include <common/path_util.h>
 #include <common/scm_rev.h>
 #include <toml.hpp>
@@ -16,6 +17,29 @@
 #include <SDL3/SDL_messagebox.h>
 
 using json = nlohmann::json;
+
+namespace {
+
+// GVS and MBON exchange only inputs and advance the same simulation on each peer.
+// Their estimate instructions are vendor-defined, so Intel and AMD hosts desync
+// unless the rewrite is on. Other titles keep the hardware estimates.
+bool TitleUsesLockstepNetplay(std::string_view serial) {
+    return serial == "CUSA08379" || serial == "CUSA15006";
+}
+
+void ApplyLockstepDeterministicFpDefault(DeterministicFpSettings& settings,
+                                         std::string_view serial) {
+    if (!TitleUsesLockstepNetplay(serial)) {
+        return;
+    }
+    if (settings.deterministic_floating_point.game_specific_value.has_value()) {
+        return;
+    }
+    settings.deterministic_floating_point.game_specific_value = true;
+    LOG_INFO(Config, "Lockstep title {}: enabling deterministic floating point by default", serial);
+}
+
+} // namespace
 
 // ── Singleton storage ─────────────────────────────────────────────────
 std::shared_ptr<EmulatorSettingsImpl> EmulatorSettingsImpl::s_instance = nullptr;
@@ -456,11 +480,13 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
                 Common::FS::GetUserPath(Common::FS::PathType::CustomConfigs) / (serial + ".json");
 
             if (!std::filesystem::exists(gamePath)) {
+                ApplyLockstepDeterministicFpDefault(m_deterministic_fp, serial);
                 return false;
             }
 
             std::ifstream in(gamePath);
             if (!in) {
+                ApplyLockstepDeterministicFpDefault(m_deterministic_fp, serial);
                 return false;
             }
 
@@ -497,10 +523,14 @@ bool EmulatorSettingsImpl::Load(const std::string& serial) {
 
             PrintChangedSummary(changed);
             EmulatorState::GetInstance()->SetGameSpecifigConfigUsed(true);
+            ApplyLockstepDeterministicFpDefault(m_deterministic_fp, serial);
             return true;
         }
     } catch (const std::exception& e) {
         LOG_ERROR(Config, "Error loading settings: {}", e.what());
+        if (!serial.empty()) {
+            ApplyLockstepDeterministicFpDefault(m_deterministic_fp, serial);
+        }
         return false;
     }
 }

@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <exception>
+#include <filesystem>
+#include <optional>
+
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -190,19 +194,28 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         static_rewrite_reasons |= StaticRewriteReason::GuestRedZone;
     }
 #endif
-    // Deterministic floating point for lockstep P2P titles
-    if (DeterministicFp::IsEnabled()) {
+    // Lockstep estimate replacements live in the title eboot, not in sysmodules.
+    // Walking every loaded SPRX still costs a full function decode and floods the
+    // QtLauncher IPC pipe with coverage lines, which delays START and looks like a hang.
+    if (DeterministicFp::IsEnabled() && name == "eboot.bin") {
         static_rewrite_reasons |= StaticRewriteReason::DeterministicFp;
     }
     const bool apply_static_rewrites = True(static_rewrite_reasons);
     std::vector<std::pair<VAddr, u64>> executable_segments;
     std::vector<uintptr_t> function_starts;
+    // The unwind header, kept so each body's extent can be read once every segment holding
+    // .eh_frame is mapped. Deterministic floating point needs it to search the parts of a
+    // body the walk never reached.
+    std::optional<Dwarf::EHHeaderInfo> eh_header_info;
+    VAddr eh_header_end{};
     // Targets recovered offline, for functions whose indirect jumps the pass cannot
-    // resolve on its own. Absent for most modules, and absence only costs coverage.
-    const auto verified_branch_targets =
-        apply_static_rewrites ? VerifiedBranchTargets::Load(VerifiedBranchTargets::PathForModule(
-                                    Common::ElfInfo::Instance().GameSerial(), name))
-                              : VerifiedBranchTargets{};
+    // resolve on its own. Absent for most modules, and absence only costs coverage. The
+    // file is read after the program headers, because checking that it belongs to this
+    // build needs the unwind-table body count the loop below recovers.
+    const auto verified_branch_targets_path =
+        apply_static_rewrites
+            ? VerifiedBranchTargets::PathForModule(Common::ElfInfo::Instance().GameSerial(), name)
+            : std::filesystem::path{};
 #endif
     for (u16 i = 0; i < elf_header.e_phnum; i++) {
         const auto header_type = elf.ElfPheaderTypeStr(elf_pheader[i].p_type);
@@ -278,6 +291,8 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
                     !Dwarf::DecodeEHHdrTable(hdr_info, eh_hdr_end, function_starts)) {
                     LOG_ERROR(Core_Linker, "Failed to decode EH frame search table for {}", name);
                 }
+                eh_header_info = hdr_info;
+                eh_header_end = eh_hdr_end;
 #endif
                 eh_frame_addr = hdr_info.eh_frame_ptr - base_virtual_addr;
                 if (eh_frame_hdr_addr > eh_frame_addr) {
@@ -306,82 +321,148 @@ void Module::LoadModuleToMemory(u32& max_tls_index) {
         u64 fp_unsupported_operand_shape_count{};
         u64 fp_unsupported_indirect_branch_count{};
         u64 fp_unsupported_unrelocatable_count{};
+        u64 fp_unsupported_undecoded_count{};
+        u64 fp_unmeasured_function_count{};
         u64 verified_target_function_count{};
-        for (const auto& [segment_addr, segment_size] : executable_segments) {
-            const auto result =
-                ApplyStaticRewrites(segment_addr, segment_size, function_starts,
-                                    static_rewrite_reasons, &verified_branch_targets);
-            analyzed_function_count += result.function_count;
-            fp_approximation_site_count += result.fp_approximation_site_count;
-            patched_fp_approximation_count += result.patched_fp_approximation_count;
-            unsupported_fp_approximation_count += result.unsupported_fp_approximation_count;
-            fp_unsupported_operand_shape_count += result.fp_unsupported_operand_shape_count;
-            fp_unsupported_indirect_branch_count += result.fp_unsupported_indirect_branch_count;
-            fp_unsupported_unrelocatable_count += result.fp_unsupported_unrelocatable_count;
-            verified_target_function_count += result.verified_target_function_count;
-            stack_dependent_instruction_count += result.stack_dependent_memory_instruction_count;
-            control_flow_instruction_count += result.control_flow_memory_instruction_count;
-            unrelocatable_instruction_count += result.unrelocatable_memory_instruction_count;
-            unsupported_cpu_patch_instruction_count +=
-                result.unsupported_cpu_patch_instruction_count;
-            LOG_DEBUG(
-                Core_Linker,
-                "Windows guest red-zone static patching for {}: {} functions, {} instructions, "
-                "{} red-zone functions, {}/{} memory instructions patched "
-                "({} short, {} stack-dependent, {} control-flow, {} unrelocatable), "
-                "{}/{} short CPU patches applied ({} unsupported), {} indirect red-zone "
-                "functions",
-                name, result.function_count, result.instruction_count,
-                result.red_zone_function_count, result.patched_memory_instruction_count,
-                result.memory_instruction_count, result.short_memory_instruction_count,
-                result.stack_dependent_memory_instruction_count,
-                result.control_flow_memory_instruction_count,
-                result.unrelocatable_memory_instruction_count,
-                result.patched_cpu_patch_instruction_count, result.cpu_patch_instruction_count,
-                result.unsupported_cpu_patch_instruction_count,
-                result.indirect_red_zone_function_count);
+        u64 verified_extended_function_count{};
+        u64 fp_borrowed_neighbour_count{};
+        u64 fp_borrowed_unverified_count{};
+        const bool replace_fp_approximations =
+            True(static_rewrite_reasons & StaticRewriteReason::DeterministicFp);
+        std::vector<Dwarf::FunctionBody> function_bodies;
+        if (replace_fp_approximations &&
+            (!eh_header_info || !Dwarf::DecodeEHFunctionBodies(
+                                    *eh_header_info, eh_header_end, base_virtual_addr,
+                                    base_virtual_addr + aligned_base_size, function_bodies))) {
+            LOG_ERROR(Core_Linker,
+                      "[FPDIAG] could not read the unwind bodies of {}; estimates outside the "
+                      "decoded code cannot be searched for, so its coverage is unverified",
+                      name);
         }
-        if (!executable_segments.empty() && analyzed_function_count == 0) {
+        const auto verified_branch_targets =
+            VerifiedBranchTargets::Load(verified_branch_targets_path, function_starts.size());
+        if (replace_fp_approximations && name == "eboot.bin" && verified_branch_targets.Empty()) {
             LOG_WARNING(Core_Linker,
-                        "Windows guest red-zone static patching could not find function "
-                        "boundaries for {}; protection was not applied",
-                        name);
-        } else if (stack_dependent_instruction_count != 0 || control_flow_instruction_count != 0 ||
-                   unrelocatable_instruction_count != 0 ||
-                   unsupported_cpu_patch_instruction_count != 0) {
-            LOG_WARNING(
-                Core_Linker,
-                "Windows guest red-zone static patching for {} is partial: {} stack-dependent, "
-                "{} control-flow, and {} unrelocatable memory instructions were not protected; "
-                "{} CPU patch instructions were unsupported",
-                name, stack_dependent_instruction_count, control_flow_instruction_count,
-                unrelocatable_instruction_count, unsupported_cpu_patch_instruction_count);
+                        "[FPDIAG] no verified branch targets at {}; install the sidecar or "
+                        "functions with jump tables keep vendor-defined estimates",
+                        verified_branch_targets_path.string());
+        }
+        if (replace_fp_approximations) {
+            LOG_INFO(Core_Linker,
+                     "[FPDIAG] rewriting {}: {} executable segments, {} function starts, "
+                     "{} unwind bodies, {} verified branch-target bodies",
+                     name, executable_segments.size(), function_starts.size(),
+                     function_bodies.size(), verified_branch_targets.FunctionCount());
+        }
+        try {
+            for (const auto& [segment_addr, segment_size] : executable_segments) {
+                const auto result = ApplyStaticRewrites(segment_addr, segment_size, function_starts,
+                                                        function_bodies, static_rewrite_reasons,
+                                                        &verified_branch_targets);
+                analyzed_function_count += result.function_count;
+                fp_approximation_site_count += result.fp_approximation_site_count;
+                patched_fp_approximation_count += result.patched_fp_approximation_count;
+                unsupported_fp_approximation_count += result.unsupported_fp_approximation_count;
+                fp_unsupported_operand_shape_count += result.fp_unsupported_operand_shape_count;
+                fp_unsupported_indirect_branch_count += result.fp_unsupported_indirect_branch_count;
+                fp_unsupported_unrelocatable_count += result.fp_unsupported_unrelocatable_count;
+                fp_unsupported_undecoded_count += result.fp_unsupported_undecoded_count;
+                fp_unmeasured_function_count += result.fp_unmeasured_function_count;
+                verified_target_function_count += result.verified_target_function_count;
+                verified_extended_function_count += result.verified_extended_function_count;
+                fp_borrowed_neighbour_count += result.fp_borrowed_neighbour_count;
+                fp_borrowed_unverified_count += result.fp_borrowed_unverified_count;
+                stack_dependent_instruction_count +=
+                    result.stack_dependent_memory_instruction_count;
+                control_flow_instruction_count += result.control_flow_memory_instruction_count;
+                unrelocatable_instruction_count += result.unrelocatable_memory_instruction_count;
+                unsupported_cpu_patch_instruction_count +=
+                    result.unsupported_cpu_patch_instruction_count;
+                LOG_DEBUG(
+                    Core_Linker,
+                    "Windows guest red-zone static patching for {}: {} functions, {} instructions, "
+                    "{} red-zone functions, {}/{} memory instructions patched "
+                    "({} short, {} stack-dependent, {} control-flow, {} unrelocatable), "
+                    "{}/{} short CPU patches applied ({} unsupported), {} indirect red-zone "
+                    "functions",
+                    name, result.function_count, result.instruction_count,
+                    result.red_zone_function_count, result.patched_memory_instruction_count,
+                    result.memory_instruction_count, result.short_memory_instruction_count,
+                    result.stack_dependent_memory_instruction_count,
+                    result.control_flow_memory_instruction_count,
+                    result.unrelocatable_memory_instruction_count,
+                    result.patched_cpu_patch_instruction_count, result.cpu_patch_instruction_count,
+                    result.unsupported_cpu_patch_instruction_count,
+                    result.indirect_red_zone_function_count);
+            }
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Core_Linker, "Static rewrites for {} failed: {}", name, exception.what());
+        } catch (...) {
+            LOG_ERROR(Core_Linker, "Static rewrites for {} failed with an unknown exception", name);
+        }
+        if (True(static_rewrite_reasons & StaticRewriteReason::GuestRedZone)) {
+            if (!executable_segments.empty() && analyzed_function_count == 0) {
+                LOG_WARNING(Core_Linker,
+                            "Windows guest red-zone static patching could not find function "
+                            "boundaries for {}; protection was not applied",
+                            name);
+            } else if (stack_dependent_instruction_count != 0 ||
+                       control_flow_instruction_count != 0 ||
+                       unrelocatable_instruction_count != 0 ||
+                       unsupported_cpu_patch_instruction_count != 0) {
+                LOG_WARNING(Core_Linker,
+                            "Windows guest red-zone static patching for {} is partial: {} "
+                            "stack-dependent, {} control-flow, and {} unrelocatable memory "
+                            "instructions were not protected; {} CPU patch instructions were "
+                            "unsupported",
+                            name, stack_dependent_instruction_count, control_flow_instruction_count,
+                            unrelocatable_instruction_count,
+                            unsupported_cpu_patch_instruction_count);
+            }
         }
 
         // Deterministic floating point for lockstep P2P titles. Measured ground truth is
         // 1258 sites for Maxi Boost ON and 2726 for Gundam Versus; any shortfall leaves a
         // vendor-defined estimate running, and a lockstep peer that disagrees by one bit
         // desyncs permanently, so this is reported as a failure rather than a statistic.
-        if (True(static_rewrite_reasons & StaticRewriteReason::DeterministicFp)) {
+        if (replace_fp_approximations) {
             LOG_INFO(Core_Linker,
                      "[FPDIAG] coverage {}: {} estimate sites found, {} replaced, {} left "
-                     "unsupported ({} functions used verified branch targets of {} in file)",
+                     "unsupported ({} functions used verified branch targets of {} in file, "
+                     "{} of them decoded further from those targets)",
                      name, fp_approximation_site_count, patched_fp_approximation_count,
                      unsupported_fp_approximation_count, verified_target_function_count,
-                     verified_branch_targets.FunctionCount());
+                     verified_branch_targets.FunctionCount(), verified_extended_function_count);
+            // Borrowing is the only part of the replacement that rewrites code the site
+            // does not own, so it is the only part that can break a title that boots
+            // today. Reporting it separates "we replaced the estimates" from "we also
+            // moved this many neighbouring instructions, this many of them on the pass's
+            // own recovery rather than a vouched-for target set".
+            LOG_INFO(Core_Linker,
+                     "[FPDIAG] relocation {}: {} of {} replaced sites borrowed neighbour "
+                     "bytes, {} of those in bodies no external analysis vouched for",
+                     name, fp_borrowed_neighbour_count, patched_fp_approximation_count,
+                     fp_borrowed_unverified_count);
             if (unsupported_fp_approximation_count != 0) {
-                LOG_CRITICAL(Core_Linker,
-                             "[FPDIAG] coverage for {} is incomplete: {} of {} estimate "
-                             "sites still execute vendor-defined results. Lockstep netplay with "
-                             "this module will desync.",
-                             name, unsupported_fp_approximation_count, fp_approximation_site_count);
-                LOG_CRITICAL(Core_Linker,
-                             "[FPDIAG] shortfall for {}: {} unexpressible operand "
-                             "shapes, {} in functions with branch tables, {} with no "
-                             "relocatable span or relay",
-                             name, fp_unsupported_operand_shape_count,
-                             fp_unsupported_indirect_branch_count,
-                             fp_unsupported_unrelocatable_count);
+                LOG_ERROR(Core_Linker,
+                          "[FPDIAG] coverage for {} is incomplete: {} of {} estimate "
+                          "sites still execute vendor-defined results. Lockstep netplay with "
+                          "this module will desync.",
+                          name, unsupported_fp_approximation_count, fp_approximation_site_count);
+                LOG_ERROR(Core_Linker,
+                          "[FPDIAG] shortfall for {}: {} unexpressible operand "
+                          "shapes, {} in functions with branch tables, {} with no "
+                          "relocatable span or relay, {} in code the walk never decoded",
+                          name, fp_unsupported_operand_shape_count,
+                          fp_unsupported_indirect_branch_count, fp_unsupported_unrelocatable_count,
+                          fp_unsupported_undecoded_count);
+            }
+            if (fp_unmeasured_function_count != 0) {
+                LOG_ERROR(Core_Linker,
+                          "[FPDIAG] coverage for {} is unverified: {} functions have no known "
+                          "extent, so estimates the walk did not reach in them were not "
+                          "counted. Lockstep netplay with this module may desync.",
+                          name, fp_unmeasured_function_count);
             }
         }
     }
@@ -529,9 +610,10 @@ void Module::LoadDynamicInfo() {
             break;
         case DT_SCE_IMPORT_LIB_ATTR:
             // The upper 32-bits should contain the module index multiplied by 0x10000. The lower
-            // 32-bits should be a constant 0x9.
-            LOG_INFO(Core_Linker, "unsupported DT_SCE_IMPORT_LIB_ATTR value = ......: {:#018x}",
-                     dyn->d_un.d_val);
+            // 32-bits should be a constant 0x9. Expected on every PS4 module; INFO would
+            // stall a QtLauncher boot by filling the IPC stdout pipe.
+            LOG_DEBUG(Core_Linker, "unsupported DT_SCE_IMPORT_LIB_ATTR value = ......: {:#018x}",
+                      dyn->d_un.d_val);
             break;
         case DT_SCE_ORIGINAL_FILENAME:
             dynamic_info.filename = dynamic_info.str_table + dyn->d_un.d_val;
@@ -566,7 +648,9 @@ void Module::LoadDynamicInfo() {
 }
 
 void Module::LoadSymbols() {
-    const auto symbol_database = [this](Loader::SymbolsResolver& symbol, bool export_func) {
+    u64 symbol_count = 0;
+    const auto symbol_database = [this, &symbol_count](Loader::SymbolsResolver& symbol,
+                                                       bool export_func) {
         if (!dynamic_info.symbol_table || !dynamic_info.str_table ||
             dynamic_info.symbol_table_total_size == 0) {
             LOG_INFO(Core_Linker, "Symbol table not found!");
@@ -576,6 +660,10 @@ void Module::LoadSymbols() {
              reinterpret_cast<u8*>(sym) < reinterpret_cast<u8*>(dynamic_info.symbol_table) +
                                               dynamic_info.symbol_table_total_size;
              sym++) {
+            if ((symbol_count & 0xfff) == 0) {
+                PumpLoaderThread();
+            }
+            ++symbol_count;
             const u8 bind = sym->GetBind();
             const u8 type = sym->GetType();
             const u8 visibility = sym->GetVisibility();
@@ -622,6 +710,7 @@ void Module::LoadSymbols() {
     };
     symbol_database(export_sym, true);
     symbol_database(import_sym, false);
+    LOG_INFO(Core_Linker, "Loaded symbols for {}", name);
 }
 
 OrbisKernelModuleInfoEx Module::GetModuleInfoEx() const {

@@ -43,6 +43,11 @@ struct PeerInfo {
     bool sent_established = false;
     u64 nonce = 0;
     u32 ping_us = 0;
+    // Recent echo samples. The published ping is their median, so one slow handshake
+    // round does not pin the room antenna on its worst bar.
+    u32 ping_samples[5]{};
+    u8 ping_sample_count = 0;
+    u8 ping_sample_pos = 0;
     u32 packet_loss_pct = 0;
     u32 bandwidth_bps = 0;
     u64 ping_seq = 0;
@@ -85,6 +90,17 @@ struct MemberCache {
     std::map<OrbisNpMatching2AttributeId, MemberBinCache> bins;
 };
 
+// Room-level binary attribute stored by value. The guest-facing struct holds a raw pointer,
+// so the cache must not keep those pointers into a vector that grows on every update: a 2v2
+// room republishes this blob for the whole match, and the reallocation used to free the bytes
+// the title was still reading.
+struct RoomBinCache {
+    OrbisNpMatching2AttributeId id = 0;
+    u64 update_date = 0;
+    OrbisNpMatching2RoomMemberId member_id = 0;
+    std::vector<u8> data;
+};
+
 struct RoomCache {
     u32 num_slots = 0;
     u64 mask_password = 0;
@@ -102,11 +118,20 @@ struct RoomCache {
     u64 passwd_slot_mask = 0;
     u64 joined_slot_mask = 0;
     OrbisNpMatching2Flags flags = 0;
-    std::vector<OrbisNpMatching2RoomBinAttrInternal> bin_attrs_internal;
-    std::vector<std::vector<u8>> bin_buffers;
+    std::vector<RoomBinCache> room_bins;
     std::map<OrbisNpMatching2RoomGroupId, OrbisNpMatching2RoomGroup> groups;
     std::map<OrbisNpMatching2RoomMemberId, MemberCache> members;
     bool owner = false;
+    // Owner bookkeeping kept in sync with ROOM_EVENT_ROOM_OWNER_CHANGED so the local getters and
+    // GetRoomDataInternal keep naming the member the server currently considers the owner.
+    OrbisNpMatching2RoomMemberId owner_member_id = 0;
+    // Room password as this client supplied it when creating or joining. The matching service
+    // never echoes it back, so GetRoomPasswordLocal can only answer from what we sent.
+    bool has_password = false;
+    OrbisNpMatching2SessionPassword password{};
+    // Signaling option parameters for the room, as last set through SetSignalingOptParam.
+    OrbisNpMatching2SignalingOptParam signaling_opt_param{};
+    bool has_signaling_opt_param = false;
 };
 
 struct CallbackPayload {
@@ -162,6 +187,12 @@ struct CallbackPayload {
     std::vector<u8> room_message_data;
     void* room_message_callback_data = nullptr;
 
+    std::unique_ptr<OrbisNpMatching2GetRoomMemberDataInternalResponse>
+        room_member_data_internal_response;
+    std::unique_ptr<OrbisNpMatching2GetRoomMemberDataInternalResponseA>
+        room_member_data_internal_response_a;
+    std::unique_ptr<OrbisNpMatching2RoomOwnerUpdateInfo> room_owner_update;
+    std::unique_ptr<OrbisNpMatching2SessionPassword> event_room_password;
     std::unique_ptr<OrbisNpMatching2RoomMemberUpdate> room_member_update;
     std::unique_ptr<OrbisNpMatching2RoomMemberUpdateA> room_member_update_a;
     std::unique_ptr<OrbisNpMatching2RoomUpdate> room_update;
@@ -227,6 +258,10 @@ struct CallbackPayload {
         room_message_multicast_members.clear();
         room_message_data.clear();
         room_message_callback_data = nullptr;
+        room_member_data_internal_response.reset();
+        room_member_data_internal_response_a.reset();
+        room_owner_update.reset();
+        event_room_password.reset();
         room_member_update.reset();
         room_member_update_a.reset();
         room_update.reset();
@@ -260,6 +295,10 @@ struct ContextObject {
     OrbisNpMatching2RoomId room_id = 0;
     OrbisNpMatching2RoomMemberId my_member_id = 0;
     bool is_room_owner = false;
+    // Password sent with the in-flight create/join, moved into the room cache once the room
+    // exists. GetRoomPasswordLocal has no other source: the service never sends it back.
+    bool pending_room_password_set = false;
+    OrbisNpMatching2SessionPassword pending_room_password{};
     u32 max_slot = 5;
     OrbisNpMatching2Flags flag_attr = 0;
 
@@ -304,6 +343,8 @@ struct ContextObject {
         room_id = 0;
         my_member_id = 0;
         is_room_owner = false;
+        pending_room_password_set = false;
+        pending_room_password = {};
         max_slot = 5;
         flag_attr = 0;
         peers.clear();
@@ -420,6 +461,13 @@ struct PendingEvent {
 struct NpMatching2State {
     std::atomic<bool> initialized = false;
 
+    // Pool sizes the title asked for at Initialize time. shadPS4 allocates from the host heap
+    // rather than out of these pools, but GetMemoryInfo / GetSslMemoryInfo must still report the
+    // budget the title handed over - a title that sees a zero total treats the library as
+    // unusable.
+    u64 pool_size = 0;
+    u64 ssl_pool_size = 0;
+
     OrbisNpMatching2RequestId next_request_id = 1;
     std::mutex mutex;
 
@@ -431,6 +479,44 @@ struct NpMatching2State {
 };
 
 extern NpMatching2State g_state;
+
+// Serialises one context's peer table, room cache and callback payload.
+//
+// The handshake thread, the ShadNet reader, the guest thread and the event dispatcher all
+// reach that state. Two players barely overlap. A third member makes the title poll room data
+// every frame while the reader rewrites the same cache and the handshake thread holds a
+// PeerInfo& into the peer map. The next poll used to Reset() the single shared payload, so the
+// callback still in flight walked freed member storage and faulted in guest code (0xc0000005).
+// Erasing a peer out from under that reference is the same window.
+//
+// Recursive because the helpers nest: a room event already holds it when it starts a handshake.
+std::recursive_mutex& Matching2StateMutex();
+
+// Payload for one locally-answered request. GetRoomDataInternal, GetRoomMemberDataInternal and
+// SignalingGetPingInfo are served from the cache and the title issues them back to back. Each
+// build starts with Reset(), which would delete the room data the previous event is about to
+// hand to the guest. Move Owner() into the event so the objects live until that callback
+// returns. Declare it after the state lock so its destructor still runs while the lock is held.
+class ScopedRequestPayload {
+public:
+    explicit ScopedRequestPayload(ContextObject& ctx)
+        : m_ctx(ctx), m_owner(std::make_shared<CallbackPayload>()) {
+        m_ctx.request_payload_override = m_owner.get();
+    }
+    ~ScopedRequestPayload() {
+        m_ctx.request_payload_override = nullptr;
+    }
+    ScopedRequestPayload(const ScopedRequestPayload&) = delete;
+    ScopedRequestPayload& operator=(const ScopedRequestPayload&) = delete;
+
+    std::shared_ptr<CallbackPayload> Owner() const {
+        return m_owner;
+    }
+
+private:
+    ContextObject& m_ctx;
+    std::shared_ptr<CallbackPayload> m_owner;
+};
 
 OrbisNpMatching2RequestId AllocRequestId();
 
@@ -457,6 +543,11 @@ void* BuildGetRoomMemberDataExternalListPayloadA(
 void* BuildGetUserInfoListPayload(ContextObject& ctx, const shadnet::GetUserInfoListReply& resp);
 void* BuildGetUserInfoListPayloadA(ContextObject& ctx, const shadnet::GetUserInfoListReply& resp);
 void* BuildGetRoomDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId room_id);
+/// Builds the GetRoomMemberDataInternal response for one member out of the room cache the room
+/// events keep current. Returns nullptr when the room or the member is not cached, which the
+/// caller reports as ROOM_MEMBER_NOT_FOUND rather than handing the title a null response.
+void* BuildGetRoomMemberDataInternalPayload(ContextObject& ctx, OrbisNpMatching2RoomId room_id,
+                                            OrbisNpMatching2RoomMemberId member_id);
 void* BuildRoomMessagePayload(CallbackPayload& p, bool a_variant, OrbisNpMatching2CastType castType,
                               const std::vector<OrbisNpMatching2RoomMemberId>& dstMembers,
                               const MemberCache* srcMember, const std::vector<u8>& msg);

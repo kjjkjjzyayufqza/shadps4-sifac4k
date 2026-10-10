@@ -45,9 +45,12 @@ static std::shared_ptr<ScoreRequestCtx> LookupRequestUnlocked(OrbisNpScoreReques
     return it == g_requests.end() ? nullptr : it->second;
 }
 
-static bool IsRequestAborted(const std::shared_ptr<ScoreRequestCtx>& req) {
-    std::lock_guard lock(req->mutex);
-    return req->result.has_value() && *req->result == ORBIS_NP_COMMUNITY_ERROR_ABORTED;
+// Starts a new operation on an existing request: clears the previous call's outcome so
+// PollAsync/WaitAsync report this one, and refuses once the request has been aborted. Titles
+// reuse a single request object for every chunk of a game-data transfer, so leaving the old
+// result in place would make each chunk after the first complete instantly.
+static bool BeginRequestOperation(const std::shared_ptr<ScoreRequestCtx>& req) {
+    return req->BeginOperation();
 }
 
 static s32 ServiceLabelForRequest(const std::shared_ptr<ScoreRequestCtx>& req) {
@@ -117,7 +120,7 @@ s32 PS4_SYSV_ABI sceNpScoreDeleteNpTitleCtx(s32 titleCtxId) {
 
     for (auto it = g_requests.begin(); it != g_requests.end();) {
         if (it->second->titleCtxId == titleCtxId) {
-            it->second->SetResult(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
+            it->second->Abort(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
             it = g_requests.erase(it);
         } else {
             ++it;
@@ -160,7 +163,7 @@ s32 PS4_SYSV_ABI sceNpScoreDeleteRequest(s32 reqId) {
         LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
     }
-    req->SetResult(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
+    req->Abort(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
     g_requests.erase(reqId);
     return ORBIS_OK;
 }
@@ -176,7 +179,7 @@ s32 PS4_SYSV_ABI sceNpScoreAbortRequest(s32 reqId) {
         LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
     }
-    req->SetResult(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
+    req->Abort(ORBIS_NP_COMMUNITY_ERROR_ABORTED);
     return ORBIS_OK;
 }
 
@@ -264,7 +267,7 @@ s32 PS4_SYSV_ABI sceNpScoreRecordScore(s32 reqId, OrbisNpScoreBoardId boardId,
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -317,7 +320,7 @@ s32 PS4_SYSV_ABI sceNpScoreRecordScoreAsync(s32 reqId, OrbisNpScoreBoardId board
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -420,7 +423,7 @@ static int GetRankingByRangeImpl(s32 reqId, OrbisNpScoreBoardId boardId,
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -563,7 +566,7 @@ static int GetRankingByNpIdImpl(s32 reqId, OrbisNpScoreBoardId boardId, const Or
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -681,7 +684,7 @@ static int GetRankingByAccountIdImpl(s32 reqId, OrbisNpScoreBoardId boardId,
         req = LookupRequestUnlocked(reqId);
         if (!req)
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
-        if (IsRequestAborted(req))
+        if (!BeginRequestOperation(req))
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
     }
 
@@ -829,7 +832,7 @@ static int GetFriendsRankingImpl(s32 reqId, OrbisNpScoreBoardId boardId, s32 inc
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -987,7 +990,7 @@ static int GetRankingByNpIdPcIdImpl(s32 reqId, OrbisNpScoreBoardId boardId,
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -1102,7 +1105,7 @@ static int GetRankingByAccountIdPcIdImpl(s32 reqId, OrbisNpScoreBoardId boardId,
         req = LookupRequestUnlocked(reqId);
         if (!req)
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
-        if (IsRequestAborted(req))
+        if (!BeginRequestOperation(req))
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
     }
 
@@ -1189,7 +1192,7 @@ static int GetBoardInfoImpl(s32 reqId, OrbisNpScoreBoardId boardId,
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -1230,6 +1233,60 @@ s32 PS4_SYSV_ABI sceNpScoreGetBoardInfoAsync(s32 reqId, OrbisNpScoreBoardId boar
 //***********************************
 // GetGameData functions
 //***********************************
+// Sentinel telling the caller that nothing was cached for this target and the blob has to be
+// fetched. Any other value is this call's return value.
+static constexpr int kGameDataNotCached = 1;
+
+// Ceiling on one game-data blob. A board's own uploadSizeLimit (6 MB by default, reported by
+// GetBoardInfo) is the real limit and the server enforces it; this only bounds what the emulator
+// will buffer on the title's behalf before the server is ever asked, so a nonsense totalSize
+// cannot turn into a nonsense allocation. Generous enough that no legitimate replay reaches it.
+static constexpr u64 kMaxGameDataSize = 64ULL * 1024 * 1024;
+
+// Hands the title the next slice of an already-downloaded game-data blob.
+//
+// sceNpScoreGetGameData has no offset parameter: a title that reads a replay larger than its
+// staging buffer simply calls again, and the library is expected to continue. The whole blob is
+// therefore fetched once and walked from here, which also means a partial read costs one server
+// round trip instead of one per chunk. A target that differs from the cached one, or a blob that
+// has been fully handed over, falls through to a fresh fetch.
+static int ServeCachedGameData(const std::shared_ptr<ScoreRequestCtx>& req,
+                               OrbisNpScoreBoardId boardId, s32 pcId, const std::string& target,
+                               u64* totalSize, u64 recvSize, void* data, s32 reqId) {
+    u64 total = 0;
+    u64 offset = 0;
+    u64 copied = 0;
+    {
+        std::lock_guard lock(req->mutex);
+        auto& xfer = req->xfer;
+        if (!xfer.SameRecvTarget(boardId, pcId, target)) {
+            return kGameDataNotCached;
+        }
+        if (xfer.RecvExhausted()) {
+            // The title has consumed this blob; a further call means it wants it again.
+            LOG_INFO(Lib_NpScore,
+                     "GetGameData: reqId={} board={} target='{}' cache exhausted, refetch", reqId,
+                     boardId, target);
+            xfer.EndRecv();
+            return kGameDataNotCached;
+        }
+
+        total = xfer.recvBuf.size();
+        offset = xfer.recvOffset;
+        copied = xfer.ReadSlice(data, recvSize);
+        if (totalSize != nullptr) {
+            *totalSize = total;
+        }
+    }
+    LOG_INFO(Lib_NpScore,
+             "GetGameData: reqId={} board={} target='{}' served {} bytes from cache at {}/{}",
+             reqId, boardId, target, copied, offset, total);
+    // Completed outside the lock: SetResult takes the same mutex, so calling it from inside would
+    // deadlock this thread against itself.
+    req->SetResult(ORBIS_OK);
+    return ORBIS_OK;
+}
+
 static int GetGameDataImpl(s32 reqId, OrbisNpScoreBoardId boardId, const OrbisNpId* npId,
                            u64* totalSize, u64 recvSize, void* data, void* option, bool is_async) {
     if (npId == nullptr) {
@@ -1249,7 +1306,7 @@ static int GetGameDataImpl(s32 reqId, OrbisNpScoreBoardId boardId, const OrbisNp
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -1263,6 +1320,17 @@ static int GetGameDataImpl(s32 reqId, OrbisNpScoreBoardId boardId, const OrbisNp
 
     const s32 pcId = req->pcId;
 
+    if (const int served =
+            ServeCachedGameData(req, boardId, pcId, npIdStr, totalSize, recvSize, data, reqId);
+        served != kGameDataNotCached) {
+        return served;
+    }
+
+    {
+        // Arm the cache before dispatching: the reply lands on the handler thread and fills it.
+        std::lock_guard lock(req->mutex);
+        req->xfer.BeginRecv(boardId, pcId, npIdStr);
+    }
     const s32 dispatch_err =
         NpHandler::GetInstance().GetGameData(req->userId, ServiceLabelForRequest(req), boardId,
                                              npIdStr, pcId, data, recvSize, totalSize, req);
@@ -1296,13 +1364,26 @@ static int GetGameDataByAccountIdImpl(s32 reqId, OrbisNpScoreBoardId boardId,
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
 
     const s32 pcId = req->pcId;
 
+    // The two download entry points name the same blob two ways, so they share one cache key
+    // space: the account-id form stores the id in decimal, which no online id can collide with.
+    const std::string target = std::to_string(accountId);
+    if (const int served =
+            ServeCachedGameData(req, boardId, pcId, target, totalSize, recvSize, data, reqId);
+        served != kGameDataNotCached) {
+        return served;
+    }
+
+    {
+        std::lock_guard lock(req->mutex);
+        req->xfer.BeginRecv(boardId, pcId, target);
+    }
     const s32 dispatch_err = NpHandler::GetInstance().GetGameDataByAccountId(
         req->userId, ServiceLabelForRequest(req), boardId, accountId, pcId, data, recvSize,
         totalSize, req);
@@ -1374,14 +1455,18 @@ static int RecordGameDataImpl(s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpSco
         LOG_ERROR(Lib_NpScore, "RecordGameData: sendSize must be > 0");
         return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
-    if (totalSize > sendSize) {
-        // Chunked send not supported on the shadnet wire — the server
-        // stores whatever bytes arrive in this single command as the
-        // complete blob. Warn so callers can spot the truncation.
-        LOG_WARNING(Lib_NpScore,
-                    "RecordGameData: chunked send not supported (totalSize={} sendSize={}); "
-                    "storing first chunk only",
-                    totalSize, sendSize);
+    if (sendSize > totalSize) {
+        LOG_ERROR(Lib_NpScore, "RecordGameData: sendSize {} exceeds totalSize {}", sendSize,
+                  totalSize);
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
+    }
+    // The accumulation buffer is sized from totalSize, which the title supplies. A bogus value
+    // would otherwise be honoured with a single enormous allocation before the server ever gets a
+    // chance to apply the board's own upload limit.
+    if (totalSize > kMaxGameDataSize) {
+        LOG_ERROR(Lib_NpScore, "RecordGameData: totalSize {} exceeds the {} byte ceiling",
+                  totalSize, kMaxGameDataSize);
+        return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
     }
 
     std::shared_ptr<ScoreRequestCtx> req;
@@ -1392,16 +1477,56 @@ static int RecordGameDataImpl(s32 reqId, OrbisNpScoreBoardId boardId, OrbisNpSco
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
 
     const s32 pcId = req->pcId;
 
-    const s32 dispatch_err = NpHandler::GetInstance().RecordGameData(
-        req->userId, ServiceLabelForRequest(req), boardId, pcId, score,
-        static_cast<const u8*>(data), static_cast<size_t>(sendSize), req);
+    // The server stores one blob per score and has no append, so a chunked upload is buffered
+    // here and submitted only once the title has handed over totalSize bytes. Without this a
+    // replay larger than the title's staging buffer is silently truncated to its first chunk.
+    std::vector<u8> complete;
+    bool more_chunks_expected = false;
+    {
+        std::lock_guard lock(req->mutex);
+        auto& xfer = req->xfer;
+        if (!xfer.SameSendTarget(boardId, pcId, score)) {
+            xfer.BeginSend(boardId, pcId, score, totalSize);
+            xfer.sendBuf.reserve(static_cast<size_t>(totalSize));
+        }
+        const auto* bytes = static_cast<const u8*>(data);
+        if (xfer.sendBuf.size() + sendSize > totalSize) {
+            LOG_ERROR(Lib_NpScore,
+                      "RecordGameData: chunk overruns totalSize (have={} chunk={} total={})",
+                      xfer.sendBuf.size(), sendSize, totalSize);
+            xfer.EndSend();
+            return ORBIS_NP_COMMUNITY_ERROR_INVALID_ARGUMENT;
+        }
+        xfer.sendBuf.insert(xfer.sendBuf.end(), bytes, bytes + sendSize);
+        LOG_INFO(Lib_NpScore,
+                 "RecordGameData: reqId={} board={} pcId={} score={} chunk={} buffered={}/{}",
+                 reqId, boardId, pcId, score, sendSize, xfer.sendBuf.size(), totalSize);
+        if (xfer.sendBuf.size() < totalSize) {
+            more_chunks_expected = true;
+        } else {
+            complete = std::move(xfer.sendBuf);
+            xfer.EndSend();
+        }
+    }
+    if (more_chunks_expected) {
+        // The call itself succeeded; nothing goes out until the title hands over the rest.
+        // Completed outside the lock above: SetResult takes the same mutex.
+        req->SetResult(ORBIS_OK);
+        return ORBIS_OK;
+    }
+
+    LOG_INFO(Lib_NpScore, "RecordGameData: reqId={} board={} uploading {} bytes", reqId, boardId,
+             complete.size());
+    const s32 dispatch_err =
+        NpHandler::GetInstance().RecordGameData(req->userId, ServiceLabelForRequest(req), boardId,
+                                                pcId, score, complete.data(), complete.size(), req);
     if (dispatch_err != ORBIS_OK) {
         req->SetResult(dispatch_err);
         return dispatch_err;
@@ -1450,7 +1575,7 @@ static int CensorCommentImpl(s32 reqId, const char* comment, void* option, bool 
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -1511,7 +1636,7 @@ static int SanitizeCommentImpl(s32 reqId, const char* comment, char* sanitizedCo
             LOG_ERROR(Lib_NpScore, "invalid reqId {}", reqId);
             return ORBIS_NP_COMMUNITY_ERROR_INVALID_ID;
         }
-        if (IsRequestAborted(req)) {
+        if (!BeginRequestOperation(req)) {
             return ORBIS_NP_COMMUNITY_ERROR_ABORTED;
         }
     }
@@ -1594,20 +1719,49 @@ int PS4_SYSV_ABI sceNpScoreCreateTitleCtx() {
     return ORBIS_OK;
 }
 
+// Cross-save ranking is not backed by shadNet: the server keeps one score table per
+// communication id, with no notion of a save that migrated between platforms. These four entry
+// points are still reachable (the games' bundled libSceNpToolkit2 imports them), and previously
+// returned success without touching the caller's arrays, which left the title reading
+// uninitialised stack. Define the outcome instead: empty result, zeroed buffers, and a warning
+// loud enough to spot in a log if a title ever takes this path.
+static int CrossSaveRankingUnsupported(const char* what, s32 reqId, OrbisNpScoreBoardId boardId,
+                                       void* rankArray, u64 rankArraySize,
+                                       OrbisNpScoreComment* commentArray, u64 commentArraySize,
+                                       OrbisNpScoreGameInfo* infoArray, u64 infoArraySize,
+                                       u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
+                                       OrbisNpScoreRankNumber* totalRecord) {
+    LOG_WARNING(Lib_NpScore,
+                "{}: cross-save ranking has no shadNet backing; returning an empty result "
+                "(reqId={} board={} arrayNum={})",
+                what, reqId, boardId, arrayNum);
+    if (rankArray != nullptr && rankArraySize > 0) {
+        std::memset(rankArray, 0, static_cast<size_t>(rankArraySize));
+    }
+    if (commentArray != nullptr && commentArraySize > 0) {
+        std::memset(commentArray, 0, static_cast<size_t>(commentArraySize));
+    }
+    if (infoArray != nullptr && infoArraySize > 0) {
+        std::memset(infoArray, 0, static_cast<size_t>(infoArraySize));
+    }
+    if (lastSortDate != nullptr) {
+        lastSortDate->tick = 0;
+    }
+    if (totalRecord != nullptr) {
+        *totalRecord = 0;
+    }
+    return ORBIS_OK;
+}
+
 int PS4_SYSV_ABI sceNpScoreGetFriendsRankingForCrossSave(
     s32 reqId, OrbisNpScoreBoardId boardId, s32 includeSelf,
     OrbisNpScoreRankDataForCrossSave* rankArray, u64 rankArraySize,
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, OrbisNpScoreGetFriendRankingOptParam* option) {
-    LOG_ERROR(Lib_NpScore,
-              "(STUBBED) called reqId={}, boardId={}, includeSelf={}, "
-              "rankArray={}, rankArraySize={}, commentArray={}, commentArraySize={}, infoArray={}, "
-              "infoArraySize={}, arrayNum={}, lastSortDate={}, totalRecord={}, option={}",
-              reqId, boardId, includeSelf, PTR(rankArray), rankArraySize, PTR(commentArray),
-              commentArraySize, PTR(infoArray), infoArraySize, arrayNum, PTR(lastSortDate),
-              PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetFriendsRankingForCrossSave", reqId, boardId, rankArray,
+                                       rankArraySize, commentArray, commentArraySize, infoArray,
+                                       infoArraySize, arrayNum, lastSortDate, totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetFriendsRankingForCrossSaveAsync(
@@ -1616,15 +1770,10 @@ int PS4_SYSV_ABI sceNpScoreGetFriendsRankingForCrossSaveAsync(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, OrbisNpScoreGetFriendRankingOptParam* option) {
-    LOG_ERROR(
-        Lib_NpScore,
-        "(STUBBED) called reqId={}, boardId={}, "
-        "includeSelf={}, rankArray={}, rankArraySize={}, commentArray={}, commentArraySize={}, "
-        "infoArray={}, infoArraySize={}, arrayNum={}, lastSortDate={}, totalRecord={}, option={}",
-        reqId, boardId, includeSelf, PTR(rankArray), rankArraySize, PTR(commentArray),
-        commentArraySize, PTR(infoArray), infoArraySize, arrayNum, PTR(lastSortDate),
-        PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetFriendsRankingForCrossSaveAsync", reqId, boardId,
+                                       rankArray, rankArraySize, commentArray, commentArraySize,
+                                       infoArray, infoArraySize, arrayNum, lastSortDate,
+                                       totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdForCrossSave(
@@ -1633,15 +1782,9 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdForCrossSave(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(Lib_NpScore,
-              "(STUBBED) called reqId={}, boardId={}, "
-              "accountIdArray={}, accountIdArraySize={}, rankArray={}, rankArraySize={}, "
-              "commentArray={}, commentArraySize={}, infoArray={}, infoArraySize={}, arrayNum={}, "
-              "lastSortDate={}, totalRecord={}, option={}",
-              reqId, boardId, PTR(accountIdArray), accountIdArraySize, PTR(rankArray),
-              rankArraySize, PTR(commentArray), commentArraySize, PTR(infoArray), infoArraySize,
-              arrayNum, PTR(lastSortDate), PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported(
+        "GetRankingByAccountIdForCrossSave", reqId, boardId, rankArray, rankArraySize, commentArray,
+        commentArraySize, infoArray, infoArraySize, arrayNum, lastSortDate, totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdForCrossSaveAsync(
@@ -1650,15 +1793,10 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdForCrossSaveAsync(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(Lib_NpScore,
-              "(STUBBED) called reqId={}, boardId={}, "
-              "accountIdArray={}, accountIdArraySize={}, rankArray={}, rankArraySize={}, "
-              "commentArray={}, commentArraySize={}, infoArray={}, infoArraySize={}, arrayNum={}, "
-              "lastSortDate={}, totalRecord={}, option={}",
-              reqId, boardId, PTR(accountIdArray), accountIdArraySize, PTR(rankArray),
-              rankArraySize, PTR(commentArray), commentArraySize, PTR(infoArray), infoArraySize,
-              arrayNum, PTR(lastSortDate), PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetRankingByAccountIdForCrossSaveAsync", reqId, boardId,
+                                       rankArray, rankArraySize, commentArray, commentArraySize,
+                                       infoArray, infoArraySize, arrayNum, lastSortDate,
+                                       totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdPcIdForCrossSave(
@@ -1667,15 +1805,10 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdPcIdForCrossSave(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(Lib_NpScore,
-              "(STUBBED) called reqId={}, boardId={}, "
-              "idArray={}, idArraySize={}, rankArray={}, rankArraySize={}, commentArray={}, "
-              "commentArraySize={}, infoArray={}, infoArraySize={}, arrayNum={}, lastSortDate={}, "
-              "totalRecord={}, option={}",
-              reqId, boardId, PTR(idArray), idArraySize, PTR(rankArray), rankArraySize,
-              PTR(commentArray), commentArraySize, PTR(infoArray), infoArraySize, arrayNum,
-              PTR(lastSortDate), PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetRankingByAccountIdPcIdForCrossSave", reqId, boardId,
+                                       rankArray, rankArraySize, commentArray, commentArraySize,
+                                       infoArray, infoArraySize, arrayNum, lastSortDate,
+                                       totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdPcIdForCrossSaveAsync(
@@ -1684,15 +1817,10 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByAccountIdPcIdForCrossSaveAsync(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(Lib_NpScore,
-              "(STUBBED) called reqId={}, boardId={}, "
-              "idArray={}, idArraySize={}, rankArray={}, rankArraySize={}, commentArray={}, "
-              "commentArraySize={}, infoArray={}, infoArraySize={}, arrayNum={}, lastSortDate={}, "
-              "totalRecord={}, option={}",
-              reqId, boardId, PTR(idArray), idArraySize, PTR(rankArray), rankArraySize,
-              PTR(commentArray), commentArraySize, PTR(infoArray), infoArraySize, arrayNum,
-              PTR(lastSortDate), PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetRankingByAccountIdPcIdForCrossSaveAsync", reqId, boardId,
+                                       rankArray, rankArraySize, commentArray, commentArraySize,
+                                       infoArray, infoArraySize, arrayNum, lastSortDate,
+                                       totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByRangeForCrossSave(
@@ -1701,15 +1829,9 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByRangeForCrossSave(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(
-        Lib_NpScore,
-        "(STUBBED) called reqId={}, boardId={}, "
-        "startSerialRank={}, rankArray={}, rankArraySize={}, commentArray={}, commentArraySize={}, "
-        "infoArray={}, infoArraySize={}, arrayNum={}, lastSortDate={}, totalRecord={}, option={}",
-        reqId, boardId, startSerialRank, PTR(rankArray), rankArraySize, PTR(commentArray),
-        commentArraySize, PTR(infoArray), infoArraySize, arrayNum, PTR(lastSortDate),
-        PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetRankingByRangeForCrossSave", reqId, boardId, rankArray,
+                                       rankArraySize, commentArray, commentArraySize, infoArray,
+                                       infoArraySize, arrayNum, lastSortDate, totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreGetRankingByRangeForCrossSaveAsync(
@@ -1718,15 +1840,10 @@ int PS4_SYSV_ABI sceNpScoreGetRankingByRangeForCrossSaveAsync(
     OrbisNpScoreComment* commentArray, u64 commentArraySize, OrbisNpScoreGameInfo* infoArray,
     u64 infoArraySize, u64 arrayNum, Rtc::OrbisRtcTick* lastSortDate,
     OrbisNpScoreRankNumber* totalRecord, void* option) {
-    LOG_ERROR(
-        Lib_NpScore,
-        "(STUBBED) called reqId={}, boardId={}, "
-        "startSerialRank={}, rankArray={}, rankArraySize={}, commentArray={}, commentArraySize={}, "
-        "infoArray={}, infoArraySize={}, arrayNum={}, lastSortDate={}, totalRecord={}, option={}",
-        reqId, boardId, startSerialRank, PTR(rankArray), rankArraySize, PTR(commentArray),
-        commentArraySize, PTR(infoArray), infoArraySize, arrayNum, PTR(lastSortDate),
-        PTR(totalRecord), PTR(option));
-    return ORBIS_OK;
+    return CrossSaveRankingUnsupported("GetRankingByRangeForCrossSaveAsync", reqId, boardId,
+                                       rankArray, rankArraySize, commentArray, commentArraySize,
+                                       infoArray, infoArraySize, arrayNum, lastSortDate,
+                                       totalRecord);
 }
 
 int PS4_SYSV_ABI sceNpScoreSetThreadParam(s32 threadPriority, u64 cpuAffinityMask) {

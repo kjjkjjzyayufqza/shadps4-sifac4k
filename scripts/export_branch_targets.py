@@ -49,6 +49,13 @@ import ida_xref
 
 FORMAT_VERSION = 1
 
+# The reciprocal and reciprocal-square-root estimates the rewrite pass replaces. Every
+# encoding of them is shorter than a near jump, so every site borrows bytes from its
+# neighbours, and a body holding one is exported even when its own control flow is direct.
+ESTIMATE_MNEMONICS = frozenset(
+    ("rcpps", "rcpss", "rsqrtps", "rsqrtss", "vrcpps", "vrcpss", "vrsqrtps", "vrsqrtss")
+)
+
 DW_EH_PE_OMIT = 0xFF
 DW_EH_PE_ABSPTR = 0x00
 DW_EH_PE_UDATA2 = 0x02
@@ -304,13 +311,22 @@ def is_padding(address):
 
 
 def analyze_range(start, end):
-    """Returns (indirect_jump_count, complete).
+    """Returns (indirect_jump_count, complete, holds_estimate).
 
     `complete` says whether every indirect jump in the range is accounted for: the
     disassembler recovered its switch table, or the jump transfers control out of the body
     entirely, as a dispatch through a vtable slot does.
+
+    `holds_estimate` says whether the body contains a reciprocal or reciprocal-square-root
+    estimate. Those are the sites the rewrite pass replaces, and every one of them is too
+    short to hold a near jump, so the pass borrows bytes from the instructions around it.
+    Borrowing is only sound where every address control flow can enter is known, and the
+    pass cannot know an entry from outside the body - an exception landing pad, say - on
+    its own. So a body holding an estimate is worth exporting even when its own control
+    flow is entirely direct.
     """
     indirect_jumps = 0
+    holds_estimate = False
     address = start
     while address < end:
         flags = ida_bytes.get_full_flags(address)
@@ -321,11 +337,13 @@ def analyze_range(start, end):
             # unexplored are the risk: they could be code holding a jump that this export
             # would then claim does not exist.
             if not ida_bytes.is_data(flags) and not is_padding(address):
-                return indirect_jumps, False
+                return indirect_jumps, False, holds_estimate
             address += max(1, ida_bytes.get_item_size(address))
             continue
 
         size = max(1, ida_bytes.get_item_size(address))
+        if idc.print_insn_mnem(address).lower() in ESTIMATE_MNEMONICS:
+            holds_estimate = True
         if not is_indirect_jump(address):
             address += size
             continue
@@ -339,23 +357,23 @@ def analyze_range(start, end):
 
         targets = code_xref_targets(address)
         if any(start <= target < end for target in targets):
-            return indirect_jumps, False
+            return indirect_jumps, False, holds_estimate
         if not targets:
             # No recovered edge, so the judgment has to come from the code around it.
             #
             # An indexed operand is how an absolute jump table is read, and an unrecovered
             # one is exactly the case that must stay forbidden.
             if "*" in idc.print_operand(address, 0):
-                return indirect_jumps, False
+                return indirect_jumps, False, holds_estimate
             # A single slot - `jmp qword ptr [rax+70h]`, a vtable dispatch, or an import
             # thunk through `[rip+disp]` - names one function pointer and cannot land
             # inside this body. A bare register needs the surrounding code to say so.
             insn = ida_ua.insn_t()
             ida_ua.decode_insn(insn, address)
             if insn.ops[0].type == ida_ua.o_reg and not leaves_body(address, start):
-                return indirect_jumps, False
+                return indirect_jumps, False, holds_estimate
         address += size
-    return indirect_jumps, True
+    return indirect_jumps, True, holds_estimate
 
 
 def define_missing_bodies(starts, base):
@@ -384,7 +402,11 @@ def main(output_path):
     idaapi.auto_wait()
 
     base = module_base()
-    starts = sorted(set(eh_frame_function_starts(ida_nalt.get_input_file_path())))
+    # The raw count is what the emulator holds too, before it sorts and dedups, so the
+    # two sides compare the same number when the loader checks that this file belongs to
+    # the module being rewritten.
+    table_starts = eh_frame_function_starts(ida_nalt.get_input_file_path())
+    starts = sorted(set(table_starts))
     if not starts:
         raise UnsupportedEncoding("the unwind table lists no bodies")
 
@@ -399,6 +421,11 @@ def main(output_path):
         "# Addresses are module-relative, matching the emulator's own logging.",
         "version %d" % FORMAT_VERSION,
         "base 0x%x" % base,
+        # Ties the file to one build. Entries exported from a different build of the same
+        # title can still cover a body the pass walks, and would then vouch for addresses
+        # that are not this build's entry points; the loader refuses the file when this
+        # disagrees with the module it is about to rewrite.
+        "bodies %d" % len(table_starts),
     ]
 
     for index, start_vaddr in enumerate(starts):
@@ -411,9 +438,10 @@ def main(output_path):
         if end <= start:
             continue
 
-        indirect_jumps, complete = analyze_range(start, end)
-        if indirect_jumps == 0:
-            # The emulator recovers these on its own; exporting them would only add bulk.
+        indirect_jumps, complete, holds_estimate = analyze_range(start, end)
+        if indirect_jumps == 0 and not holds_estimate:
+            # Direct control flow the emulator recovers on its own, and nothing in the
+            # body that makes it borrow bytes. Exporting it would only add bulk.
             continue
         if not complete:
             # Saying nothing leaves the emulator's own conservative refusal in place,
@@ -435,7 +463,7 @@ def main(output_path):
     print(
         "[branch-targets] %d bodies in the unwind table, %d newly defined, %d exported, "
         "%d refused, %d targets, base 0x%x -> %s"
-        % (len(starts), defined, exported, refused, total_targets, base, output_path)
+        % (len(table_starts), defined, exported, refused, total_targets, base, output_path)
     )
 
 

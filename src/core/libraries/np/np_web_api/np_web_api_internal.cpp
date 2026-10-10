@@ -66,6 +66,7 @@ s32 createLibraryContext(s32 libHttpCtxId, u64 poolSize, const char* name, s32 t
     auto& new_context = g_contexts.at(ctx_id);
     new_context->libCtxId = ctx_id;
     new_context->libHttpCtxId = libHttpCtxId;
+    new_context->poolSize = poolSize;
     new_context->type = type;
     new_context->userCount = 0;
     new_context->terminated = false;

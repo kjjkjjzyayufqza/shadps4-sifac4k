@@ -84,7 +84,8 @@ const VerifiedBranchTargets::Function* VerifiedBranchTargets::FindContaining(u64
     return entry->second.end > offset ? &entry->second : nullptr;
 }
 
-VerifiedBranchTargets VerifiedBranchTargets::Load(const std::filesystem::path& path) {
+VerifiedBranchTargets VerifiedBranchTargets::Load(const std::filesystem::path& path,
+                                                  u64 module_body_count) {
     VerifiedBranchTargets result;
 
     std::ifstream file{path};
@@ -137,6 +138,23 @@ VerifiedBranchTargets VerifiedBranchTargets::Load(const std::filesystem::path& p
             continue;
         }
 
+        if (fields[0] == "bodies") {
+            u64 parsed = 0;
+            if (fields.size() != 2 || !ParseAddress(fields[1], parsed) || parsed == 0) {
+                return reject("malformed bodies count");
+            }
+            if (module_body_count != 0 && parsed != module_body_count) {
+                LOG_ERROR(Core,
+                          "Branch target file {} was exported from a module with {} unwind "
+                          "bodies, but this one has {}; refusing it rather than vouching for "
+                          "another build's addresses",
+                          path.string(), parsed, module_body_count);
+                return VerifiedBranchTargets{};
+            }
+            result.declared_body_count = parsed;
+            continue;
+        }
+
         if (fields[0] == "func") {
             u64 start = 0;
             u64 end = 0;
@@ -185,6 +203,12 @@ VerifiedBranchTargets VerifiedBranchTargets::Load(const std::filesystem::path& p
         function.targets.erase(duplicates.begin(), duplicates.end());
     }
 
+    if (result.declared_body_count == 0) {
+        LOG_WARNING(Core,
+                    "Branch target file {} predates the unwind-body record, so nothing ties it "
+                    "to this build of the module; re-export it to have the tie checked",
+                    path.string());
+    }
     LOG_INFO(Core, "Loaded {} verified function target sets from {}", result.functions.size(),
              path.string());
     return result;

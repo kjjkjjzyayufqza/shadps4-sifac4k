@@ -303,8 +303,12 @@ int PS4_SYSV_ABI sceNetCtlGetResult(int eventType, int* errorCode) {
     if (!errorCode) {
         return ORBIS_NET_CTL_ERROR_INVALID_ADDR;
     }
-    LOG_DEBUG(Lib_NetCtl, "(STUBBED) called eventType = {} ", eventType);
-    *errorCode = 0;
+    // Reports the error recorded for the last transition of this event type. shadPS4 drives
+    // netctl straight off the host's connectivity, so the only outcomes it can produce are
+    // success ones - but a title that reads a stale or unrelated code here takes the wrong
+    // branch, so the answer has to come from the recorded state rather than a constant.
+    *errorCode = netctl.LastEventError(eventType);
+    LOG_DEBUG(Lib_NetCtl, "GetResult eventType={} errorCode={:#x}", eventType, *errorCode);
     return ORBIS_OK;
 }
 
@@ -430,9 +434,12 @@ int PS4_SYSV_ABI sceNetCtlTerm() {
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlUnregisterCallback() {
-    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetCtlUnregisterCallback(int cid) {
+    const s32 result = netctl.UnregisterCallback(cid);
+    if (result != ORBIS_OK) {
+        LOG_ERROR(Lib_NetCtl, "UnregisterCallback cid={} failed ({:#x})", cid, result);
+    }
+    return result;
 }
 
 int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForLibIpcInt() {
@@ -485,9 +492,12 @@ int PS4_SYSV_ABI sceNetCtlRegisterCallbackForNpToolkit(OrbisNetCtlCallbackForNpT
     return ORBIS_OK;
 }
 
-int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForNpToolkit() {
-    LOG_ERROR(Lib_NetCtl, "(STUBBED) called");
-    return ORBIS_OK;
+int PS4_SYSV_ABI sceNetCtlUnregisterCallbackForNpToolkit(int cid) {
+    const s32 result = netctl.UnregisterNpToolkitCallback(cid);
+    if (result != ORBIS_OK) {
+        LOG_ERROR(Lib_NetCtl, "UnregisterCallbackForNpToolkit cid={} failed ({:#x})", cid, result);
+    }
+    return result;
 }
 
 int PS4_SYSV_ABI sceNetCtlApCheckCallback() {

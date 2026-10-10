@@ -41,6 +41,13 @@ struct OrbisNpWebApiContext {
     std::map<s32, OrbisNpWebApiExtendedPushEventFilter*> extendedPushEventFilters;
     std::string name;
     bool terminated;
+    // What the title asked for at Initialize time and through SetMaxConnection. shadPS4 serves
+    // WebApi traffic from the host heap and the host's connection pool, so neither value changes
+    // how a request is issued - but GetMemoryPoolStats and GetConnectionStats have to answer with
+    // the budget the title handed over, and a title that reads back a zero pool concludes the
+    // library failed to initialise.
+    u64 poolSize = 0;
+    s32 maxConnection = 0;
 };
 
 struct OrbisNpWebApiUserContext {

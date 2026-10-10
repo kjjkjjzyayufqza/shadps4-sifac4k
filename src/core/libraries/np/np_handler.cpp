@@ -719,6 +719,56 @@ bool NpHandler::IsPsnSignedIn(s32 user_id) const {
     return it != m_clients.end() && it->second->IsAuthenticated();
 }
 
+s32 NpHandler::GetFirstSignedInUserId() const {
+    std::lock_guard lock(m_mutex_clients);
+    for (const auto& [user_id, client] : m_clients) {
+        if (client->IsAuthenticated()) {
+            return user_id;
+        }
+    }
+    return -1;
+}
+
+s32 NpHandler::SendInGameMessage(s32 user_id, const std::vector<u64>& target_account_ids,
+                                 const u8* msg, size_t msg_len, u32 message_type) {
+    std::shared_ptr<ShadNet::ShadNetClient> client;
+    {
+        std::lock_guard lock(m_mutex_clients);
+        auto it = m_clients.find(user_id);
+        if (it == m_clients.end()) {
+            LOG_WARNING(NpHandler, "SendInGameMessage: user_id={} not connected", user_id);
+            return ORBIS_NP_ERROR_SIGNED_OUT;
+        }
+        client = it->second;
+    }
+    if (!client->IsAuthenticated()) {
+        LOG_WARNING(NpHandler, "SendInGameMessage: user_id={} not authenticated", user_id);
+        return ORBIS_NP_ERROR_SIGNED_OUT;
+    }
+
+    shadnet::SendInGameMessageRequest proto;
+    for (const u64 account_id : target_account_ids) {
+        proto.add_target_account_ids(account_id);
+    }
+    proto.set_message(msg, msg_len);
+    proto.set_message_type(message_type);
+
+    const std::string proto_bytes = proto.SerializeAsString();
+    std::vector<u8> payload;
+    payload.reserve(4 + proto_bytes.size());
+    const u32 sz = static_cast<u32>(proto_bytes.size());
+    payload.push_back(static_cast<u8>(sz));
+    payload.push_back(static_cast<u8>(sz >> 8));
+    payload.push_back(static_cast<u8>(sz >> 16));
+    payload.push_back(static_cast<u8>(sz >> 24));
+    payload.insert(payload.end(), proto_bytes.begin(), proto_bytes.end());
+
+    const u64 pkt_id = client->SubmitRequest(ShadNet::CommandType::SendInGameMessage, payload);
+    LOG_INFO(NpHandler, "SendInGameMessage: user_id={} targets={} type={} bytes={} pkt_id={}",
+             user_id, target_account_ids.size(), message_type, msg_len, pkt_id);
+    return ORBIS_OK;
+}
+
 bool NpHandler::IsAnySignedIn() const {
     std::lock_guard lock(m_mutex_clients);
     for (auto& [_, client] : m_clients)
@@ -2885,6 +2935,20 @@ s32 NpHandler::TusSetData(s32 user_id, s32 service_label, const std::string& own
     return ORBIS_OK;
 }
 
+// Reply bodies that carry a protobuf are prefixed with its length as a u32 LE. Returns an empty
+// string when the body is shorter than it claims, which every caller treats as a parse failure.
+static std::string ExtractLengthPrefixedProto(const std::vector<u8>& body) {
+    if (body.size() < 4) {
+        return {};
+    }
+    const u32 len = static_cast<u32>(body[0]) | (static_cast<u32>(body[1]) << 8) |
+                    (static_cast<u32>(body[2]) << 16) | (static_cast<u32>(body[3]) << 24);
+    if (body.size() < static_cast<size_t>(4) + len) {
+        return {};
+    }
+    return std::string(reinterpret_cast<const char*>(body.data() + 4), len);
+}
+
 void NpHandler::OnAsyncReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
                              ShadNet::ErrorType error, const std::vector<u8>& body) {
     const auto cmd_val = static_cast<u16>(cmd);
@@ -2902,6 +2966,30 @@ void NpHandler::OnAsyncReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
     }
     if (cmd == ShadNet::CommandType::LookupOnlineId) {
         OnLookupReply(user_id, cmd, pkt_id, error, body);
+        return;
+    }
+    if (cmd == ShadNet::CommandType::SendInGameMessage) {
+        // Nothing waits on this reply: the title's send call completes as soon as the request is
+        // queued, exactly as it does on hardware. The per-target outcome is still worth a line,
+        // because "sent but nobody was online" and "sent and delivered" look identical to the
+        // game and only the log can tell them apart.
+        shadnet::SendInGameMessageReply reply;
+        const std::string proto = ExtractLengthPrefixedProto(body);
+        if (error != ShadNet::ErrorType::NoError) {
+            LOG_WARNING(NpHandler, "SendInGameMessage: pkt_id={} rejected by server (error={})",
+                        pkt_id, static_cast<int>(error));
+        } else if (reply.ParseFromString(proto)) {
+            int delivered = 0;
+            for (const auto& r : reply.results()) {
+                LOG_INFO(NpHandler, "SendInGameMessage: pkt_id={} target={} delivered={}", pkt_id,
+                         r.account_id(), r.delivered());
+                delivered += r.delivered() ? 1 : 0;
+            }
+            LOG_INFO(NpHandler, "SendInGameMessage: pkt_id={} delivered {}/{}", pkt_id, delivered,
+                     reply.results_size());
+        } else {
+            LOG_WARNING(NpHandler, "SendInGameMessage: pkt_id={} reply parse failed", pkt_id);
+        }
         return;
     }
 
@@ -3285,17 +3373,26 @@ void NpHandler::OnScoreReply(s32 user_id, ShadNet::CommandType cmd, u64 pkt_id,
         if (pending.totalSizeOut != nullptr) {
             *pending.totalSizeOut = stored_size;
         }
-        if (pending.dataOut != nullptr && pending.recvSize > 0) {
-            const u64 copy_n = std::min<u64>(static_cast<u64>(stored_size), pending.recvSize);
-            std::memcpy(pending.dataOut, body.data() + 4, static_cast<size_t>(copy_n));
-            if (copy_n < stored_size) {
-                LOG_WARNING(NpHandler,
-                            "OnScoreReply: {} truncated user_id={} pkt_id={} stored={} recv={}",
-                            cmd_name, user_id, pkt_id, stored_size, pending.recvSize);
+        // The blob is kept whole on the request so the title can keep asking for the next piece
+        // with the same small buffer: sceNpScoreGetGameData has no offset parameter, so
+        // continuing is state on the request, not something the caller can express. Handing out
+        // the first piece here leaves the read position where the next call has to resume.
+        u64 copied = 0;
+        u64 remaining = 0;
+        {
+            std::lock_guard lock(req->mutex);
+            auto& xfer = req->xfer;
+            xfer.recvBuf.assign(body.begin() + 4, body.begin() + 4 + stored_size);
+            xfer.recvOffset = 0;
+            if (pending.dataOut != nullptr && pending.recvSize > 0) {
+                copied = xfer.ReadSlice(pending.dataOut, pending.recvSize);
             }
+            remaining = xfer.recvBuf.size() - xfer.recvOffset;
         }
-        LOG_INFO(NpHandler, "OnScoreReply: {} user_id={} pkt_id={} storedSize={} recvSize={}",
-                 cmd_name, user_id, pkt_id, stored_size, pending.recvSize);
+        LOG_INFO(NpHandler,
+                 "OnScoreReply: {} user_id={} pkt_id={} storedSize={} recvSize={} copied={} "
+                 "remaining={}",
+                 cmd_name, user_id, pkt_id, stored_size, pending.recvSize, copied, remaining);
         req->SetResult(ORBIS_OK);
         break;
     }

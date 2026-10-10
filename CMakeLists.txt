@@ -656,6 +656,8 @@ set(NP_LIBS src/core/libraries/np/np_error.h
             src/core/libraries/np/np_trophy.h
             src/core/libraries/np/trophy_ui.cpp
             src/core/libraries/np/trophy_ui.h
+            src/core/libraries/np/np_ingame_message.cpp
+            src/core/libraries/np/np_ingame_message.h
             src/core/libraries/np/np_party.cpp
             src/core/libraries/np/np_party.h
             src/core/libraries/np/np_auth.cpp
@@ -1261,6 +1263,8 @@ set(SHADNET src/shadnet/client.cpp
             src/shadnet/client.h
             src/shadnet/link_liveness.cpp
             src/shadnet/link_liveness.h
+            src/shadnet/resolve.cpp
+            src/shadnet/resolve.h
             src/shadnet/server_probe.cpp
             src/shadnet/server_probe.h
             "${SHADNET_PROTO_OUT}/shadnet.pb.cc"

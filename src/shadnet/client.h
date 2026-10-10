@@ -37,9 +37,13 @@ namespace ShadNet {
 
 // Protocol constants
 static constexpr u32 SHAD_HEADER_SIZE = 15;
-static constexpr u32 SHAD_CONNECT_TIMEOUT_MS = 10000; // 10 second connect/handshake timeout
+// One TCP handshake, long enough for a lossy path to finish its own SYN retransmits.
+// The minute MBON's login screen waits is not this timer. That page polls until
+// sign-in finishes, and sign-in was stuck in an unbounded DNS lookup of a
+// Cloudflare-hosted name. Resolution has its own budget in resolve.h.
+static constexpr u32 SHAD_CONNECT_TIMEOUT_MS = 15000;
 // MAX_ATTEMPTS * CONNECT_TIMEOUT + sum(backoffs).
-static constexpr u32 SHAD_CONNECT_MAX_ATTEMPTS = 4;
+static constexpr u32 SHAD_CONNECT_MAX_ATTEMPTS = 2;
 static constexpr u32 SHAD_CONNECT_RETRY_BACKOFF_MS =
     1000; // base backoff, doubled per retry (cap 8s)
 // Upper bound on what ConnectThread can spend before it gives up: every attempt may burn the
@@ -119,6 +123,7 @@ enum class CommandType : u16 {
     GetToken = 39,
     SetAppearOffline = 40,
     LookupOnlineId = 41,
+    SendInGameMessage = 42,
     // Matchmaking
     ContextStart = 100,
     CreateRoom = 101,
@@ -137,6 +142,8 @@ enum class CommandType : u16 {
     GetRoomMemberDataExternalList = 114,
     SendRoomMessage = 115,
     GetLobbyInfoList = 116,
+    SetRoomMemberDataInternal = 117,
+    SetSignalingOptParam = 118,
     // Title User Storage (TUS)
     TusSetData = 201,
     TusGetData = 202,
@@ -202,7 +209,9 @@ enum class ErrorType : uint8_t {
     ScoreHasData = 31,
     CondFail = 32,
     Unsupported = 33,
-    TooLarge = 34, // TSS file on the server exceeds the slot's documented maximum
+    TooLarge = 34,      // TSS file on the server exceeds the slot's documented maximum
+    RateLimited = 35,   // sending faster than the server allows
+    QuotaExceeded = 36, // caller already stores as much as its quota allows
 };
 
 enum class ShadNetState {
@@ -300,6 +309,11 @@ struct NotifyRoomEvent {
     std::vector<MatchingBinAttr> member_bin_attrs;
 
     std::vector<MatchingBinAttr> bin_attrs;
+
+    // Only carried by ROOM_EVENT_UPDATED_SIGNALING_OPT_PARAM (0x1108).
+    u32 signaling_type = 0;
+    u32 signaling_flag = 0;
+    u32 signaling_hub_member_id = 0;
 };
 
 struct NotifyRoomMessage {
@@ -313,6 +327,8 @@ struct NotifyRoomMessage {
     u64 src_account_id = 0;
     u32 src_platform = 0;
     std::vector<u8> msg;
+    // True when the sender used sceNpMatching2SendRoomChatMessage rather than SendRoomMessage.
+    bool is_chat = false;
 };
 
 // ShadNetClient
