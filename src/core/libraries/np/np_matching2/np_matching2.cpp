@@ -545,8 +545,10 @@ s32 PS4_SYSV_ABI sceNpMatching2SignalingGetConnectionStatus(OrbisNpMatching2Cont
                                                             OrbisNpMatching2RoomMemberId memberId,
                                                             s32* connStatus, void* peerAddr,
                                                             u16* peerPort) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
-             memberId);
+    // Per peer per frame while a room is up. Info would be a synchronous write on the guest
+    // thread under Log.sync; the [RoomDiag] line is the one that stays on.
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
+              memberId);
 
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
@@ -564,46 +566,54 @@ s32 PS4_SYSV_ABI sceNpMatching2SignalingGetConnectionStatus(OrbisNpMatching2Cont
     constexpr s32 kActive = 2;
     // The title polls this once per peer per frame while a room is filling. The handshake thread
     // and the ShadNet reader mutate the same maps.
-    std::lock_guard state_lock(Matching2StateMutex());
-    const auto room_it = ctx->room_cache.find(roomId);
-    const bool in_room = room_it != ctx->room_cache.end() &&
-                         room_it->second.members.find(memberId) != room_it->second.members.end();
+    u64 wait_us = 0;
+    s32 status = kInactive;
+    {
+        Matching2StateLock state_lock{"GetConnectionStatus"};
+        wait_us = state_lock.WaitUs();
+        const auto room_it = ctx->room_cache.find(roomId);
+        const bool in_room =
+            room_it != ctx->room_cache.end() &&
+            room_it->second.members.find(memberId) != room_it->second.members.end();
 
-    if (!in_room) {
-        if (connStatus) {
-            *connStatus = kInactive;
+        if (!in_room) {
+            if (connStatus) {
+                *connStatus = kInactive;
+            }
+            LOG_DEBUG(Lib_NpMatching2, "member={} is not in room={}, status=inactive", memberId,
+                      roomId);
+        } else {
+            auto peer_it = ctx->peers.find(memberId);
+            if (peer_it == ctx->peers.end()) {
+                PeerInfo pi{};
+                pi.member_id = memberId;
+                pi.status = kPending;
+                const auto member_it = room_it->second.members.find(memberId);
+                if (member_it != room_it->second.members.end()) {
+                    pi.addr = member_it->second.addr;
+                    pi.port = member_it->second.port;
+                    pi.online_id = member_it->second.np_id.handle;
+                }
+                peer_it = ctx->peers.emplace(memberId, pi).first;
+            }
+
+            status = peer_it->second.status == kActive ? kActive : kPending;
+            if (connStatus) {
+                *connStatus = status;
+            }
+            if (peerAddr) {
+                *reinterpret_cast<u32*>(peerAddr) = peer_it->second.addr;
+            }
+            if (peerPort) {
+                *peerPort = peer_it->second.port;
+            }
+
+            LOG_DEBUG(Lib_NpMatching2, "member={} is in room={}, status={} addr={:#x}:{}", memberId,
+                      roomId, status, peer_it->second.addr,
+                      Libraries::Net::sceNetNtohs(peer_it->second.port));
         }
-        LOG_INFO(Lib_NpMatching2, "member={} is not in room={}, status=inactive", memberId, roomId);
-        return ORBIS_OK;
     }
-
-    auto peer_it = ctx->peers.find(memberId);
-    if (peer_it == ctx->peers.end()) {
-        PeerInfo pi{};
-        pi.member_id = memberId;
-        pi.status = kPending;
-        const auto member_it = room_it->second.members.find(memberId);
-        if (member_it != room_it->second.members.end()) {
-            pi.addr = member_it->second.addr;
-            pi.port = member_it->second.port;
-            pi.online_id = member_it->second.np_id.handle;
-        }
-        peer_it = ctx->peers.emplace(memberId, pi).first;
-    }
-
-    const s32 status = peer_it->second.status == kActive ? kActive : kPending;
-    if (connStatus) {
-        *connStatus = status;
-    }
-    if (peerAddr) {
-        *reinterpret_cast<u32*>(peerAddr) = peer_it->second.addr;
-    }
-    if (peerPort) {
-        *peerPort = peer_it->second.port;
-    }
-
-    LOG_INFO(Lib_NpMatching2, "member={} is in room={}, status={} addr={:#x}:{}", memberId, roomId,
-             status, peer_it->second.addr, Libraries::Net::sceNetNtohs(peer_it->second.port));
+    NoteConnectionStatusPoll(wait_us, status);
     return ORBIS_OK;
 }
 
@@ -718,26 +728,32 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomMemberIdListLocal(OrbisNpMatching2ContextI
         LOG_ERROR(Lib_NpMatching2, "invalid context id");
         return ORBIS_NP_MATCHING2_ERROR_INVALID_CONTEXT_ID;
     }
-    std::lock_guard state_lock(Matching2StateMutex());
-    const auto rc_it = ctx->room_cache.find(roomId);
-    if (rc_it == ctx->room_cache.end()) {
-        LOG_ERROR(Lib_NpMatching2, "GetRoomMemberIdListLocal: room {} not cached", roomId);
-        return ORBIS_NP_MATCHING2_ERROR_ROOM_NOT_FOUND;
-    }
-
-    // A zero filter means "every member"; otherwise only members whose NAT type is at least as
-    // good as the requested one are listed, which is how the caller asks for peers it can
-    // actually reach directly.
+    bool missing = false;
     u32 written = 0;
     u32 matched = 0;
-    for (const auto& [mid, mc] : rc_it->second.members) {
-        if (natTypeFilter != 0 && mc.nat_type > natTypeFilter) {
-            continue;
+    {
+        Matching2StateLock state_lock{"GetRoomMemberIdListLocal"};
+        const auto rc_it = ctx->room_cache.find(roomId);
+        if (rc_it == ctx->room_cache.end()) {
+            missing = true;
+        } else {
+            // A zero filter means "every member"; otherwise only members whose NAT type is at
+            // least as good as the requested one are listed, which is how the caller asks for
+            // peers it can actually reach directly.
+            for (const auto& [mid, mc] : rc_it->second.members) {
+                if (natTypeFilter != 0 && mc.nat_type > natTypeFilter) {
+                    continue;
+                }
+                ++matched;
+                if (written < memberIdNum) {
+                    memberId[written++] = mid;
+                }
+            }
         }
-        ++matched;
-        if (written < memberIdNum) {
-            memberId[written++] = mid;
-        }
+    }
+    if (missing) {
+        LOG_ERROR(Lib_NpMatching2, "GetRoomMemberIdListLocal: room {} not cached", roomId);
+        return ORBIS_NP_MATCHING2_ERROR_ROOM_NOT_FOUND;
     }
     LOG_INFO(Lib_NpMatching2,
              "GetRoomMemberIdListLocal: ctx={} room={} natFilter={} matched={} written={} cap={}",
@@ -764,18 +780,18 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomPasswordLocal(OrbisNpMatching2ContextId ct
         LOG_ERROR(Lib_NpMatching2, "invalid context id");
         return ORBIS_NP_MATCHING2_ERROR_INVALID_CONTEXT_ID;
     }
-    std::lock_guard state_lock(Matching2StateMutex());
-    const auto rc_it = ctx->room_cache.find(roomId);
-    if (rc_it == ctx->room_cache.end() || !rc_it->second.has_password) {
-        *withPassword = false;
-        LOG_INFO(Lib_NpMatching2, "GetRoomPasswordLocal: ctx={} room={} no password", ctxId,
-                 roomId);
-        return ORBIS_OK;
+    bool has_password = false;
+    {
+        Matching2StateLock state_lock{"GetRoomPasswordLocal"};
+        const auto rc_it = ctx->room_cache.find(roomId);
+        if (rc_it != ctx->room_cache.end() && rc_it->second.has_password) {
+            has_password = true;
+            *password = rc_it->second.password;
+        }
     }
-    *withPassword = true;
-    *password = rc_it->second.password;
-    LOG_INFO(Lib_NpMatching2, "GetRoomPasswordLocal: ctx={} room={} password returned", ctxId,
-             roomId);
+    *withPassword = has_password;
+    LOG_INFO(Lib_NpMatching2, "GetRoomPasswordLocal: ctx={} room={} {}", ctxId, roomId,
+             has_password ? "password returned" : "no password");
     return ORBIS_OK;
 }
 
@@ -795,15 +811,15 @@ int PS4_SYSV_ABI sceNpMatching2GetSignalingOptParamLocal(
         LOG_ERROR(Lib_NpMatching2, "invalid context id");
         return ORBIS_NP_MATCHING2_ERROR_INVALID_CONTEXT_ID;
     }
-    std::lock_guard state_lock(Matching2StateMutex());
+    Matching2StateLock state_lock{"GetSignalingOptParamLocal"};
     *signalingOptParam = OrbisNpMatching2SignalingOptParam{};
     const auto rc_it = ctx->room_cache.find(roomId);
     if (rc_it != ctx->room_cache.end() && rc_it->second.has_signaling_opt_param) {
         *signalingOptParam = rc_it->second.signaling_opt_param;
     }
-    LOG_INFO(Lib_NpMatching2, "GetSignalingOptParamLocal: ctx={} room={} type={} flag={} hub={}",
-             ctxId, roomId, static_cast<u32>(signalingOptParam->type),
-             static_cast<u32>(signalingOptParam->flag), signalingOptParam->memberId);
+    LOG_DEBUG(Lib_NpMatching2, "GetSignalingOptParamLocal: ctx={} room={} type={} flag={} hub={}",
+              ctxId, roomId, static_cast<u32>(signalingOptParam->type),
+              static_cast<u32>(signalingOptParam->flag), signalingOptParam->memberId);
     return ORBIS_OK;
 }
 
@@ -894,10 +910,23 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomDataExternalList(
     return ORBIS_OK;
 }
 
+u32 RoomCacheBinBytes(const RoomCache& room) {
+    u32 bytes = 0;
+    for (const RoomBinCache& bin : room.room_bins) {
+        bytes += static_cast<u32>(bin.data.size());
+    }
+    for (const auto& member : room.members) {
+        for (const auto& bin : member.second.bins) {
+            bytes += static_cast<u32>(bin.second.data.size());
+        }
+    }
+    return bytes;
+}
+
 int PS4_SYSV_ABI sceNpMatching2GetRoomDataInternal(
     OrbisNpMatching2ContextId ctxId, OrbisNpMatching2GetRoomDataInternalRequest* request,
     OrbisNpMatching2RequestOptParam* requestOpt, OrbisNpMatching2RequestId* requestId) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, requestOpt = {}", ctxId, fmt::ptr(requestOpt));
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}, requestOpt = {}", ctxId, fmt::ptr(requestOpt));
 
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
@@ -918,27 +947,45 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomDataInternal(
     // answered locally and the title polls it every frame once a third member is in the room.
     // Built into the context's one shared slot, the next poll's Reset() deleted the member list
     // before Matching2:Dispatch invoked the callback, and the guest faulted on that freed list.
-    std::lock_guard state_lock(Matching2StateMutex());
-    StoreRequestCallback(ctx, requestOpt);
-    const OrbisNpMatching2RequestId reqId = AllocRequestId();
-    *requestId = reqId;
+    u64 wait_us = 0;
+    u64 build_us = 0;
+    u32 members = 0;
+    u32 bin_bytes = 0;
+    {
+        Matching2StateLock state_lock{"GetRoomDataInternal"};
+        wait_us = state_lock.WaitUs();
+        StoreRequestCallback(ctx, requestOpt);
+        const OrbisNpMatching2RequestId reqId = AllocRequestId();
+        *requestId = reqId;
 
-    ScopedRequestPayload payload(*ctx);
-    void* request_data = BuildGetRoomDataInternalPayload(*ctx, request->roomId);
+        if (const auto room_it = ctx->room_cache.find(request->roomId);
+            room_it != ctx->room_cache.end()) {
+            members = static_cast<u32>(room_it->second.members.size());
+            bin_bytes = RoomCacheBinBytes(room_it->second);
+        }
 
-    PendingEvent ev{};
-    ev.type = PendingEvent::REQUEST_CB;
-    ev.ctx_id = ctxId;
-    ev.fire_at = std::chrono::steady_clock::now();
-    ev.req_id = reqId;
-    ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_DATA_INTERNAL;
-    ev.error_code = 0;
-    const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
-    ev.request_cb = request_cb.callback;
-    ev.request_cb_arg = request_cb.arg;
-    ev.request_data = request_data;
-    ev.request_payload_owner = payload.Owner();
-    ScheduleEvent(std::move(ev));
+        ScopedRequestPayload payload(*ctx);
+        const auto build_t0 = std::chrono::steady_clock::now();
+        void* request_data = BuildGetRoomDataInternalPayload(*ctx, request->roomId);
+        build_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - build_t0)
+                                        .count());
+
+        PendingEvent ev{};
+        ev.type = PendingEvent::REQUEST_CB;
+        ev.ctx_id = ctxId;
+        ev.fire_at = std::chrono::steady_clock::now();
+        ev.req_id = reqId;
+        ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_DATA_INTERNAL;
+        ev.error_code = 0;
+        const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
+        ev.request_cb = request_cb.callback;
+        ev.request_cb_arg = request_cb.arg;
+        ev.request_data = request_data;
+        ev.request_payload_owner = payload.Owner();
+        ScheduleEvent(std::move(ev));
+    }
+    NoteRoomDataPoll(wait_us, build_us, members, bin_bytes);
     return ORBIS_OK;
 }
 
@@ -972,7 +1019,7 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomMemberDataExternalList(
 int PS4_SYSV_ABI sceNpMatching2GetRoomMemberDataInternal(
     OrbisNpMatching2ContextId ctxId, OrbisNpMatching2GetRoomMemberDataInternalRequest* request,
     OrbisNpMatching2RequestOptParam* requestOpt, OrbisNpMatching2RequestId* requestId) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, requestOpt = {}", ctxId, fmt::ptr(requestOpt));
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}, requestOpt = {}", ctxId, fmt::ptr(requestOpt));
 
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
@@ -1004,36 +1051,47 @@ int PS4_SYSV_ABI sceNpMatching2GetRoomMemberDataInternal(
 
     // Same lifetime as GetRoomDataInternal: a later poll must not free the member record this
     // callback still has to read.
-    std::lock_guard state_lock(Matching2StateMutex());
-    StoreRequestCallback(ctx, requestOpt);
-    const OrbisNpMatching2RequestId reqId = AllocRequestId();
-    if (requestId) {
-        *requestId = reqId;
+    u64 wait_us = 0;
+    u64 build_us = 0;
+    {
+        Matching2StateLock state_lock{"GetRoomMemberDataInternal"};
+        wait_us = state_lock.WaitUs();
+        StoreRequestCallback(ctx, requestOpt);
+        const OrbisNpMatching2RequestId reqId = AllocRequestId();
+        if (requestId) {
+            *requestId = reqId;
+        }
+
+        // Answered from the room cache the 0x1101/0x1102/0x1107 room events keep current, the same
+        // way GetRoomDataInternal is: the matching server has no separate per-member read command,
+        // and a round trip would only echo state we were already pushed.
+        ScopedRequestPayload payload(*ctx);
+        const auto build_t0 = std::chrono::steady_clock::now();
+        void* request_data =
+            BuildGetRoomMemberDataInternalPayload(*ctx, request->roomId, request->memberId);
+        build_us = static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                        std::chrono::steady_clock::now() - build_t0)
+                                        .count());
+        const s32 error_code = request_data ? 0 : ORBIS_NP_MATCHING2_ERROR_ROOM_MEMBER_NOT_FOUND;
+        LOG_DEBUG(Lib_NpMatching2,
+                  "GetRoomMemberDataInternal: ctx={} room={} member={} reqId={} err={}", ctxId,
+                  request->roomId, request->memberId, reqId, error_code);
+
+        PendingEvent ev{};
+        ev.type = PendingEvent::REQUEST_CB;
+        ev.ctx_id = ctxId;
+        ev.fire_at = std::chrono::steady_clock::now();
+        ev.req_id = reqId;
+        ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_MEMBER_DATA_INTERNAL;
+        ev.error_code = error_code;
+        const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
+        ev.request_cb = request_cb.callback;
+        ev.request_cb_arg = request_cb.arg;
+        ev.request_data = request_data;
+        ev.request_payload_owner = payload.Owner();
+        ScheduleEvent(std::move(ev));
     }
-
-    // Answered from the room cache the 0x1101/0x1102/0x1107 room events keep current, the same
-    // way GetRoomDataInternal is: the matching server has no separate per-member read command,
-    // and a round trip would only echo state we were already pushed.
-    ScopedRequestPayload payload(*ctx);
-    void* request_data =
-        BuildGetRoomMemberDataInternalPayload(*ctx, request->roomId, request->memberId);
-    const s32 error_code = request_data ? 0 : ORBIS_NP_MATCHING2_ERROR_ROOM_MEMBER_NOT_FOUND;
-    LOG_INFO(Lib_NpMatching2, "GetRoomMemberDataInternal: ctx={} room={} member={} reqId={} err={}",
-             ctxId, request->roomId, request->memberId, reqId, error_code);
-
-    PendingEvent ev{};
-    ev.type = PendingEvent::REQUEST_CB;
-    ev.ctx_id = ctxId;
-    ev.fire_at = std::chrono::steady_clock::now();
-    ev.req_id = reqId;
-    ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_GET_ROOM_MEMBER_DATA_INTERNAL;
-    ev.error_code = error_code;
-    const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
-    ev.request_cb = request_cb.callback;
-    ev.request_cb_arg = request_cb.arg;
-    ev.request_data = request_data;
-    ev.request_payload_owner = payload.Owner();
-    ScheduleEvent(std::move(ev));
+    NoteRoomMemberPoll(wait_us, build_us);
     return ORBIS_OK;
 }
 
@@ -1362,7 +1420,7 @@ int PS4_SYSV_ABI sceNpMatching2SignalingGetPeerNetInfo() {
 int PS4_SYSV_ABI sceNpMatching2SignalingGetPingInfo(OrbisNpMatching2ContextId ctxId,
                                                     const void* reqParam, const void* optParam,
                                                     s32* reqId) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}", ctxId);
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}", ctxId);
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
         return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
@@ -1379,27 +1437,32 @@ int PS4_SYSV_ABI sceNpMatching2SignalingGetPingInfo(OrbisNpMatching2ContextId ct
     }
 
     const auto* request = static_cast<const OrbisNpMatching2SignalingGetPingInfoRequest*>(reqParam);
-    std::lock_guard state_lock(Matching2StateMutex());
-    StoreRequestCallback(ctx, static_cast<const OrbisNpMatching2RequestOptParam*>(optParam));
-    const OrbisNpMatching2RequestId request_id = AllocRequestId();
-    *reqId = request_id;
+    u64 wait_us = 0;
+    {
+        Matching2StateLock state_lock{"GetPingInfo"};
+        wait_us = state_lock.WaitUs();
+        StoreRequestCallback(ctx, static_cast<const OrbisNpMatching2RequestOptParam*>(optParam));
+        const OrbisNpMatching2RequestId request_id = AllocRequestId();
+        *reqId = request_id;
 
-    ScopedRequestPayload payload(*ctx);
-    void* request_data = BuildSignalingGetPingInfoPayload(*ctx, request->roomId);
+        ScopedRequestPayload payload(*ctx);
+        void* request_data = BuildSignalingGetPingInfoPayload(*ctx, request->roomId);
 
-    PendingEvent ev{};
-    ev.type = PendingEvent::REQUEST_CB;
-    ev.ctx_id = ctxId;
-    ev.fire_at = std::chrono::steady_clock::now();
-    ev.req_id = request_id;
-    ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_SIGNALING_GET_PING_INFO;
-    ev.error_code = ORBIS_OK;
-    const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
-    ev.request_cb = request_cb.callback;
-    ev.request_cb_arg = request_cb.arg;
-    ev.request_data = request_data;
-    ev.request_payload_owner = payload.Owner();
-    ScheduleEvent(std::move(ev));
+        PendingEvent ev{};
+        ev.type = PendingEvent::REQUEST_CB;
+        ev.ctx_id = ctxId;
+        ev.fire_at = std::chrono::steady_clock::now();
+        ev.req_id = request_id;
+        ev.req_event = ORBIS_NP_MATCHING2_REQUEST_EVENT_SIGNALING_GET_PING_INFO;
+        ev.error_code = ORBIS_OK;
+        const RequestCallbackInfo request_cb = ConsumeRequestCallback(ctx);
+        ev.request_cb = request_cb.callback;
+        ev.request_cb_arg = request_cb.arg;
+        ev.request_data = request_data;
+        ev.request_payload_owner = payload.Owner();
+        ScheduleEvent(std::move(ev));
+    }
+    NotePingInfoPoll(wait_us);
     return ORBIS_OK;
 }
 
@@ -1412,8 +1475,8 @@ int PS4_SYSV_ABI sceNpMatching2SignalingGetConnectionInfoA(OrbisNpMatching2Conte
                                                            OrbisNpMatching2RoomId roomId,
                                                            OrbisNpMatching2RoomMemberId memberId,
                                                            u32 infoType, void* connInfo) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
-             memberId);
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
+              memberId);
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
         return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;
@@ -1431,8 +1494,8 @@ int PS4_SYSV_ABI sceNpMatching2SignalingGetConnectionInfo(OrbisNpMatching2Contex
                                                           OrbisNpMatching2RoomId roomId,
                                                           OrbisNpMatching2RoomMemberId memberId,
                                                           u32 infoType, void* connInfo) {
-    LOG_INFO(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
-             memberId);
+    LOG_DEBUG(Lib_NpMatching2, "called, ctxId = {}, roomId = {}, memberId = {}", ctxId, roomId,
+              memberId);
     if (!IsInitialized()) {
         LOG_ERROR(Lib_NpMatching2, "not initialized");
         return ORBIS_NP_MATCHING2_ERROR_NOT_INITIALIZED;

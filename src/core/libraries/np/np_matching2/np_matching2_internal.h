@@ -490,7 +490,48 @@ extern NpMatching2State g_state;
 // Erasing a peer out from under that reference is the same window.
 //
 // Recursive because the helpers nest: a room event already holds it when it starts a handshake.
+//
+// Do not hold it across a socket send or a log line. Log.sync defaults on and writes on the
+// calling thread, so an INFO line on a per-frame poll stalls the guest. Matching2StateLock
+// is the lock to take: handshake datagrams queued while it is held go out only after the
+// outermost owner on this thread has unlocked.
 std::recursive_mutex& Matching2StateMutex();
+
+// Named so a slow acquire or a long hold is attributed in the [RoomLock] line.
+class Matching2StateLock {
+public:
+    explicit Matching2StateLock(const char* where);
+    ~Matching2StateLock();
+    Matching2StateLock(const Matching2StateLock&) = delete;
+    Matching2StateLock& operator=(const Matching2StateLock&) = delete;
+
+    u64 WaitUs() const {
+        return wait_us;
+    }
+
+private:
+    std::unique_lock<std::recursive_mutex> lock;
+    const char* where = nullptr;
+    u64 wait_us = 0;
+    std::chrono::steady_clock::time_point acquired{};
+};
+
+// How many Matching2StateLock objects this thread currently holds. Handshake sends
+// queue instead of entering the socket while this is non-zero.
+int Matching2StateLockDepth();
+
+// Sends datagrams queued by this thread during Matching2StateLock. The caller has
+// already released the state mutex.
+void DrainDeferredHandshakeSends();
+
+// Once-a-second [RoomDiag] summary. Per-call lines stay at Debug so the default
+// synchronous info log does not write on every guest poll.
+void NoteRoomDataPoll(u64 lock_wait_us, u64 build_us, u32 members, u32 bin_bytes);
+void NoteRoomMemberPoll(u64 lock_wait_us, u64 build_us);
+void NoteConnectionStatusPoll(u64 lock_wait_us, s32 status);
+void NoteConnectionInfoPoll(u64 lock_wait_us, u32 rtt_us, u32 loss_pct);
+void NotePingInfoPoll(u64 lock_wait_us);
+void MaybeLogRoomDiag();
 
 // Payload for one locally-answered request. GetRoomDataInternal, GetRoomMemberDataInternal and
 // SignalingGetPingInfo are served from the cache and the title issues them back to back. Each

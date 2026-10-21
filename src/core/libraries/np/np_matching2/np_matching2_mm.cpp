@@ -250,7 +250,7 @@ void FailContextStart(OrbisNpMatching2ContextId ctx_id, s32 error_code) {
 // A request whose reply can no longer arrive must still complete: the title is waiting on this
 // callback and has no other way to learn the request is dead.
 void DispatchRequestFailure(const PendingRequest& pr, s32 error_code) {
-    std::lock_guard state_lock(Matching2StateMutex());
+    Matching2StateLock state_lock{"DispatchRequestFailure"};
     if (ContextManager::Instance().Get(pr.ctx_id) == nullptr) {
         return;
     }
@@ -279,7 +279,7 @@ void DispatchRequestFailure(const PendingRequest& pr, s32 error_code) {
 
 void DispatchRequestComplete(const PendingRequest& pr, ShadNet::ErrorType error,
                              const std::vector<u8>& body) {
-    std::lock_guard state_lock(Matching2StateMutex());
+    Matching2StateLock state_lock{"DispatchRequestComplete"};
     ContextObject* ctx = ContextManager::Instance().Get(pr.ctx_id);
     if (!ctx) {
         return;
@@ -485,8 +485,24 @@ void BuildMemberUpdate(CallbackPayload& p, const RoomCache& rc, const MemberCach
     p.room_event_data = p.room_member_update.get();
 }
 
+// Destroyed after Matching2StateLock when declared first. Room events used to log while the
+// state mutex was still held, so a guest poll waited on the synchronous write.
+struct LogAfterUnlock {
+    std::string info;
+    std::string warning;
+    ~LogAfterUnlock() {
+        if (!warning.empty()) {
+            LOG_WARNING(Lib_NpMatching2, "{}", warning);
+        }
+        if (!info.empty()) {
+            LOG_INFO(Lib_NpMatching2, "{}", info);
+        }
+    }
+};
+
 void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
-    std::lock_guard state_lock(Matching2StateMutex());
+    LogAfterUnlock after_unlock;
+    Matching2StateLock state_lock{"HandleRoomEvent"};
     ContextObject* ctx =
         ContextManager::Instance().Get(static_cast<OrbisNpMatching2ContextId>(n.ctx_id));
     if (!ctx) {
@@ -592,13 +608,13 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
     case ORBIS_NP_MATCHING2_ROOM_EVENT_UPDATED_ROOM_MEMBER_DATA_INTERNAL: {
         auto room_it = ctx->room_cache.find(room_id);
         if (room_it == ctx->room_cache.end()) {
-            LOG_WARNING(Lib_NpMatching2, "0x1107 for uncached room {}", room_id);
+            after_unlock.warning = fmt::format("0x1107 for uncached room {}", room_id);
             return;
         }
         auto mem_it = room_it->second.members.find(member_id);
         if (mem_it == room_it->second.members.end()) {
-            LOG_WARNING(Lib_NpMatching2, "0x1107 for unknown member {} in room {}", member_id,
-                        room_id);
+            after_unlock.warning =
+                fmt::format("0x1107 for unknown member {} in room {}", member_id, room_id);
             return;
         }
         MemberCache& mc = mem_it->second;
@@ -615,16 +631,16 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
             b.data = a.data;
             bytes += a.data.size();
         }
-        LOG_INFO(Lib_NpMatching2,
-                 "RoomEvent 0x1107: room={} member={} team={} flagAttr={:#x} attrs={} bytes={}",
-                 room_id, member_id, mc.team_id, mc.flag_attr, mc.bins.size(), bytes);
+        after_unlock.info = fmt::format(
+            "RoomEvent 0x1107: room={} member={} team={} flagAttr={:#x} attrs={} bytes={}", room_id,
+            member_id, mc.team_id, mc.flag_attr, mc.bins.size(), bytes);
         BuildMemberUpdate(p, room_it->second, mc, cause, ctx->a_variant);
         break;
     }
     case ORBIS_NP_MATCHING2_ROOM_EVENT_ROOM_OWNER_CHANGED: {
         auto room_it = ctx->room_cache.find(room_id);
         if (room_it == ctx->room_cache.end()) {
-            LOG_WARNING(Lib_NpMatching2, "0x1105 for uncached room {}", room_id);
+            after_unlock.warning = fmt::format("0x1105 for uncached room {}", room_id);
             return;
         }
         RoomCache& rc = room_it->second;
@@ -643,8 +659,9 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
         if (room_id == ctx->room_id) {
             ctx->is_room_owner = rc.owner;
         }
-        LOG_INFO(Lib_NpMatching2, "RoomEvent 0x1105: room={} owner {} -> {} (self={}) cause={}",
-                 room_id, prev_owner, member_id, rc.owner, static_cast<u32>(cause));
+        after_unlock.info =
+            fmt::format("RoomEvent 0x1105: room={} owner {} -> {} (self={}) cause={}", room_id,
+                        prev_owner, member_id, rc.owner, static_cast<u32>(cause));
 
         p.event_room_password = std::make_unique<OrbisNpMatching2SessionPassword>();
         *p.event_room_password = rc.has_password ? rc.password : OrbisNpMatching2SessionPassword{};
@@ -661,7 +678,7 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
     case ORBIS_NP_MATCHING2_ROOM_EVENT_UPDATED_SIGNALING_OPT_PARAM: {
         auto room_it = ctx->room_cache.find(room_id);
         if (room_it == ctx->room_cache.end()) {
-            LOG_WARNING(Lib_NpMatching2, "0x1108 for uncached room {}", room_id);
+            after_unlock.warning = fmt::format("0x1108 for uncached room {}", room_id);
             return;
         }
         RoomCache& rc = room_it->second;
@@ -676,10 +693,10 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
         // owner's choice. The guest callback is deliberately not raised - the payload structure
         // this event carries was not recoverable from libSceNpMatching2, and handing a title a
         // structure we guessed at is worse than handing it nothing.
-        LOG_INFO(Lib_NpMatching2,
-                 "RoomEvent 0x1108: room={} type={} flag={} hub={} (cache only, no callback)",
-                 room_id, static_cast<u32>(rc.signaling_opt_param.type),
-                 static_cast<u32>(rc.signaling_opt_param.flag), rc.signaling_opt_param.memberId);
+        after_unlock.info = fmt::format(
+            "RoomEvent 0x1108: room={} type={} flag={} hub={} (cache only, no callback)", room_id,
+            static_cast<u32>(rc.signaling_opt_param.type),
+            static_cast<u32>(rc.signaling_opt_param.flag), rc.signaling_opt_param.memberId);
         // Members already in the room were skipped while the type was still the default.
         // Start whatever this update now allows; an active peer is left alone.
         StartMatching2SignalingForRoomPeers(*ctx, room_id);
@@ -807,7 +824,7 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
         break;
     }
     default:
-        LOG_WARNING(Lib_NpMatching2, "unhandled room event {:#x}", n.event);
+        after_unlock.warning = fmt::format("unhandled room event {:#x}", n.event);
         return;
     }
 
@@ -847,7 +864,7 @@ void HandleRoomEvent(const ShadNet::NotifyRoomEvent& n) {
 }
 
 void HandleRoomMessage(const ShadNet::NotifyRoomMessage& n) {
-    std::lock_guard state_lock(Matching2StateMutex());
+    Matching2StateLock state_lock{"HandleRoomMessage"};
     ContextObject* ctx =
         ContextManager::Instance().Get(static_cast<OrbisNpMatching2ContextId>(n.ctx_id));
     if (!ctx) {
