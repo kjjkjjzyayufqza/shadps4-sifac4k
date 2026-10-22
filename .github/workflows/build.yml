@@ -229,16 +229,16 @@ jobs:
         # Kosmickrisp shader compilation does not open the spirv-mesa3d bitcode.
         LIBCLC_PREFIX="${RUNNER_TEMP}/libclc"
         mkdir -p "${LIBCLC_PREFIX}/include" "${LIBCLC_PREFIX}/share/clc" "${LIBCLC_PREFIX}/share/pkgconfig"
-        cat > "${LIBCLC_PREFIX}/share/pkgconfig/libclc.pc" <<EOF
-prefix=${LIBCLC_PREFIX}
-includedir=\${prefix}/include
-libexecdir=\${prefix}/share/clc
-
-Name: libclc
-Description: OpenCL C library path used by the Mesa clc configure check
-Version: 23.1.3
-Cflags: -I\${includedir}
-EOF
+        {
+          printf 'prefix=%s\n' "${LIBCLC_PREFIX}"
+          printf 'includedir=%s/include\n' "${LIBCLC_PREFIX}"
+          printf 'libexecdir=%s/share/clc\n' "${LIBCLC_PREFIX}"
+          printf '\n'
+          printf 'Name: libclc\n'
+          printf 'Description: OpenCL C library path used by the Mesa clc configure check\n'
+          printf 'Version: 23.1.3\n'
+          printf 'Cflags: -I%s/include\n' "${LIBCLC_PREFIX}"
+        } > "${LIBCLC_PREFIX}/share/pkgconfig/libclc.pc"
         export PKG_CONFIG_PATH="${LIBCLC_PREFIX}/share/pkgconfig:${PKG_CONFIG_PATH}"
         echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> "$GITHUB_ENV"
         pkg-config --modversion libclc
