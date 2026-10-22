@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -18,6 +19,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -192,8 +194,8 @@ std::vector<u32> QueryA(const char* server, const std::string& host, u32 timeout
 #ifdef _WIN32
     const DWORD rcv = timeout_ms;
 #else
-    const timeval rcv{static_cast<long>(timeout_ms / 1000),
-                      static_cast<long>((timeout_ms % 1000) * 1000)};
+    const timeval rcv{static_cast<time_t>(timeout_ms / 1000),
+                      static_cast<suseconds_t>((timeout_ms % 1000) * 1000)};
 #endif
     ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv), sizeof(rcv));
 
