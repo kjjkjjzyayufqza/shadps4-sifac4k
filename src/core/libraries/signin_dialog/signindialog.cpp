@@ -3,7 +3,7 @@
 
 #include "common/logging/log.h"
 #include "core/libraries/libs.h"
-#include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/signin_dialog/signindialog.h"
 
 namespace Libraries::SigninDialog {

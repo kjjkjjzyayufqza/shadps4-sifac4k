@@ -169,7 +169,8 @@ public:
     u32 Add(const SamplerResource& desc) {
         const u32 index{Add(sampler_resources, desc, [&desc](const auto& existing) {
             return desc.sharp_fetch == existing.sharp_fetch && desc.post_op == existing.post_op &&
-                   desc.post_op_tsharp_dw3_off == existing.post_op_tsharp_dw3_off;
+                   desc.post_op_tsharp_dw3_off == existing.post_op_tsharp_dw3_off &&
+                   desc.is_depth == existing.is_depth;
         })};
         return index;
     }
@@ -248,7 +249,7 @@ static IR::U32 CalculateBufferAddress(IR::IREmitter& ir, const IR::Inst& inst, c
         index = ir.IAdd(index, vgpr_index);
     }
     if (buffer.add_tid_enable) {
-        ASSERT_MSG(info.l_stage == LogicalStage::Compute,
+        ASSERT_MSG(info.sw_stage == SwStage::Compute,
                    "Thread ID buffer addressing is not supported outside of compute.");
         const IR::U32 thread_id{ir.LaneId()};
         index = ir.IAdd(index, thread_id);

@@ -6,7 +6,9 @@
 #include <ctime>
 #include <string>
 #include <thread>
+#include <fmt/format.h>
 
+#include "core/libraries/fiber/fiber.h"
 #include "core/libraries/kernel/threads/pthread.h"
 
 #include "common/error.h"
@@ -252,6 +254,10 @@ void AccurateTimer::End() {
 std::string GetCurrentThreadName() {
     using namespace Libraries::Kernel;
     if (g_curthread && !g_curthread->name.empty()) {
+        if (g_curthread->tcb->tcb_fiber) {
+            return fmt::format("{}@@{}", g_curthread->name,
+                               g_curthread->tcb->tcb_fiber->current_fiber->name);
+        }
         return g_curthread->name;
     }
 #ifdef _WIN32

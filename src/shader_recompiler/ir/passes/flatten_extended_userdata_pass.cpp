@@ -50,7 +50,7 @@ static void DumpSrtProgram(const Shader::Info& info, const u8* code, size_t code
     if (!std::filesystem::exists(dump_dir)) {
         std::filesystem::create_directories(dump_dir);
     }
-    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.stage, info.pgm_hash);
+    const auto filename = fmt::format("{}_{:#018x}.srtprogram.txt", info.hw_stage, info.pgm_hash);
     const auto file = IOFile{dump_dir / filename, FileAccessMode::Create, FileType::TextFile};
 
     u64 address = reinterpret_cast<u64>(code);
@@ -683,6 +683,10 @@ static bool IsReadConstSource(const IR::Value base) {
 
 void SimplifyReadConstAddressAdd(IR::Inst& inst) {
     // This handles the following pattern by combining the addition with the offset
+    // s_add_u32    s12, s2, <offset>
+    // s_addc_u32   s13, s3, 0
+    // s_load_dword s16, s[12:13], 0x0
+    //
     // %82 = IAdd32 %65, #28816
     // %83 = ULessThan32 %82, %65
     // %84 = SelectU32 %83, #1, #0

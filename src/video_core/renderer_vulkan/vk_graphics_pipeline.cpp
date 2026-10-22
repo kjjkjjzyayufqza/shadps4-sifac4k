@@ -32,10 +32,13 @@ GraphicsPipeline::GraphicsPipeline(
     const Shader::Profile& profile, const GraphicsPipelineKey& key_,
     vk::PipelineCache pipeline_cache, std::span<const Shader::Info*, MaxShaderStages> infos,
     std::span<const Shader::RuntimeInfo, MaxShaderStages> runtime_infos,
-    std::optional<const Shader::Gcn::FetchShaderData> fetch_shader_,
-    std::span<const vk::ShaderModule> modules, SerializationSupport& sdata, bool preloading)
-    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_},
-      fetch_shader{std::move(fetch_shader_)} {
+    const Shader::Gcn::FetchShaderData* fetch_shader_, std::span<const vk::ShaderModule> modules,
+    SerializationSupport& sdata, bool preloading)
+    : Pipeline{instance, scheduler, desc_heap, profile, pipeline_cache}, key{key_} {
+    if (fetch_shader_) {
+        fetch_shader = *fetch_shader_;
+    }
+
     const vk::Device device = instance.GetDevice();
     std::ranges::copy(infos, stages.begin());
     BuildDescSetLayout(preloading);
@@ -63,7 +66,7 @@ GraphicsPipeline::GraphicsPipeline(
     if (!preloading) {
         VertexInputs<AmdGpu::Buffer> guest_buffers;
         if (!instance.IsVertexInputDynamicState()) {
-            const auto& vs_info = runtime_infos[u32(Shader::LogicalStage::Vertex)].vs_info;
+            const auto& vs_info = runtime_infos[u32(Shader::SwStage::Vertex)].sw.vs;
             GetVertexInputs(sdata.vertex_attributes, sdata.vertex_bindings, sdata.divisors,
                             guest_buffers, vs_info.step_rate_0, vs_info.step_rate_1);
         }
@@ -119,7 +122,7 @@ GraphicsPipeline::GraphicsPipeline(
     }
 
     if (!preloading) {
-        const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
+        const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
         sdata.multisampling = {
             .rasterizationSamples = LiverpoolToVK::NumSamples(
                 key.num_samples, instance.GetColorSampleCounts() & instance.GetDepthSampleCounts()),
@@ -168,7 +171,7 @@ GraphicsPipeline::GraphicsPipeline(
 
     boost::container::static_vector<vk::PipelineShaderStageCreateInfo, MaxShaderStages>
         shader_stages;
-    auto stage = u32(Shader::LogicalStage::Vertex);
+    auto stage = u32(Shader::SwStage::Vertex);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eVertex,
@@ -176,7 +179,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::LogicalStage::Geometry);
+    stage = u32(Shader::SwStage::Geometry);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eGeometry,
@@ -184,7 +187,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::LogicalStage::TessellationControl);
+    stage = u32(Shader::SwStage::TessellationControl);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationControl,
@@ -194,7 +197,7 @@ GraphicsPipeline::GraphicsPipeline(
     } else if (is_rect_list || is_quad_list) {
         const auto type = is_quad_list ? AuxShaderType::QuadListTCS : AuxShaderType::RectListTCS;
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
+            const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tcs = Shader::Backend::SPIRV::EmitAuxilaryTessShader(type, fs_info);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
@@ -203,7 +206,7 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::LogicalStage::TessellationEval);
+    stage = u32(Shader::SwStage::TessellationEval);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eTessellationEvaluation,
@@ -212,7 +215,7 @@ GraphicsPipeline::GraphicsPipeline(
         });
     } else if (is_rect_list || is_quad_list) {
         if (!preloading) {
-            const auto& fs_info = runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info;
+            const auto& fs_info = runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs;
             sdata.tes = Shader::Backend::SPIRV::EmitAuxilaryTessShader(
                 AuxShaderType::PassthroughTES, fs_info);
         }
@@ -222,20 +225,18 @@ GraphicsPipeline::GraphicsPipeline(
             .pName = "main",
         });
     }
-    stage = u32(Shader::LogicalStage::Fragment);
+    stage = u32(Shader::SwStage::Fragment);
     if (infos[stage]) {
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
             .module = modules[stage],
             .pName = "main",
         });
-    } else if (runtime_infos[u32(Shader::LogicalStage::Fragment)].fs_info.clip_distance_emulation) {
+    } else if (runtime_infos[u32(Shader::SwStage::Fragment)].hw.fs.clip_distance_emulation) {
         if (!preloading) {
-            const auto vs_runtime_info =
-                runtime_infos[static_cast<u32>(Shader::LogicalStage::Vertex)].vs_info;
+            const auto& vs = runtime_infos[static_cast<u32>(Shader::SwStage::Vertex)].hw.vs;
 
-            sdata.fragment =
-                Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs_runtime_info.outputs);
+            sdata.fragment = Shader::Backend::SPIRV::EmitDiscardFragmentShader(vs.outputs);
         }
         shader_stages.emplace_back(vk::PipelineShaderStageCreateInfo{
             .stage = vk::ShaderStageFlagBits::eFragment,
@@ -308,47 +309,14 @@ GraphicsPipeline::GraphicsPipeline(
         const auto alpha_blend =
             control.separate_alpha_blend ? LiverpoolToVK::BlendOp(control.alpha_func) : color_blend;
 
-        // Vulkan ignores blend factors for min/max, but a factor that zeroes one operand
-        // makes the operation collapse to a plain selection: min(s, 0) is 0 and max(s, 0)
-        // is s for normalized alpha. Rewrite those to the equivalent add so the result is
-        // exact instead of leaving the other operand to survive.
-        auto eff_src_alpha = src_alpha;
-        auto eff_dst_alpha = dst_alpha;
-        auto eff_alpha_blend = alpha_blend;
-        if (alpha_blend == vk::BlendOp::eMin || alpha_blend == vk::BlendOp::eMax) {
-            const bool takes_max = alpha_blend == vk::BlendOp::eMax;
-            if (src_alpha == vk::BlendFactor::eOne && dst_alpha == vk::BlendFactor::eZero) {
-                eff_alpha_blend = vk::BlendOp::eAdd;
-                eff_src_alpha = takes_max ? vk::BlendFactor::eOne : vk::BlendFactor::eZero;
-                eff_dst_alpha = vk::BlendFactor::eZero;
-            } else if (src_alpha == vk::BlendFactor::eZero && dst_alpha == vk::BlendFactor::eOne) {
-                eff_alpha_blend = vk::BlendOp::eAdd;
-                eff_src_alpha = vk::BlendFactor::eZero;
-                eff_dst_alpha = takes_max ? vk::BlendFactor::eOne : vk::BlendFactor::eZero;
-            }
-        }
-
-        const auto color_scaled_min_max =
-            (color_blend == vk::BlendOp::eMin || color_blend == vk::BlendOp::eMax) &&
-            (src_color != vk::BlendFactor::eOne || dst_color != vk::BlendFactor::eOne) &&
-            !key.color_buffers[i].blend_self_scale;
-        const auto alpha_scaled_min_max =
-            (eff_alpha_blend == vk::BlendOp::eMin || eff_alpha_blend == vk::BlendOp::eMax) &&
-            (eff_src_alpha != vk::BlendFactor::eOne || eff_dst_alpha != vk::BlendFactor::eOne);
-        if (color_scaled_min_max || alpha_scaled_min_max) {
-            LOG_WARNING(
-                Render_Vulkan,
-                "Unimplemented use of min/max blend op with blend factor not equal to one.");
-        }
-
         attachments[i] = vk::PipelineColorBlendAttachmentState{
             .blendEnable = control.enable,
             .srcColorBlendFactor = src_color,
             .dstColorBlendFactor = dst_color,
             .colorBlendOp = color_blend,
-            .srcAlphaBlendFactor = eff_src_alpha,
-            .dstAlphaBlendFactor = eff_dst_alpha,
-            .alphaBlendOp = eff_alpha_blend,
+            .srcAlphaBlendFactor = src_alpha,
+            .dstAlphaBlendFactor = dst_alpha,
+            .alphaBlendOp = alpha_blend,
             .colorWriteMask =
                 instance.IsDynamicColorWriteMaskSupported()
                     ? vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
@@ -387,6 +355,30 @@ GraphicsPipeline::GraphicsPipeline(
             attachments[i].dstColorBlendFactor = dst_color == vk::BlendFactor::eSrcAlpha
                                                      ? vk::BlendFactor::eOne
                                                      : vk::BlendFactor::eZero; // 1-A
+        }
+
+        auto& attachment = attachments[i];
+        LiverpoolToVK::NormalizeMinMaxBlend(attachment.colorBlendOp, attachment.srcColorBlendFactor,
+                                            attachment.dstColorBlendFactor,
+                                            key.color_buffers[i].num_format);
+        LiverpoolToVK::NormalizeMinMaxBlend(attachment.alphaBlendOp, attachment.srcAlphaBlendFactor,
+                                            attachment.dstAlphaBlendFactor,
+                                            key.color_buffers[i].num_format);
+
+        const auto color_scaled_min_max =
+            (attachment.colorBlendOp == vk::BlendOp::eMin ||
+             attachment.colorBlendOp == vk::BlendOp::eMax) &&
+            (attachment.srcColorBlendFactor != vk::BlendFactor::eOne ||
+             attachment.dstColorBlendFactor != vk::BlendFactor::eOne);
+        const auto alpha_scaled_min_max =
+            (attachment.alphaBlendOp == vk::BlendOp::eMin ||
+             attachment.alphaBlendOp == vk::BlendOp::eMax) &&
+            (attachment.srcAlphaBlendFactor != vk::BlendFactor::eOne ||
+             attachment.dstAlphaBlendFactor != vk::BlendFactor::eOne);
+        if (control.enable && (color_scaled_min_max || alpha_scaled_min_max)) {
+            LOG_WARNING(
+                Render_Vulkan,
+                "Unimplemented use of min/max blend op with blend factor not equal to one.");
         }
     }
 
@@ -436,21 +428,22 @@ void GraphicsPipeline::GetVertexInputs(
     VertexInputs<vk::VertexInputBindingDivisorDescriptionEXT>& divisors,
     VertexInputs<AmdGpu::Buffer>& guest_buffers, u32 step_rate_0, u32 step_rate_1) const {
     using InstanceIdType = Shader::Gcn::VertexAttribute::InstanceIdType;
-    if (!fetch_shader || fetch_shader->attributes.empty()) {
+    if (fetch_shader.Empty() || fetch_shader.attributes.empty()) {
         return;
     }
-    const auto& vs_info = GetStage(Shader::LogicalStage::Vertex);
-    for (const auto& attrib : fetch_shader->attributes) {
+    const auto& vs_info = GetStage(Shader::SwStage::Vertex);
+    for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
+        const auto& attrib = fetch_shader.attributes[semantic];
         const auto step_rate = attrib.GetStepRate();
         const auto buffer = attrib.GetSharp(vs_info);
         attributes.push_back(Attribute{
-            .location = attrib.semantic,
-            .binding = attrib.semantic,
+            .location = semantic,
+            .binding = semantic,
             .format = LiverpoolToVK::SurfaceFormat(buffer.GetDataFmt(), buffer.GetNumberFmt()),
             .offset = 0,
         });
         bindings.push_back(Binding{
-            .binding = attrib.semantic,
+            .binding = semantic,
             .stride = buffer.GetStride(),
             .inputRate = step_rate == InstanceIdType::None ? vk::VertexInputRate::eVertex
                                                            : vk::VertexInputRate::eInstance,
@@ -462,7 +455,7 @@ void GraphicsPipeline::GetVertexInputs(
             bindings.back().divisor = divisor;
         } else if (step_rate != InstanceIdType::None) {
             divisors.push_back(vk::VertexInputBindingDivisorDescriptionEXT{
-                .binding = attrib.semantic,
+                .binding = semantic,
                 .divisor = divisor,
             });
         }
@@ -490,7 +483,7 @@ void GraphicsPipeline::BuildDescSetLayout(bool preloading) {
         if (!stage) {
             continue;
         }
-        const auto stage_bit = LogicalStageToStageBit[u32(stage->l_stage)];
+        const auto stage_bit = LogicalStageToStageBit[u32(stage->sw_stage)];
         for (const auto& buffer : stage->buffers) {
             const auto sharp =
                 preloading ? AmdGpu::Buffer{}

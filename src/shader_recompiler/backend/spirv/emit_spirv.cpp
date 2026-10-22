@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <span>
 #include <type_traits>
 #include <utility>
@@ -136,14 +137,16 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
         return ctx.U1[1];
     case IR::Type::U32:
         return ctx.U32[1];
-    case IR::Type::F32:
-        return ctx.F32[1];
     case IR::Type::U32x2:
         return ctx.U32[2];
-    case IR::Type::U64:
-        return ctx.U64;
+    case IR::Type::U32x3:
+        return ctx.U32[3];
     case IR::Type::U32x4:
         return ctx.U32[4];
+    case IR::Type::F32:
+        return ctx.F32[1];
+    case IR::Type::U64:
+        return ctx.U64;
     default:
         UNREACHABLE_MSG("Phi node type {}", type);
     }
@@ -298,18 +301,31 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     if (info.uses_group_quad) {
         ctx.AddCapability(spv::Capability::GroupNonUniformQuad);
     }
-    if (info.uses_group_ballot) {
+    if (info.uses_group_shuffle) {
+        ctx.AddCapability(spv::Capability::GroupNonUniformShuffle);
+    }
+    if (info.uses_group_ballot || info.loads.Get(IR::Attribute::SubgroupLtMask)) {
         ctx.AddCapability(spv::Capability::GroupNonUniformBallot);
     }
-    const auto stage = info.l_stage;
-    if (stage == LogicalStage::Vertex) {
+    if (info.uses_shader_clock) {
+        if (ctx.profile.supports_shader_subgroup_clock) {
+            ctx.AddExtension("SPV_KHR_shader_clock");
+            ctx.AddCapability(spv::Capability::ShaderClockKHR);
+        } else {
+            LOG_WARNING(Render_Recompiler,
+                        "Shader requires support for ShaderClockKHR capability"
+                        " that your Vulkan instance does not advertise. Results may vary");
+        }
+    }
+    const auto stage = info.sw_stage;
+    if (stage == SwStage::Vertex) {
         ctx.AddExtension("SPV_KHR_shader_draw_parameters");
         ctx.AddCapability(spv::Capability::DrawParameters);
     }
-    if (stage == LogicalStage::Geometry) {
+    if (stage == SwStage::Geometry) {
         ctx.AddCapability(spv::Capability::Geometry);
     }
-    if (info.stage == Stage::Fragment) {
+    if (info.hw_stage == HwStage::Fragment) {
         if (profile.supports_amd_shader_explicit_vertex_parameter) {
             ctx.AddExtension("SPV_AMD_shader_explicit_vertex_parameter");
         } else if (profile.supports_fragment_shader_barycentric) {
@@ -318,8 +334,8 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::InterpolationFunction);
         }
         if (info.loads.Get(IR::Attribute::SampleIndex) ||
-            runtime_info.fs_info.addr_flags.linear_sample_ena ||
-            runtime_info.fs_info.addr_flags.persp_sample_ena ||
+            runtime_info.hw.fs.addr_flags.linear_sample_ena ||
+            runtime_info.hw.fs.addr_flags.persp_sample_ena ||
             (!profile.supports_amd_shader_explicit_vertex_parameter &&
              profile.supports_fragment_shader_barycentric &&
              info.loads.Get(IR::Attribute::BaryCoordSmoothSample))) {
@@ -333,19 +349,18 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
             ctx.AddCapability(spv::Capability::StencilExportEXT);
         }
     }
-    if (stage == LogicalStage::TessellationControl || stage == LogicalStage::TessellationEval) {
+    if (stage == SwStage::TessellationControl || stage == SwStage::TessellationEval) {
         ctx.AddCapability(spv::Capability::Tessellation);
     }
-    if (stage == LogicalStage::Vertex || stage == LogicalStage::TessellationControl ||
-        stage == LogicalStage::TessellationEval) {
+    if (stage == SwStage::Vertex || stage == SwStage::TessellationControl ||
+        stage == SwStage::TessellationEval) {
         if (info.stores.GetAny(IR::Attribute::RenderTargetIndex)) {
             ctx.AddCapability(spv::Capability::ShaderLayer);
         }
         if (info.stores.GetAny(IR::Attribute::ViewportIndex)) {
             ctx.AddCapability(spv::Capability::ShaderViewportIndex);
         }
-    } else if (stage == LogicalStage::Geometry &&
-               info.stores.GetAny(IR::Attribute::ViewportIndex)) {
+    } else if (stage == SwStage::Geometry && info.stores.GetAny(IR::Attribute::ViewportIndex)) {
         ctx.AddCapability(spv::Capability::MultiViewport);
     }
     if (info.uses_dma) {
@@ -373,37 +388,38 @@ void SetupCapabilities(const Info& info, const Profile& profile, const RuntimeIn
     }
 }
 
-void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
+void DefineEntryPoint(const Info& info, const RuntimeInfo& runtime_info, EmitContext& ctx,
+                      Id main) {
     const std::span interfaces(ctx.interfaces.data(), ctx.interfaces.size());
     spv::ExecutionModel execution_model{};
-    switch (info.l_stage) {
-    case LogicalStage::Compute: {
-        const std::array<u32, 3> workgroup_size{ctx.runtime_info.cs_info.workgroup_size};
+    switch (info.sw_stage) {
+    case SwStage::Compute: {
+        const std::array<u32, 3> workgroup_size{ctx.runtime_info.hw.cs.workgroup_size};
         execution_model = spv::ExecutionModel::GLCompute;
         ctx.AddExecutionMode(main, spv::ExecutionMode::LocalSize, workgroup_size[0],
                              workgroup_size[1], workgroup_size[2]);
         break;
     }
-    case LogicalStage::Vertex:
+    case SwStage::Vertex:
         execution_model = spv::ExecutionModel::Vertex;
         break;
-    case LogicalStage::TessellationControl:
+    case SwStage::TessellationControl:
         execution_model = spv::ExecutionModel::TessellationControl;
         ctx.AddCapability(spv::Capability::Tessellation);
         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices,
-                             ctx.runtime_info.hs_info.NumOutputControlPoints());
+                             ctx.runtime_info.sw.tcs.NumOutputControlPoints());
         break;
-    case LogicalStage::TessellationEval: {
+    case SwStage::TessellationEval: {
         execution_model = spv::ExecutionModel::TessellationEvaluation;
-        ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.es_vs_info.tess_type));
-        ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.es_vs_info.tess_partitioning));
-        ctx.AddExecutionMode(main, ctx.runtime_info.es_vs_info.tess_topology ==
+        ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.sw.tes.tess_type));
+        ctx.AddExecutionMode(main, ExecutionMode(ctx.runtime_info.sw.tes.tess_partitioning));
+        ctx.AddExecutionMode(main, ctx.runtime_info.sw.tes.tess_topology ==
                                            AmdGpu::TessellationTopology::TriangleCcw
                                        ? spv::ExecutionMode::VertexOrderCcw
                                        : spv::ExecutionMode::VertexOrderCw);
         break;
     }
-    case LogicalStage::Fragment:
+    case SwStage::Fragment: {
         execution_model = spv::ExecutionModel::Fragment;
         if (ctx.profile.lower_left_origin_mode) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::OriginLowerLeft);
@@ -413,29 +429,34 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         if (info.has_discard) {
             ctx.AddCapability(spv::Capability::DemoteToHelperInvocation);
         }
-        if (info.stores.GetAny(IR::Attribute::Depth)) {
+        const bool stores_depth = info.stores.Get(IR::Attribute::Depth);
+        if (stores_depth) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
+        if (runtime_info.hw.fs.depth_before_shader) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
+            ASSERT_MSG(!stores_depth, "DEPTH_BEFORE_SHADER enabled with depth exporting shader");
+        }
         break;
-    case LogicalStage::Geometry:
+    }
+    case SwStage::Geometry:
         execution_model = spv::ExecutionModel::Geometry;
-        ctx.AddExecutionMode(main, GetInputPrimitiveType(ctx.runtime_info.gs_info.in_primitive));
-        ctx.AddExecutionMode(main,
-                             GetOutputPrimitiveType(ctx.runtime_info.gs_info.out_primitive[0]));
+        ctx.AddExecutionMode(main, GetInputPrimitiveType(ctx.runtime_info.hw.gs.in_primitive));
+        ctx.AddExecutionMode(main, GetOutputPrimitiveType(ctx.runtime_info.hw.gs.out_primitive[0]));
         ctx.AddExecutionMode(main, spv::ExecutionMode::OutputVertices,
-                             ctx.runtime_info.gs_info.output_vertices);
+                             ctx.runtime_info.hw.gs.output_vertices);
         ctx.AddExecutionMode(main, spv::ExecutionMode::Invocations,
-                             ctx.runtime_info.gs_info.num_invocations);
+                             ctx.runtime_info.hw.gs.num_invocations);
         break;
     default:
-        UNREACHABLE_MSG("Stage {}", u32(info.stage));
+        UNREACHABLE_MSG("Stage {}", u32(info.hw_stage));
     }
     ctx.AddEntryPoint(execution_model, main, "main", interfaces);
 }
 
 void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
                           Id main_func) {
-    const auto fp32_denorm_mode = runtime_info.fp_denorm_mode32;
+    const auto fp32_denorm_mode = runtime_info.props.fp_denorm_mode32;
     if (fp32_denorm_mode == AmdGpu::FpDenormMode::InOutFlush) {
         if (profile.support_fp32_denorm_flush) {
             ctx.AddCapability(spv::Capability::DenormFlushToZero);
@@ -454,7 +475,7 @@ void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const Runtim
         return;
     }
 
-    const auto fp16_64_denorm_mode = runtime_info.fp_denorm_mode16_64;
+    const auto fp16_64_denorm_mode = runtime_info.props.fp_denorm_mode16_64;
     const auto same_denorm_mode = fp16_64_denorm_mode == fp32_denorm_mode;
     if (!same_denorm_mode && !profile.supports_denorm_behavior_independence) {
         static std::once_flag logged;
@@ -510,7 +531,7 @@ void SetupDenormFlushMode(EmitContext& ctx, const Profile& profile, const Runtim
 
 void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeInfo& runtime_info,
                        Id main_func) {
-    const auto fp_round_mode = runtime_info.fp_round_mode32;
+    const auto fp_round_mode = runtime_info.props.fp_round_mode32;
     if (fp_round_mode == AmdGpu::FpRoundMode::ToZero) {
         if (profile.support_fp32_round_to_zero) {
             ctx.AddCapability(spv::Capability::RoundingModeRTZ);
@@ -522,11 +543,12 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
             });
         }
     } else if (fp_round_mode != AmdGpu::FpRoundMode::NearestEven) {
-        LOG_WARNING(Render_Vulkan, "Unknown FP rounding mode {}", u32(fp_round_mode));
+        LOG_WARNING(Render_Vulkan, "Unimplemented FP rounding mode {}",
+                    magic_enum::enum_name(fp_round_mode));
     }
 
     if (ctx.info.uses_fp16 || ctx.info.uses_fp64) {
-        const auto fp16_64_round_mode = runtime_info.fp_round_mode16_64;
+        const auto fp16_64_round_mode = runtime_info.props.fp_round_mode16_64;
         const auto same_round_mode = fp16_64_round_mode == fp_round_mode;
         if (!same_round_mode && !profile.supports_rounding_mode_independence) {
             static std::once_flag logged;
@@ -571,6 +593,9 @@ void SetupRoundingMode(EmitContext& ctx, const Profile& profile, const RuntimeIn
 
 void SetupInfNanPreserveMode(EmitContext& ctx, const Profile& profile,
                              const RuntimeInfo& runtime_info, Id main_func) {
+    if (profile.fast_shader_math) {
+        return;
+    }
     if (profile.support_fp16_signed_zero_inf_nan_preserve ||
         profile.support_fp32_signed_zero_inf_nan_preserve ||
         profile.support_fp64_signed_zero_inf_nan_preserve) {
@@ -644,11 +669,10 @@ std::vector<u32> EmitSPIRV(const Profile& profile, const RuntimeInfo& runtime_in
                            const IR::Program& program, Bindings& binding) {
     EmitContext ctx{profile, runtime_info, program.info, binding};
     const Id main{DefineMain(ctx, program)};
-    DefineEntryPoint(program.info, ctx, main);
+    DefineEntryPoint(program.info, runtime_info, ctx, main);
     SetupCapabilities(program.info, profile, runtime_info, ctx);
     SetupFloatMode(ctx, profile, runtime_info, main);
     PatchPhiNodes(program, ctx);
-    binding.user_data += program.info.ud_mask.NumRegs();
     return ctx.Assemble();
 }
 
@@ -672,10 +696,10 @@ Id EmitConditionRef(EmitContext& ctx, const IR::Value& value) {
     return id;
 }
 
-void EmitReference(EmitContext&) {}
-
-void EmitPhiMove(EmitContext&) {
-    UNREACHABLE_MSG("Unreachable instruction");
+Id EmitGetPcLo(EmitContext& ctx, const IR::Value& value) {
+    const Id id{ctx.Def(value)};
+    ASSERT_MSG(Sirit::ValidId(id), "Forward identity declaration");
+    return id;
 }
 
 void EmitGetScc(EmitContext& ctx) {
@@ -687,10 +711,6 @@ void EmitGetExec(EmitContext& ctx) {
 }
 
 void EmitGetVcc(EmitContext& ctx) {
-    UNREACHABLE_MSG("Unreachable instruction");
-}
-
-void EmitGetSccLo(EmitContext& ctx) {
     UNREACHABLE_MSG("Unreachable instruction");
 }
 

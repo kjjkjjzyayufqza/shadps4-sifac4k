@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <vector>
+#include <fmt/format.h>
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/error_codes.h"

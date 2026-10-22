@@ -19,7 +19,7 @@ on:
 
 concurrency:
   group: ci-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'push' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' || github.repository != 'shadps4-emu/shadPS4' || github.event_name != 'push' }}
 
 env:
   BUILD_TYPE: Release
@@ -220,7 +220,7 @@ jobs:
 
     - name: Install Build Dependencies
       run: |
-        brew install cmake meson pkg-config llvm spirv-tools spirv-llvm-translator libclc
+        brew install cmake meson pkg-config llvm spirv-tools spirv-llvm-translator
         pip3 install --break-system-packages mako packaging pyyaml
         echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
         LIBCLC_PC="$(find "$(brew --prefix libclc)" "$(brew --prefix llvm)" -name libclc.pc 2>/dev/null | head -n 1)"

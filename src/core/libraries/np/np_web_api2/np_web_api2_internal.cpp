@@ -6,7 +6,7 @@
 #include "core/libraries/kernel/time.h"
 #include "core/libraries/network/http2.h"
 #include "core/libraries/np/np_error.h"
-#include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_context.h"
 #include "core/libraries/np/np_web_api2/np_web_api2_internal.h"

@@ -94,6 +94,27 @@ message NotifyFriendStatus {
     uint64 timestamp = 3;  // nanoseconds since Unix epoch
 }
 
+// Notification 18: the server refused a service to this player.
+//   service: 1 = Matching2 (matchmaking)
+//   reason:  1 = server full (in_use / limit are set), 2 = account not allowed,
+//            3 = service disabled on this server
+message NotifyServiceUnavailable {
+    uint32 service = 1;
+    uint32 reason  = 2;
+    uint32 in_use  = 3;
+    uint32 limit   = 4;
+}
+
+// Notification 19: the server is signing this client out, then disconnects.
+//   reason:  1 = client version not accepted (clientversions.cfg)
+//   message: text for the player, from the rule that matched
+//   version: the version the server checked ("" = none reported)
+message NotifyClientRejected {
+    uint32 reason  = 1;
+    string message = 2;
+    string version = 3;
+}
+
 // Score: board configuration
 
 message BoardInfo {
@@ -385,6 +406,19 @@ message SetRoomDataInternalRequest {
     uint64 passwd_slot_mask = 7;
 }
 
+// member_id 0 targets the sender. team_id is applied only when has_team_id is set, so a title
+// that only updates its blob does not reset the team assignment it was given when it joined.
+message SetRoomMemberDataInternalRequest {
+    uint32 req_id      = 1;
+    uint64 room_id     = 2;
+    uint32 member_id   = 3;
+    uint32 team_id     = 4;
+    bool   has_team_id = 5;
+    uint32 flag_filter = 6;
+    uint32 flag_attr   = 7;
+    repeated MatchingBinAttr bin_attrs = 8;
+}
+
 message SetRoomDataExternalRequest {
     uint32 req_id  = 1;
     uint64 room_id = 2;
@@ -544,6 +578,7 @@ message RequestSignalingInfosReply {
 
 message LeaveRoomReply            { uint64 room_id = 1; }
 message SetRoomDataInternalReply  { uint64 room_id = 1; }
+message SetRoomMemberDataInternalReply { uint64 room_id = 1; uint32 member_id = 2; }
 message SetRoomDataExternalReply  { uint64 room_id = 1; }
 message KickoutRoomMemberReply    { uint64 room_id = 1; }
 
@@ -560,21 +595,6 @@ message SendRoomMessageRequest {
 }
 
 message SendRoomMessageReply { uint64 room_id = 1; }
-
-// SetRoomMemberDataInternal (command 117). member_id 0 targets the sender. team_id is only
-// applied when has_team_id is set, so a title that only updates its blob does not reset the
-// team assignment it was given when it joined.
-message SetRoomMemberDataInternalRequest {
-    uint32 req_id      = 1;
-    uint64 room_id     = 2;
-    uint32 member_id   = 3;
-    uint32 team_id     = 4;
-    bool   has_team_id = 5;
-    uint32 flag_filter = 6;
-    uint32 flag_attr   = 7;
-    repeated MatchingBinAttr bin_attrs = 8;
-}
-message SetRoomMemberDataInternalReply { uint64 room_id = 1; uint32 member_id = 2; }
 
 // SetSignalingOptParam (command 118): the room-wide signaling topology the owner picked.
 message SetSignalingOptParamRequest {
@@ -601,6 +621,18 @@ message LookupOnlineIdRequest {
 message LookupOnlineIdReply {
     uint64 account_id = 1;
     string npid        = 2; // canonical online ID as registered on the server
+}
+
+// Single-use authorization code issued to the signed-in account for a game's backend, which
+// exchanges it at POST /2.0/oauth/token.
+message GetAuthorizationCodeRequest {
+    string client_id = 1;
+    string scope     = 2;
+}
+
+message GetAuthorizationCodeReply {
+    string code       = 1;
+    uint32 expires_in = 2; // seconds
 }
 
 // Notification payloads

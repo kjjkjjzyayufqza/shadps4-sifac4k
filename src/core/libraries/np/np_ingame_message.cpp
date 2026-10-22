@@ -5,12 +5,13 @@
 #include <mutex>
 #include <set>
 #include <vector>
+#include <fmt/format.h>
 
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
-#include "core/libraries/np/np_handler.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_ingame_message.h"
 
 namespace Libraries::Np::NpInGameMessage {

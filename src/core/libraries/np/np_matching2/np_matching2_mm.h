@@ -93,6 +93,8 @@ s32 MmSendRoomMessage(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestI
                       const OrbisNpMatching2SendRoomMessageRequest& request);
 s32 MmSetRoomDataInternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                           const OrbisNpMatching2SetRoomDataInternalRequest& request);
+s32 MmSetRoomMemberDataInternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
+                                const OrbisNpMatching2SetRoomMemberDataInternalRequest& request);
 s32 MmSetRoomDataExternal(OrbisNpMatching2ContextId ctx_id, OrbisNpMatching2RequestId req_id,
                           const OrbisNpMatching2SetRoomDataExternalRequest& request);
 // Chat messages ride the same room-message command as SendRoomMessage; the request event the

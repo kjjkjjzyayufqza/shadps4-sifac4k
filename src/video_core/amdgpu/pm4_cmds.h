@@ -536,17 +536,21 @@ enum class DmaDataSrc : u32 {
 
 struct PM4DmaData {
     PM4Type3Header header;
-    union {
-        BitField<0, 1, u32> engine;
-        BitField<12, 1, u32> src_atc;
-        BitField<13, 2, u32> src_cache_policy;
-        BitField<15, 1, u32> src_volatile;
-        BitField<20, 2, DmaDataDst> dst_sel;
-        BitField<24, 1, u32> dst_atc;
-        BitField<25, 2, u32> dst_cache_policy;
-        BitField<27, 1, u32> dst_volatile;
-        BitField<29, 2, DmaDataSrc> src_sel;
-        BitField<31, 1, u32> cp_sync;
+    struct {
+        u32 engine : 1;
+        u32 reserved1 : 11;
+        u32 src_atc : 1;
+        u32 src_cache_policy : 2;
+        u32 src_volatile : 1;
+        u32 reserved2 : 4;
+        DmaDataDst dst_sel : 2;
+        u32 reserved3 : 2;
+        u32 dst_atc : 1;
+        u32 dst_cache_policy : 2;
+        u32 dst_volatile : 1;
+        u32 reserved4 : 1;
+        DmaDataSrc src_sel : 2;
+        u32 cp_sync : 1;
     };
     union {
         u32 src_addr_lo;
@@ -555,7 +559,18 @@ struct PM4DmaData {
     u32 src_addr_hi;
     u32 dst_addr_lo;
     u32 dst_addr_hi;
-    u32 command;
+    struct {
+        u32 num_bytes : 21;
+        u32 dis_wc : 1;
+        u32 src_swap : 2;
+        u32 dst_swap : 2;
+        u32 sas : 1;
+        u32 das : 1;
+        u32 saic : 1;
+        u32 daic : 1;
+        u32 raw_wait : 1;
+        u32 reserved5 : 1;
+    } command;
 
     template <typename T>
     T SrcAddress() const {
@@ -568,7 +583,7 @@ struct PM4DmaData {
     }
 
     u32 NumBytes() const noexcept {
-        return command & 0x1fffff;
+        return command.num_bytes;
     }
 };
 
@@ -833,7 +848,7 @@ struct PM4DumpConstRam {
 
     template <typename T>
     T Address() const {
-        return reinterpret_cast<T>((u64(addr_hi) << 32u) | addr_lo);
+        return std::bit_cast<T>((u64(addr_hi) << 32u) | addr_lo);
     }
 
     [[nodiscard]] u32 Offset() const {
@@ -1048,6 +1063,33 @@ struct PM4CmdDrawIndirect {
         BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
                                              ///< StartInstanceLocation it fetched from memory
     };
+    u32 draw_initiator; ///< Draw Initiator Register
+};
+
+struct PM4CmdDrawIndirectCountMulti {
+    PM4Type3Header header; ///< header
+    u32 data_offset;       ///< Byte aligned offset where the required data structure starts
+    union {
+        u32 dw2;
+        BitField<0, 16, u32> base_vtx_loc; ///< Offset where the CP will write the
+                                           ///< BaseVertexLocation it fetched from memory
+    };
+    union {
+        u32 dw3;
+        BitField<0, 16, u32> start_inst_loc; ///< Offset where the CP will write the
+                                             ///< StartInstanceLocation it fetched from memory
+    };
+    union {
+        u32 dw4;
+        BitField<0, 16, u32> draw_index_loc; ///< register offset to write the Draw Index count
+        BitField<30, 1, u32>
+            count_indirect_enable; ///< Indicates the data structure count is in memory
+        BitField<31, 1, u32>
+            draw_index_enable; ///< Enables writing of Draw Index count to DRAW_INDEX_LOC
+    };
+    u32 count;          ///< Count of data structures to loop through before going to next packet
+    u64 count_addr;     ///< DWord aligned Address[31:2]; Valid if countIndirectEnable is set
+    u32 stride;         ///< Stride in memory from one data structure to the next
     u32 draw_initiator; ///< Draw Initiator Register
 };
 

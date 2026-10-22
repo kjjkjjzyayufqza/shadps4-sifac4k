@@ -13,7 +13,19 @@
 #include <vector>
 
 #include "common/types.h"
-#include "core/libraries/network/sockets.h"
+
+#ifdef _WIN32
+#include <winsock2.h>
+#include <ws2tcpip.h>
+typedef SOCKET net_socket;
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+typedef int net_socket;
+#endif
+
+#include "core/libraries/net/net_p2p.h"
 
 namespace Libraries::Net {
 
@@ -40,12 +52,9 @@ constexpr net_socket kInvalidNetSocket =
 constexpr u16 kP2PSignalingVport = 0;
 constexpr u16 kP2PFirstEphemeralVport = 30000;
 
-// NP signaling traffic (STUN with the matching server, NpSignaling and Matching2 handshakes with
-// peers) shares the host port with guest P2P data, so the endpoint the server learns from a ping
-// is the one peers use to reach the guest's sockets. It carries a 4-byte {0xFFFF, channel} header
-// instead of the 6-byte guest header: shadNet's STUN listener expects {0xFFFF, 0xFFFF} in front of
-// a ping and answers with the same framing. A guest datagram would only collide by addressing
-// vport 0xFFFF.
+// Legacy stack kept for the P2P port tests. Live traffic uses Core::Net::P2P and the 6-byte
+// signaling frame (0xFF 0x83 0xFF 0xFF 0xFF 0xFF). This file still carries a 4-byte
+// {0xFFFF, channel} header. A guest datagram would only collide by addressing vport 0xFFFF.
 constexpr u32 kP2PInternalHeaderSize = 4;
 constexpr u16 kP2PInternalMarker = 0xFFFF;
 enum class P2PInternalChannel : u16 {

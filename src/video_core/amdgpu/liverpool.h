@@ -61,6 +61,7 @@ struct Liverpool {
     };
 
     Regs regs{};
+    u32 index_buffer_num_indices{};
     std::array<CbDbExtent, NUM_COLOR_BUFFERS> last_cb_extent{};
     CbDbExtent last_db_extent{};
 
@@ -98,9 +99,6 @@ public:
 
     template <bool wait_done = false>
     void SendCommand(auto&& func) {
-        if (std::this_thread::get_id() == gpu_id) {
-            return func();
-        }
         if constexpr (wait_done) {
             std::binary_semaphore sem{0};
             {
@@ -140,7 +138,17 @@ public:
         u32 pipe_id;
         Pm4PacketAssembler packet_assembler;
     };
-    Common::SlotVector<AscQueueInfo> asc_queues{};
+    Common::SlotVector<AscQueueInfo> asc_queues{64};
+
+    std::thread::id GetGpuCommandProcessorThread() {
+        return gpu_id;
+    }
+
+#ifdef __linux__
+    u32 GetGpuCommandProcessorThreadId() {
+        return gpu_tid;
+    }
+#endif
 
 private:
     struct Task {
@@ -177,12 +185,13 @@ private:
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
     CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
+    Task ProcessGraphics(std::span<const u32> dcb);
     Task ProcessCeUpdate(std::span<const u32> ccb);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    void ProcessCeQueue();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -195,6 +204,7 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+    std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
@@ -202,18 +212,11 @@ private:
     u64 pixel_counter{};
 
     struct ConstantEngine {
-        void Reset() {
-            ce_count = 0;
-            de_count = 0;
-            ce_compare_count = 0;
-        }
-
         [[nodiscard]] u32 Diff() const {
             ASSERT_MSG(ce_count >= de_count, "DE counter is ahead of CE");
             return ce_count - de_count;
         }
 
-        u32 ce_compare_count{};
         u32 ce_count{};
         u32 de_count{};
         static std::array<u8, 48_KB> constants_heap;
@@ -221,6 +224,7 @@ private:
 
     Vulkan::Rasterizer* rasterizer{};
     Libraries::VideoOut::VideoOutPort* vo_port{};
+    const bool guest_markers_enabled;
     std::jthread process_thread{};
     std::atomic<u32> num_submits{};
     std::atomic<u32> num_commands{};
@@ -229,6 +233,9 @@ private:
     std::condition_variable_any submit_cv;
     std::queue<Common::UniqueFunction<void>> command_queue{};
     std::thread::id gpu_id;
+#ifdef __linux__
+    u32 gpu_tid;
+#endif
     s32 curr_qid{-1};
 };
 

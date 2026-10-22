@@ -9,7 +9,6 @@
 #include <utility>
 #include <vector>
 
-#include <core/user_settings.h>
 #include "common/elf_info.h"
 #include "common/logging/log.h"
 #include "core/emulator_settings.h"
@@ -17,10 +16,11 @@
 #include "core/libraries/kernel/process.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
+#include "core/libraries/np/np_handler/np_handler.h"
 #include "core/libraries/np/np_manager.h"
 #include "core/tls.h"
 #include "core/user_manager.h"
-#include "np_handler.h"
+#include "core/user_settings.h"
 
 namespace Libraries::Np::NpManager {
 
@@ -292,7 +292,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
     }
     if (param->features < 1 || param->features > 3) {
         // TODO: If compiled SDK version is greater or equal to fw 3.50,
-        // // error if param->features != 1 instead.
+        // error if param->features != 1 instead.
         return ORBIS_NP_ERROR_INVALID_ARGUMENT;
     }
     // The reserved field must be zero-initialized by the caller.
@@ -311,7 +311,7 @@ s32 PS4_SYSV_ABI sceNpCheckPlus(s32 req_id, const OrbisNpCheckPlusParameter* par
         return CompleteRequest(*req, ORBIS_NP_ERROR_SIGNED_OUT);
     }
     LOG_DEBUG(Lib_NpManager, "req_id = {:#x}, features = {:#x}", req_id, param->features);
-    // Grant PS+ — shadNet has no subscription gating.
+    // Grant PS+  shadNet has no subscription gating.
     result->authorized = true;
     return CompleteRequest(*req, ORBIS_OK);
 }

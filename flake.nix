@@ -123,6 +123,7 @@
             , lib
             , cmake
             , ninja
+            , python3
             , pkg-config
             , libX11
             , libxrandr
@@ -168,7 +169,7 @@
             clangStdenv.mkDerivation (finalAttrs: {
               name = "${finalAttrs.pname}-${finalAttrs.version}-${finalAttrs.system}";
               pname = "shadps4";
-              version = "0.18.1";
+              version = "0.20.1";
               system = "x86_64-linux";
               src = ./.;
 
@@ -176,6 +177,7 @@
                 cmake
                 ninja
                 pkg-config
+                python3
               ];
               buildInputs = [
                 boost

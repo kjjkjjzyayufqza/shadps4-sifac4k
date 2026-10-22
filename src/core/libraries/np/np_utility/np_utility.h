@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <cstddef>
+
 #include "common/types.h"
 #include "core/libraries/np/np_types.h"
 #include "core/libraries/system/userservice.h"
@@ -35,19 +37,20 @@ struct OrbisNpLookupCreateAsyncRequestParameter {
 };
 
 // ---- NpWordFilter ----
-// libSceNpUtility sizes its NP community object pools at runtime and exposes no word filter
-// limit, so the NpLookup limits are reused.
+// Pool sizes match NpLookup. Title and request ids sit in separate ranges so one cannot
+// be passed to the other API. The async parameter is the same 24-byte layout.
 constexpr s32 ORBIS_NP_WORD_FILTER_MAX_CTX_NUM = ORBIS_NP_LOOKUP_MAX_CTX_NUM;
 constexpr s32 ORBIS_NP_WORD_FILTER_MAX_REQUEST_NUM = ORBIS_NP_LOOKUP_MAX_REQUEST_NUM;
-
-// Longest comment, in bytes, accepted by the censor and sanitize calls.
-constexpr size_t ORBIS_NP_WORD_FILTER_COMMENT_MAX_LENGTH = 1024;
+constexpr s32 ORBIS_NP_WORD_FILTER_TITLE_CTX_ID_OFFSET = 0x01000000;
+constexpr s32 ORBIS_NP_WORD_FILTER_REQUEST_ID_OFFSET = 0x02000000;
+constexpr std::size_t ORBIS_NP_WORD_FILTER_COMMENT_MAX_LENGTH = 0x400;
+constexpr s32 ORBIS_NP_WORD_FILTER_POLL_ASYNC_RET_FINISHED = 0;
+constexpr s32 ORBIS_NP_WORD_FILTER_POLL_ASYNC_RET_RUNNING = 1;
 
 using OrbisNpWordFilterTitleCtxId = s32;
 using OrbisNpWordFilterRequestId = s32;
-
-// Same 24-byte layout as the NpLookup parameter; the library rejects any other size.
 using OrbisNpWordFilterCreateAsyncRequestParameter = OrbisNpLookupCreateAsyncRequestParameter;
+static_assert(sizeof(OrbisNpWordFilterCreateAsyncRequestParameter) == 0x18);
 
 // ---- NpBandwidthTest ----
 constexpr s32 ORBIS_NP_BANDWIDTH_TEST_STATUS_RUNNING = 1;

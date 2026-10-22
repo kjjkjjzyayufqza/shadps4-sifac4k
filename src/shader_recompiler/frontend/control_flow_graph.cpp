@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "shader_recompiler/frontend/control_flow_graph.h"
+#include "shader_recompiler/ir/condition.h"
 
 namespace Shader::Gcn {
 
@@ -191,7 +192,7 @@ void CFG::SplitDivergenceScopes() {
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
-                    curr_begin = -1;
+                    curr_begin = is_open_scope(inst) ? static_cast<s32>(index) : -1;
                     continue;
                 }
                 // If all instructions in the scope ignore exec masking, we shouldn't insert a
@@ -322,6 +323,7 @@ void CFG::LinkBlocks() {
         // need to link with the next block.
         if (!end_inst.IsTerminateInstruction()) {
             auto* next_block = get_block(block.end);
+            block.cond = IR::Condition::True;
             block.branch_true = next_block;
             block.end_class = EndClass::Branch;
             next_block->num_predecessors++;
@@ -349,12 +351,17 @@ void CFG::LinkBlocks() {
             block.end_class = EndClass::Branch;
             target_block->num_predecessors++;
         } else if (end_inst.IsConditionalBranch()) {
-            auto* target_block = get_block(target_pc);
             auto* end_block = get_block(block.end);
-            block.branch_true = target_block;
-            block.branch_false = end_block;
             block.end_class = EndClass::Branch;
-            target_block->num_predecessors++;
+            if (target_pc != block.end) {
+                auto* target_block = get_block(target_pc);
+                block.branch_true = target_block;
+                block.branch_false = end_block;
+                target_block->num_predecessors++;
+            } else {
+                block.branch_true = end_block;
+                block.cond = IR::Condition::True;
+            }
             end_block->num_predecessors++;
         } else if (end_inst.opcode == Opcode::S_ENDPGM) {
             block.end_class = EndClass::Exit;
