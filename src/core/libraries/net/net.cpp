@@ -1469,11 +1469,12 @@ s32 PS4_SYSV_ABI sceNetGetDnsInfo(u32* info, s32 flags) {
         servers = g_dns_override;
     }
     if (servers[0] == 0) {
-        // What sceNetCtlGetInfo reports, while online.
+        // What sceNetCtlGetInfo reports, while online: AliDNS.
         const auto hooks = GetSystemHooks();
         if (!hooks.is_online || hooks.is_online()) {
-            const u32 cloudflare = ToBigEndian(0x01010101u);
-            servers = {cloudflare, cloudflare};
+            const u32 primary = ToBigEndian(0xDF050505u);     // 223.5.5.5
+            const u32 secondary = ToBigEndian(0xDF060606u);   // 223.6.6.6
+            servers = {primary, secondary};
         }
     }
     info[0] = servers[0];

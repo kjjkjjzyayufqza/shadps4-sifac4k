@@ -221,12 +221,12 @@ std::vector<u32> QueryA(const char* server, const std::string& host, u32 timeout
     return ParseA(reply, static_cast<std::size_t>(got));
 }
 
-// Authoritative DNS for the public shadNet name is on Cloudflare. Mainland recursive
-// resolvers often drop that query and sit until their own timeout, which is the minute
-// MBON's login screen waits. These two answer without that hop. 1.1.1.1 is not used:
-// it is itself a Cloudflare address.
+// Authoritative DNS for the public shadNet name is on Cloudflare. A resolver the guest
+// has to reach itself often drops that query until its own timeout, which is the minute
+// MBON's login screen waits. AliDNS answers that name from both mainland China and
+// outside it. 1.1.1.1 is not used: it is a Cloudflare address.
 std::vector<u32> LookupPublic(const std::string& host) {
-    for (const char* server : {"8.8.8.8", "8.8.4.4"}) {
+    for (const char* server : {"223.5.5.5", "223.6.6.6"}) {
         std::vector<u32> found = QueryA(server, host, 1000);
         if (!found.empty()) {
             return found;
@@ -277,7 +277,7 @@ std::vector<u32> ResolveIPv4(const std::string& host) {
         }
         if (!pub.addrs.empty() && (sys.done || elapsed >= SHAD_RESOLVE_SYSTEM_GRACE_MS)) {
             chosen = pub.addrs;
-            via = "8.8.8.8";
+            via = "AliDNS";
             break;
         }
         if (sys.done && pub.done) {
@@ -293,7 +293,7 @@ std::vector<u32> ResolveIPv4(const std::string& host) {
             via = "system";
         } else if (!pub.addrs.empty()) {
             chosen = pub.addrs;
-            via = "8.8.8.8";
+            via = "AliDNS";
         }
     }
 

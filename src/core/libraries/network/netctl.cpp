@@ -224,11 +224,11 @@ int PS4_SYSV_ABI sceNetCtlGetInfo(int code, OrbisNetCtlInfo* info) {
         LOG_DEBUG(Lib_NetCtl, "http proxy config: {}", info->http_proxy_config);
         break;
     case ORBIS_NET_CTL_INFO_PRIMARY_DNS:
-        strcpy(info->primary_dns, "1.1.1.1");
+        strcpy(info->primary_dns, "223.5.5.5");
         LOG_DEBUG(Lib_NetCtl, "http primary dns: {}", info->primary_dns);
         break;
     case ORBIS_NET_CTL_INFO_SECONDARY_DNS:
-        strcpy(info->secondary_dns, "1.1.1.1");
+        strcpy(info->secondary_dns, "223.6.6.6");
         LOG_DEBUG(Lib_NetCtl, "http secondary dns: {}", info->secondary_dns);
         break;
     case ORBIS_NET_CTL_INFO_HTTP_PROXY_SERVER:
